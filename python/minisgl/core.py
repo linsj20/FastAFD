@@ -75,10 +75,29 @@ class Batch:
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
+    positions_host: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # AFD microbatch ping-pong: req-order and token-order split points
+    # (both len = m+1). `afd_microbatch_offsets[-1] == padded_size`, slices
+    # `padded_reqs`.
+    # `afd_microbatch_token_offsets[-1] == total_tokens`, slices flat token
+    # tensors (`out_loc`, `positions`, `input_ids`, packed comm buffers).
+    # For decode they coincide (1 token per req); for prefill they differ.
+    # AFD attention scheduler also populates `attn_metadata_mbs` with one
+    # metadata object per MB; for m=1 it is a one-element list.
+    afd_microbatch_offsets: tuple[int, ...] | None = field(default=None, init=False)
+    afd_microbatch_token_offsets: tuple[int, ...] | None = field(default=None, init=False)
+    attn_metadata_mbs: list[BaseAttnMetadata] | None = field(default=None, init=False)
+    afd_mb_subbatches: list[Batch] | None = field(default=None, init=False)
+    afd_sampling_plan: object | None = field(default=None, init=False)
+    afd_last_indices: torch.Tensor | None = field(default=None, init=False)
+    afd_num_sampling: int = field(default=0, init=False)
+    afd_writeback: object | None = field(default=None, init=False)
+    afd_req_table_indices_gpu: torch.Tensor | None = field(default=None, init=False)
+    afd_kv_store_merged: bool = field(default=False, init=False)
 
     @property
     def is_prefill(self) -> bool:
@@ -105,6 +124,9 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    mlp_deepep_buffer: object | None = None
+    moe_num_token_non_padded: torch.Tensor | int | None = None
+    moe_deepep_dispatch_max_tokens_per_rank: int | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

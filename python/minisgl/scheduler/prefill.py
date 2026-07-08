@@ -55,9 +55,10 @@ class PrefillAdder:
 
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
-            device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
-            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
+            if self.table_manager.token_pool is not None:
+                device_ids = self.table_manager.token_pool[table_idx][:cached_len]
+                device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
             page_entry.copy_(handle.get_matched_indices())
 
         return handle, table_idx
@@ -77,8 +78,9 @@ class PrefillAdder:
         self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx, _slice]
-        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
+        if self.table_manager.token_pool is not None:
+            device_ids = self.table_manager.token_pool[table_idx, _slice]
+            device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -122,6 +124,12 @@ class PrefillManager:
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+
+    def add_reqs(self, reqs: List[UserMsg]) -> None:
+        self.pending_list.extend(
+            PendingReq(req.uid, req.input_ids, req.sampling_params)
+            for req in reqs
+        )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

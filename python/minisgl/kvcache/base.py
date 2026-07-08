@@ -32,10 +32,6 @@ class BaseKVCachePool(ABC):
     @abstractmethod
     def dtype(self) -> torch.dtype: ...
 
-    @property
-    @abstractmethod
-    def num_layers(self) -> int: ...
-
 
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
@@ -120,10 +116,6 @@ class BasePrefixCache(ABC):
         Raises:
             RuntimeError: If the requested size is larger than the evictable size.
         """
-
-    @abstractmethod
-    def reset(self) -> None:
-        """Reset the cache manager and the underlying cache."""
 
     @property
     @abstractmethod

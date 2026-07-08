@@ -114,7 +114,6 @@ class FlashInferBackend(BaseAttnBackend):
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
         self.capture_bs: List[int] = []
-        self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
         self.last_event = torch.cuda.Event()
@@ -182,7 +181,8 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if not batch.afd_kv_store_merged:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
@@ -229,7 +229,6 @@ class FlashInferBackend(BaseAttnBackend):
         max_bs = max(bs_list)
         capture = FICaptureData.create(max_bs, max_seq_len, self.kvcache.device)
         capture.page_table = capture.page_table.view(-1)  # use 1D as ragged indices
-        self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 

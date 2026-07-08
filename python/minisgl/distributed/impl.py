@@ -20,6 +20,9 @@ class DistributedImpl(ABC):
     @abstractmethod
     def all_gather(self, x: torch.Tensor) -> torch.Tensor: ...
 
+    @abstractmethod
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor: ...
+
 
 @dataclass
 class TorchDistributedImpl(DistributedImpl):
@@ -38,6 +41,21 @@ class TorchDistributedImpl(DistributedImpl):
         shape[0] = shape[0] * tp_size
         out = torch.empty(shape, dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x)
+        return out
+
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        tp_size = dist.get_world_size()
+        if tp_size == 1:
+            return x
+        if x.shape[0] % tp_size != 0:
+            raise ValueError(
+                "reduce_scatter requires x.shape[0] % world_size == 0; "
+                f"got x.shape[0]={x.shape[0]} world_size={tp_size}"
+            )
+        shape = list(x.shape)
+        shape[0] //= tp_size
+        out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        dist.reduce_scatter_tensor(out, x, op=dist.ReduceOp.SUM)
         return out
 
 
@@ -59,6 +77,12 @@ class PyNCCLDistributedImpl(DistributedImpl):
         self.comm.all_gather(result, x)
         return result
 
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "PyNCCLDistributedImpl.reduce_scatter is not implemented; "
+            "use TorchDistributedImpl instead"
+        )
+
 
 class DistributedCommunicator:
     plugins: List[DistributedImpl] = [TorchDistributedImpl()]
@@ -68,6 +92,16 @@ class DistributedCommunicator:
 
     def all_gather(self, x: torch.Tensor) -> torch.Tensor:
         return self.plugins[-1].all_gather(x)
+
+    def reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        return self.plugins[-1].reduce_scatter(x)
+
+
+def get_active_pynccl_communicator() -> PyNCCLCommunicator | None:
+    for plugin in reversed(DistributedCommunicator.plugins):
+        if isinstance(plugin, PyNCCLDistributedImpl):
+            return plugin.comm
+    return None
 
 
 def enable_pynccl_distributed(
@@ -94,4 +128,12 @@ def destroy_distributed() -> None:
     """
     Destroy all the distributed communication plugins.
     """
-    DistributedCommunicator.plugins = []
+    for plugin in reversed(DistributedCommunicator.plugins):
+        close = getattr(plugin, "close", None)
+        if close is None:
+            continue
+        try:
+            close()
+        except Exception:
+            pass
+    DistributedCommunicator.plugins = [TorchDistributedImpl()]

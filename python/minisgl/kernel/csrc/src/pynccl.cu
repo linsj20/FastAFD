@@ -76,18 +76,25 @@ public:
     ncclUniqueId id = get_uid(uid);
     ncclComm_t comm;
     NCCL_CHECK(::ncclCommInitRank(&comm, m_world_size, id, m_rank));
-    m_comm = {comm, template_fn<::ncclCommDestroy>};
+    m_comm_aborted = std::make_shared<bool>(false);
+    m_comm = {comm, [aborted = m_comm_aborted](ncclComm_t c) {
+                if (!*aborted) {
+                  NCCL_CHECK(::ncclCommDestroy(c));
+                }
+              }};
 
-    void *buf;
-    NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
-    m_sym_mem = {buf, template_fn<::ncclMemFree>};
+    if (max_bytes > 0) {
+      void *buf;
+      NCCL_CHECK(::ncclMemAlloc(&buf, max_bytes));
+      m_sym_mem = {buf, template_fn<::ncclMemFree>};
 
-    ncclWindow_t win;
-    NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
-                                        NCCL_WIN_COLL_SYMMETRIC));
-    m_win = {win, [comm = m_comm](ncclWindow_t w) {
-               return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
-             }};
+      ncclWindow_t win;
+      NCCL_CHECK(::ncclCommWindowRegister(comm, buf, max_bytes, &win,
+                                          NCCL_WIN_COLL_SYMMETRIC));
+      m_win = {win, [comm = m_comm](ncclWindow_t w) {
+                 return NCCL_CHECK(::ncclCommWindowDeregister(comm.get(), w));
+               }};
+    }
   }
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
@@ -102,7 +109,7 @@ public:
     const auto reduce_op = kNCCLReduceOPMap.at(op);
     const auto stream = LaunchKernel::resolve_device(t.device());
 
-    if (size_bytes <= m_max_bytes) { // use internal buffer
+    if (m_max_bytes > 0 && size_bytes <= m_max_bytes) { // use internal buffer
       const auto buf_ptr = m_sym_mem.get();
       const auto need_memcpy = (buf_ptr != data_ptr);
       if (need_memcpy) {
@@ -162,6 +169,26 @@ public:
 
   auto get_buffer() const -> void * { return m_sym_mem.get(); }
 
+  auto get_async_error() const -> int {
+    ncclResult_t async_error = ::ncclSuccess;
+    NCCL_CHECK(::ncclCommGetAsyncError(m_comm.get(), &async_error));
+    return static_cast<int>(async_error);
+  }
+
+  auto get_async_error_string() const -> std::string {
+    ncclResult_t async_error = ::ncclSuccess;
+    NCCL_CHECK(::ncclCommGetAsyncError(m_comm.get(), &async_error));
+    return std::string(::ncclGetErrorString(async_error));
+  }
+
+  auto abort() -> void {
+    if (*m_comm_aborted) {
+      return;
+    }
+    NCCL_CHECK(::ncclCommAbort(m_comm.get()));
+    *m_comm_aborted = true;
+  }
+
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("minisgl.NCCLWrapper", NCCLWrapper,
                                     tvm::ffi::Object);
 
@@ -170,6 +197,7 @@ private:
   int m_world_size;
   size_t m_max_bytes;
   shared_obj<ncclComm_t> m_comm;
+  std::shared_ptr<bool> m_comm_aborted;
   shared_ptr<void> m_sym_mem;
   shared_obj<ncclWindow_t> m_win;
 };
@@ -180,7 +208,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def(refl::init<int, int, size_t, NCCLIDList>(), "__init__")
       .def("all_reduce", &NCCLWrapper::all_reduce)
       .def("all_gather", &NCCLWrapper::all_gather)
-      .def("get_buffer", &NCCLWrapper::get_buffer);
+      .def("get_buffer", &NCCLWrapper::get_buffer)
+      .def("get_async_error", &NCCLWrapper::get_async_error)
+      .def("get_async_error_string", &NCCLWrapper::get_async_error_string)
+      .def("abort", &NCCLWrapper::abort);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(create_nccl_uid, &create_uid);

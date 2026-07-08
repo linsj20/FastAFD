@@ -1,6 +1,13 @@
 from .backend import AbortBackendMsg, BaseBackendMsg, BatchBackendMsg, ExitMsg, UserMsg
 from .frontend import BaseFrontendMsg, BatchFrontendMsg, UserReply
-from .tokenizer import AbortMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg, TokenizeMsg
+from .tokenizer import (
+    AbortMsg,
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeBatchMsg,
+    DetokenizeMsg,
+    TokenizeMsg,
+)
 
 __all__ = [
     "AbortMsg",
@@ -11,6 +18,7 @@ __all__ = [
     "UserMsg",
     "BaseTokenizerMsg",
     "BatchTokenizerMsg",
+    "DetokenizeBatchMsg",
     "DetokenizeMsg",
     "TokenizeMsg",
     "BaseFrontendMsg",

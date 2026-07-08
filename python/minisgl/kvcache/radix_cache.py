@@ -15,15 +15,11 @@ KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
 
 class RadixTreeNode:
-    counter: int = 0
-
     def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
         self.key_fn = key_fn
         self.children: Dict[Any, RadixTreeNode] = {}
         self._parent: RadixTreeNode | None = None
         self.ref_count: int = 0
-        self.uuid = RadixTreeNode.counter
-        RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
 
         # these fields should be updated later
@@ -101,7 +97,6 @@ class RadixCacheHandle(BaseCacheHandle):
 class RadixPrefixCache(BasePrefixCache):
     def __init__(self, device: torch.device):
         super().__init__()
-        self.device = device
         self.page_size = get_global_ctx().page_size
         self.key_fn = _get_key_fn(self.page_size)
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
@@ -173,9 +168,6 @@ class RadixPrefixCache(BasePrefixCache):
                 heapq.heappush(leave_nodes, parent)
 
         return torch.cat(evicted_indices)
-
-    def reset(self) -> None:
-        raise NotImplementedError("RadixManager.reset is not implemented")
 
     @property
     def size_info(self) -> SizeInfo:

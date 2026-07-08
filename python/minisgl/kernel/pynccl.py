@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import functools
+import os
+import site
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from minisgl.env import ENV
@@ -20,14 +23,42 @@ if TYPE_CHECKING:
         def all_gather(self, output: torch.Tensor, input: torch.Tensor) -> None: ...
         @abstractmethod
         def get_buffer(self) -> int: ...
+        @abstractmethod
+        def get_async_error(self) -> int: ...
+        @abstractmethod
+        def get_async_error_string(self) -> str: ...
+        @abstractmethod
+        def abort(self) -> None: ...
 
 else:
     PyNCCLCommunicator = Any
 
 
 @functools.cache
+def _nccl_ldflags() -> list[str]:
+    flags = []
+    lib_dirs: list[Path] = []
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        lib_dirs.append(Path(conda_prefix) / "lib")
+
+    for root in site.getsitepackages():
+        lib_dirs.append(Path(root) / "nvidia" / "nccl" / "lib")
+
+    seen: set[Path] = set()
+    for lib_dir in lib_dirs:
+        if lib_dir.exists() and lib_dir not in seen:
+            flags.append(f"-L{lib_dir}")
+            seen.add(lib_dir)
+
+    flags.append("-lnccl")
+    return flags
+
+
+@functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=_nccl_ldflags())
 
 
 @functools.cache
@@ -60,15 +91,15 @@ def init_pynccl(
         id_list = [module.create_nccl_uid()]
         torch.distributed.broadcast_object_list(
             id_list,
-            src=0,
             group=tp_cpu_group,
+            group_src=0,
         )
     else:
         id_list = [None]
         torch.distributed.broadcast_object_list(
             id_list,
-            src=0,
             group=tp_cpu_group,
+            group_src=0,
         )
 
     nccl_id = id_list[0]

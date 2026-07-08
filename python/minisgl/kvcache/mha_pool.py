@@ -8,9 +8,10 @@ from .base import BaseKVCachePool
 
 
 class MHAKVCache(BaseKVCachePool):
-    """
-    Base class for key-value caches.
-    This class defines the interface for key-value caches used in LLMs.
+    """Concrete paged MHA key-value cache.
+
+    Stores keys and values in a single contiguous
+    [2, num_layers, num_pages, page_size, local_kv_heads, head_dim] buffer.
     """
 
     def __init__(
@@ -30,7 +31,6 @@ class MHAKVCache(BaseKVCachePool):
             device=device,
             dtype=dtype,
         )
-        self._num_layers = num_layers
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
@@ -62,7 +62,3 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._kv_buffer.dtype
-
-    @property
-    def num_layers(self) -> int:
-        return self._num_layers

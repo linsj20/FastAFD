@@ -93,6 +93,8 @@ class ParallelLMHead(VocabParallelEmbedding):
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        else:
+            x = x.contiguous()
 
         module = self.tied_embedding or self
         logits = F.linear(x, module.weight, self.bias)

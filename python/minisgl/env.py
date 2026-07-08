@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from functools import partial
-from typing import Callable, Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 
 class BaseEnv:
@@ -48,6 +48,13 @@ def _PARSE_MEM_BYTES(mem: str) -> int:
 
 
 MINISGL_ENV_PREFIX = "MINISGL_"
+
+
+def afd_env(suffix: str, default: Any = None) -> Any:
+    """Read a MINISGL_AFD_* environment variable."""
+    return os.environ.get(f"{MINISGL_ENV_PREFIX}AFD_{suffix}", default)
+
+
 EnvInt = partial(EnvVar[int], fn=int)
 EnvFloat = partial(EnvVar[float], fn=float)
 EnvBool = partial(EnvVar[bool], fn=_TO_BOOL)

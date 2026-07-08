@@ -38,7 +38,7 @@ class SchedulerIOMixin:
                 create=True,
                 decoder=BaseBackendMsg.decoder,
             )
-            self._send_into_tokenizer: Final = ZmqPushQueue(
+            self._send_into_detokenizer: Final = ZmqPushQueue(
                 config.zmq_detokenizer_addr,
                 create=config.backend_create_detokenizer_link,
                 encoder=BaseTokenizerMsg.encoder,
@@ -74,7 +74,9 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
+        logger.info("Scheduler sync_all_ranks:start")
         self.tp_cpu_group.barrier().wait()
+        logger.info("Scheduler sync_all_ranks:done")
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
@@ -125,9 +127,9 @@ class SchedulerIOMixin:
         num_reply = len(reply)
         logger.debug_rank0(f"Replying to tokenizer: {num_reply} messages")
         if num_reply == 1:
-            self._send_into_tokenizer.put(reply[0])
+            self._send_into_detokenizer.put(reply[0])
         elif num_reply > 1:
-            self._send_into_tokenizer.put(BatchTokenizerMsg(data=reply))  # type: ignore
+            self._send_into_detokenizer.put(BatchTokenizerMsg(data=reply))  # type: ignore
 
     def _reply_tokenizer_rank1(self, reply: List[DetokenizeMsg]) -> None:
         _ = reply  # do nothing for non-primary ranks

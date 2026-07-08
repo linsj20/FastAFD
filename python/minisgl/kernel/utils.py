@@ -24,11 +24,6 @@ class KernelConfig(NamedTuple):
     max_occupancy: int
     use_pdl: bool
 
-    @property
-    def template_args(self) -> str:
-        pdl = "true" if self.use_pdl else "false"
-        return f"{self.num_threads},{self.max_occupancy},{pdl}"
-
 
 def _make_name(*args: str) -> str:
     return "minisgl__" + "_".join(str(arg) for arg in args)

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -21,24 +21,18 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = [
-    "accelerate",
-    "msgpack",
-    "modelscope",
-    "torch<2.10.0",
-    "transformers>=4.56.0,<=4.57.3",
-    "flashinfer-python>=0.5.3",
-    "pyzmq",
-    "uvicorn",
-    "fastapi",
-    "prompt_toolkit",
-    "openai",
-    "apache-tvm-ffi>=0.1.4",
-    "sgl_kernel>=0.3.17.post1",
-    "quack-kernels",
-]
+dependencies = []
 
 [project.optional-dependencies]
+shell = [
+    "prompt_toolkit",
+]
+benchmark = [
+    "openai",
+]
+modelscope = [
+    "modelscope",
+]
 dev = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
@@ -49,6 +43,9 @@ dev = [
     "ruff>=0.11.0",
     "matplotlib>=3.10.5",
     "pyarrow",
+    "prompt_toolkit",
+    "openai",
+    "modelscope",
 ]
 
 [tool.setuptools]
@@ -104,7 +101,6 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

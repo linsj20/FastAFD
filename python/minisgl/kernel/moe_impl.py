@@ -62,37 +62,33 @@ def fused_moe_kernel_triton(
     )
 
 
-def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
-    import triton
+import functools
 
-    from .triton.fused_moe import moe_sum_reduce_kernel
 
-    assert input.is_contiguous()
-    assert output.is_contiguous()
-
-    token_num, topk_num, hidden_dim = input.shape
-    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
-
-    BLOCK_M = 1
-    BLOCK_DIM = 2048
-    NUM_STAGE = 1
-    num_warps = 8
-
-    grid = (
-        triton.cdiv(token_num, BLOCK_M),
-        triton.cdiv(hidden_dim, BLOCK_DIM),
+@functools.cache
+def _get_moe_sum_cuda_module():
+    from .utils import load_jit
+    return load_jit(
+        "moe_sum",
+        cuda_files=["moe_sum.cu"],
+        cuda_wrappers=[("launch", "MoeSumKernel::run")],
+        extra_cuda_cflags=["--use_fast_math"],
     )
 
-    moe_sum_reduce_kernel[grid](
-        input,
-        *input.stride(),
-        output,  # type: ignore
-        *output.stride(),
-        token_num=token_num,
-        topk_num=topk_num,
-        hidden_dim=hidden_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DIM=BLOCK_DIM,
-        NUM_STAGE=NUM_STAGE,
-        num_warps=num_warps,  # type: ignore
-    )
+
+def moe_sum_reduce_cuda(input: torch.Tensor, output: torch.Tensor) -> None:
+    """CUDA fused split-K reduce for MoE: out[m, h] = sum_k input[m, k, h].
+
+    Block-per-token, 256 thr/block, uint4 (8 bf16) vec loads + fp32 acc.
+    Templated on TOPK ∈ {2, 4, 6, 8, 16} (compile-time unroll), generic
+    fallback otherwise. Requires h % 8 == 0 and bf16/fp16 input.
+    """
+    assert input.is_contiguous() and output.is_contiguous()
+    assert input.dim() == 3 and output.dim() == 2
+    m, topk, h = input.shape
+    assert output.shape == (m, h)
+    assert input.dtype == output.dtype
+    assert h % 8 == 0, f"hidden={h} must be divisible by 8 (uint4 vec)"
+    if m == 0 or topk == 0 or h == 0:
+        return
+    _get_moe_sum_cuda_module().launch(output, input)

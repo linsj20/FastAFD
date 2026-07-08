@@ -2,13 +2,21 @@ import torch
 
 
 class TableManager:
-    def __init__(self, max_running_reqs: int, page_table: torch.Tensor) -> None:
+    def __init__(
+        self,
+        max_running_reqs: int,
+        page_table: torch.Tensor,
+        *,
+        with_token_pool: bool = True,
+    ) -> None:
         self._max_running_reqs = max_running_reqs
         self._free_slots = list(range(max_running_reqs))
         self.page_table = page_table
         # NOTE: dummy request also use this pool to get the input ids, so we need to
         # make sure the token pool is initialized with valid values (token_id = 0).
-        self.token_pool = torch.zeros_like(page_table, dtype=torch.int32)
+        self.token_pool: torch.Tensor | None = (
+            torch.zeros_like(page_table, dtype=torch.int32) if with_token_pool else None
+        )
 
     @property
     def available_size(self) -> int:

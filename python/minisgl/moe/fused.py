@@ -2,8 +2,9 @@ import functools
 from typing import Dict, Tuple
 
 import torch
+from minisgl.kernel import moe_align_block_size as kernel_moe_align_block_size
+from minisgl.kernel import topk_softmax as kernel_topk_softmax
 from minisgl.moe import BaseMoeBackend
-from minisgl.utils import div_ceil
 
 
 def fused_topk(
@@ -11,20 +12,18 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_token_non_padded: torch.Tensor | None = None,
+    num_token_non_padded: torch.Tensor | int | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sgl_kernel import topk_softmax
-
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     M, _ = hidden_states.shape
     topk_weights = torch.empty(M, topk, dtype=torch.float32, device=hidden_states.device)
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
-    if renormalize:
-        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+    kernel_topk_softmax(topk_weights, topk_ids, gating_output.float(), renormalize)
     if num_token_non_padded is not None:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)[:, None]
+        valid = indices < num_token_non_padded
+        topk_ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+        topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
     return topk_weights, topk_ids
 
 
@@ -68,25 +67,7 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    from sgl_kernel import moe_align_block_size as sgl_moe_align_block_size
-
-    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
-    max_num_m_blocks = div_ceil(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
-    sgl_moe_align_block_size(
-        topk_ids,
-        num_experts + 1,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        cumsum_buffer,
-        True,
-    )
-    return sorted_ids, expert_ids, num_tokens_post_pad
+    return kernel_moe_align_block_size(topk_ids, block_size, num_experts)
 
 
 def get_default_config(
@@ -132,9 +113,11 @@ def fused_experts_impl(
     topk_ids: torch.Tensor,
     activation: str = "silu",
     apply_router_weight_on_input: bool = False,
+    expert_map: torch.Tensor | None = None,
+    global_num_experts: int | None = None,
 ) -> torch.Tensor:
-    from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_triton
-    from minisgl.layers import gelu_and_mul, silu_and_mul
+    from minisgl.kernel import fused_moe_kernel_triton, moe_sum_reduce_cuda
+    from minisgl.layers import gelu_and_mul, glm4_silu_and_mul, silu_and_mul
 
     padded_size = 0
     assert hidden_states.shape[1] == w1.shape[2] - padded_size, "Hidden size mismatch"
@@ -143,6 +126,8 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+    if expert_map is not None and global_num_experts is None:
+        raise RuntimeError("global_num_experts is required when expert_map is provided")
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
     M = num_tokens
@@ -159,6 +144,10 @@ def fused_experts_impl(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    if expert_map is not None:
+        # EP: remote experts are skipped by the kernel and would otherwise leave
+        # stale cache rows that are later summed.
+        cache.zero_()
     intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
         (M, topk_ids.shape[1], N),
     )
@@ -185,9 +174,18 @@ def fused_experts_impl(
     curr_topk_ids = topk_ids[begin_token_idx:end_token_idx]
     curr_topk_weights = topk_weights[begin_token_idx:end_token_idx]
 
+    num_experts_for_align = global_num_experts if expert_map is not None else E
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        curr_topk_ids, config["BLOCK_SIZE_M"], E
+        curr_topk_ids, config["BLOCK_SIZE_M"], num_experts_for_align
     )
+    if expert_map is not None:
+        valid = (expert_ids >= 0) & (expert_ids < global_num_experts)
+        safe_ids = torch.where(valid, expert_ids, torch.zeros_like(expert_ids))
+        expert_ids = torch.where(
+            valid,
+            expert_map[safe_ids.to(torch.long)],
+            torch.full_like(expert_ids, -1),
+        )
 
     fused_moe_kernel_triton(
         curr_hidden_states,
@@ -203,8 +201,13 @@ def fused_experts_impl(
         config,
         compute_type=compute_type,
     )
-    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
+    FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul, "glm4_silu": glm4_silu_and_mul}
     FN_MAP[activation](intermediate_cache1.view(-1, N), intermediate_cache2)
+    if expert_map is not None:
+        # intermediate_cache1 and intermediate_cache3 alias the same cache with
+        # different row widths. Re-zero before down-proj so skipped remote rows
+        # stay zero.
+        intermediate_cache3.zero_()
     fused_moe_kernel_triton(
         intermediate_cache2,
         w2,
@@ -220,7 +223,7 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
 
-    moe_sum_reduce_triton(
+    moe_sum_reduce_cuda(
         intermediate_cache3,
         out_hidden_states[begin_token_idx:end_token_idx],
     )
@@ -233,18 +236,13 @@ class FusedMoe(BaseMoeBackend):
         hidden_states: torch.Tensor,
         w1: torch.Tensor,
         w2: torch.Tensor,
-        gating_output: torch.Tensor,
-        topk: int,
-        renormalize: bool,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        expert_map: torch.Tensor | None = None,
+        global_num_experts: int | None = None,
     ) -> torch.Tensor:
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=gating_output,
-            topk=topk,
-            renormalize=renormalize,
-        )
         return fused_experts_impl(
             hidden_states,
             w1,
@@ -253,4 +251,6 @@ class FusedMoe(BaseMoeBackend):
             topk_ids,
             activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts,
         )

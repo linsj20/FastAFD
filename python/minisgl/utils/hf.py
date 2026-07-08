@@ -1,35 +1,26 @@
 import functools
-import json
 import os
 from typing import Any
 
-from huggingface_hub import hf_hub_download, snapshot_download
-from tqdm.asyncio import tqdm
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig, PreTrainedTokenizerBase
+from huggingface_hub import snapshot_download
+from transformers import AutoConfig, PretrainedConfig
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs.pop("name", None)
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
-
-
-def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    # Some Mistral models store chat_template in a separate JSON file
-    if not getattr(tokenizer, "chat_template", None):
-        try:
-            path = hf_hub_download(repo_id=model_path, filename="chat_template.json")
-            with open(path, "r", encoding="utf-8") as f:
-                tokenizer.chat_template = json.load(f)["chat_template"]
-        except Exception:
-            pass
-    return tokenizer
+from minisgl.hf_support import DisabledTqdm, load_tokenizer, local_files_only, resolve_local_model_dir
 
 
 @functools.cache
+def _load_hf_config_cached(resolved_model_path: str, local_files_only: bool) -> Any:
+    return AutoConfig.from_pretrained(
+        resolved_model_path,
+        local_files_only=local_files_only,
+        trust_remote_code=True,
+    )
+
+
 def _load_hf_config(model_path: str) -> Any:
-    return AutoConfig.from_pretrained(model_path)
+    local_files = local_files_only()
+    resolved_model_path = resolve_local_model_dir(model_path, local_only=local_files)
+    return _load_hf_config_cached(resolved_model_path, local_files)
 
 
 def cached_load_hf_config(model_path: str) -> PretrainedConfig:

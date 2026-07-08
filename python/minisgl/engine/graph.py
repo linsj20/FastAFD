@@ -107,6 +107,11 @@ class GraphRunner:
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
+        logger.info(
+            "Per-rank CUDA graph capture start: sizes=%s max_graph_bs=%d",
+            self.graph_bs_list,
+            self.max_graph_bs,
+        )
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
 
         torch.cuda.synchronize(self.device)
@@ -145,6 +150,11 @@ class GraphRunner:
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        logger.info(
+            "Per-rank CUDA graph capture done: captured_sizes=%s free_mem=%s",
+            self.graph_bs_list,
+            mem_GB(free_memory),
+        )
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

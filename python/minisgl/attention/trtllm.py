@@ -35,16 +35,60 @@ class TRTLLMMetadata(BaseAttnMetadata):
 class TensorRTLLMBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
-        self.config = config
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
         self.capture: TRTLLMCaptureData | None = None
-        self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
         self.workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
+        self._decode_cu_seqlens_q = torch.empty(
+            (0,), dtype=torch.int32, device=self.kvcache.device
+        )
+        self._page_offsets_by_len: dict[int, torch.Tensor] = {}
+
+    def _get_decode_cu_seqlens_q(self, padded_size: int) -> torch.Tensor:
+        needed = int(padded_size) + 1
+        if int(self._decode_cu_seqlens_q.numel()) < needed:
+            self._decode_cu_seqlens_q = torch.arange(
+                needed,
+                device=self.kvcache.device,
+                dtype=torch.int32,
+            )
+        return self._decode_cu_seqlens_q[:needed]
+
+    def _get_page_offsets(self, max_seqlen_k: int) -> torch.Tensor:
+        page_count = (int(max_seqlen_k) + int(self.page_size) - 1) // int(self.page_size)
+        offsets = self._page_offsets_by_len.get(page_count)
+        if offsets is None:
+            offsets = (
+                torch.arange(page_count, device=self.kvcache.device, dtype=torch.long)
+                * int(self.page_size)
+            )
+            self._page_offsets_by_len[page_count] = offsets
+        return offsets
+
+    def _build_page_table(
+        self,
+        batch: Batch,
+        reqs: list,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        page_table = get_global_ctx().page_table
+        table_indices = batch.afd_req_table_indices_gpu
+        if table_indices is None:
+            new_page_table = torch.stack(
+                [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+            )
+            if self.page_size > 1:
+                new_page_table.div_(self.page_size, rounding_mode="floor")
+            return new_page_table
+        page_offsets = self._get_page_offsets(max_seqlen_k)
+        new_page_table = page_table[table_indices[:, None], page_offsets[None, :]]
+        if self.page_size > 1:
+            new_page_table.div_(self.page_size, rounding_mode="floor")
+        return new_page_table
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
@@ -54,7 +98,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TRTLLMMetadata)
-        self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        if not batch.afd_kv_store_merged:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
 
         if batch.is_prefill:
@@ -106,19 +151,19 @@ class TensorRTLLMBackend(BaseAttnBackend):
         cu_seqlens_k = cu_seqlens_k.to(device, non_blocking=True)
 
         if max_seqlen_q == 1:
-            cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
+            if batch.afd_req_table_indices_gpu is None:
+                cu_seqlens_q = torch.arange(
+                    0, padded_size + 1, device=device, dtype=torch.int32
+                )
+            else:
+                cu_seqlens_q = self._get_decode_cu_seqlens_q(padded_size)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
             cu_seqlens_q = cu_seqlens_k
         else:  # normal extend prefill, with partial cache hit
             cu_seqlens_q = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
             cu_seqlens_q = cu_seqlens_q.to(self.kvcache.device, non_blocking=True)
 
-        page_table = get_global_ctx().page_table
-        new_page_table = torch.stack(  # NOTE: global page table treat page_size = 1, we need slice
-            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
-        )
-        if self.page_size > 1:
-            new_page_table.div_(self.page_size, rounding_mode="floor")
+        new_page_table = self._build_page_table(batch, reqs, max_seqlen_k)
         batch.attn_metadata = TRTLLMMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
@@ -134,7 +179,6 @@ class TensorRTLLMBackend(BaseAttnBackend):
         capture = TRTLLMCaptureData.create(
             max_bs, max_seq_len // self.page_size, self.kvcache.device
         )
-        self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
 

@@ -1,186 +1,248 @@
 <p align="center">
-<img width="400" src="/assets/logo.png">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="FastAFD" src="assets/logo.svg" width="320">
+  </picture>
 </p>
 
-# Mini-SGLang
+<p align="center"><b>Fast Attention–FFN Disaggregation for MoE Serving</b></p>
 
-A **lightweight yet high-performance** inference framework for Large Language Models.
+<p align="center">
+| <a href="https://haoailab.com/blogs/fastafd/">Blog</a> | <a href="#">X</a> |
+</p>
 
 ---
 
-Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-project/sglang), designed to demystify the complexities of modern LLM serving systems. With a compact codebase of **~5,000 lines of Python**, it serves as both a capable inference engine and a transparent reference for researchers and developers.
+FastAFD is an open-source serving system for **large-scale Attention–FFN Disaggregation (AFD)** of MoE models.
 
-## ✨ Key Features
+## News
 
-- **High Performance**: Achieves state-of-the-art throughput and latency with advanced optimizations.
-- **Lightweight & Readable**: A clean, modular, and fully type-annotated codebase that is easy to understand and modify.
-- **Advanced Optimizations**:
-  - **Radix Cache**: Reuses KV cache for shared prefixes across requests.
-  - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
-  - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
-  - **Tensor Parallelism**: Scales inference across multiple GPUs.
-  - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
-  - ...
+- **[2026-07-07]** FastAFD is open-sourced — **1.3–1.5× per-GPU decode throughput**
+  over colocated MoE serving on Blackwell NVL72.
 
-## 🚀 Quick Start
+## Contents
 
-> **⚠️ Platform Support**: Mini-SGLang currently supports **Linux only** (x86_64 and aarch64). Windows and macOS are not supported due to dependencies on Linux-specific CUDA kernels (`sgl-kernel`, `flashinfer`). We recommend using [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows or Docker for cross-platform compatibility.
+- [How FastAFD Works](#how-fastafd-works)
+- [Key Techniques](#key-techniques)
+  - [N2M/M2N MoE Megakernel](#n2mm2n-moe-megakernel)
+  - [Micro-Batch Ping-Pong Overlap](#micro-batch-ping-pong-overlap)
+  - [Zero-Overhead Cluster Coordination](#zero-overhead-cluster-coordination)
+- [Results](#results)
+- [Getting Started](#getting-started)
+  - [Install](#install)
+  - [Supported Models](#supported-models)
+  - [Quickstart](#quickstart)
+  - [Correctness Alignment](#correctness-alignment)
+  - [Large-Scale AFD Experiments](#large-scale-afd-experiments)
+- [Acknowledgements](#acknowledgements)
+- [Citation](#citation)
 
-### 1. Environment Setup
+## How FastAFD Works
 
-We recommend using `uv` for a fast and reliable installation (note that `uv` does not conflict with `conda`).
+<p align="center">
+  <img alt="FastAFD Attention-FFN disaggregation" src="assets/afd-token-flow.gif" width="86%">
+</p>
 
-```bash
-# Create a virtual environment (Python 3.10+ recommended)
-uv venv --python=3.12
-source .venv/bin/activate
-```
+FastAFD splits MoE decoding into **attention servers** and **MLP servers**.
+Attention servers own KV-cache attention, routing, and sampling; MLP servers
+aggregate routed hidden states from many attention servers and run the experts.
+Micro-batches overlap dispatch, expert execution, and combine so the MLP side
+stays dense while activations move.
 
-**Prerequisites**: Mini-SGLang relies on CUDA kernels that are JIT-compiled. Ensure you have the **NVIDIA CUDA Toolkit** installed and that its version matches your driver's version. You can check your driver's CUDA capability with `nvidia-smi`.
+## Key Techniques
 
-### 2. Installation
+### N2M/M2N MoE Megakernel
 
-Install Mini-SGLang directly from the source:
+FastAFD maps the AFD boundary to an asymmetric DeepEP-style dispatch/combine
+path. During N2M, attention ranks send routed activations and MLP ranks receive
+expert inputs; during M2N, MLP ranks return combined outputs and attention ranks
+receive layer results. On the MLP side, FastAFD runs the repeated receive, group,
+expert, combine, and send-back loop as a role-specialized MoE path with fewer
+launches and synchronization points.
 
-```bash
-git clone https://github.com/sgl-project/mini-sglang.git
-cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e .
-```
+### Micro-Batch Ping-Pong Overlap
 
-<details>
-<summary><b>💡 Installing on Windows (WSL2)</b></summary>
+<p align="center">
+  <img alt="FastAFD micro-batch pipeline" src="assets/afd-microbatch-pipeline.png" width="92%">
+</p>
 
-Since Mini-SGLang requires Linux-specific dependencies, Windows users should use WSL2:
+FastAFD splits each decode batch into micro-batches so N2M dispatch, expert
+execution, M2N return, and attention-side work overlap across layers instead of
+serializing at every AFD boundary.
 
-1. **Install WSL2** (if not already installed):
-   ```powershell
-   # In PowerShell (as Administrator)
-   wsl --install
-   ```
+### Zero-Overhead Cluster Coordination
 
-2. **Install CUDA on WSL2**:
-   - Follow [NVIDIA's WSL2 CUDA guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
-   - Ensure your Windows GPU drivers support WSL2
+<p align="center">
+  <img alt="FastAFD zero-overhead coordinator" src="assets/zero-overhead-coordinator.png" width="92%">
+  <br>
+  <img alt="FastAFD Nsight Systems trace" src="assets/zero-overhead-nsys.png" width="92%">
+</p>
 
-3. **Install Mini-SGLang in WSL2**:
-   ```bash
-   # Inside WSL2 terminal
-   git clone https://github.com/sgl-project/mini-sglang.git
-   cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-   uv pip install -e .
-   ```
+FastAFD prepares the next decode plan while GPUs execute the current one. The
+coordinator publishes micro-batch order, buffer slots, request ownership, and
+peer metadata one step ahead, so scheduling stays off the decode critical path.
 
-4. **Access from Windows**: The server will be accessible at `http://localhost:8000` from Windows browsers and applications.
+## Results
 
-</details>
+<p align="center">
+  <img alt="FastAFD throughput improvement over colocated MoE serving" src="assets/fig_win.png" width="82%">
+</p>
 
-<details>
-<summary><b>🐳 Running with Docker</b></summary>
+FastAFD improves per-GPU decode throughput by **1.35–1.45×** over colocated
+MoE serving across Qwen3-235B-A22B-FP8 and MiniMax-M2.5 on GB200 NVL72.
 
-**Prerequisites**:
-- [Docker](https://docs.docker.com/get-docker/)
-- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+## Getting Started
 
-1. **Build the Docker image**:
-   ```bash
-   docker build -t minisgl .
-   ```
+FastAFD is currently validated on `aarch64` with CUDA 13.0. The conda
+environment is named `minisgl-cuda130` for compatibility with the current
+runtime scripts.
 
-2. **Run the server**:
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-3. **Run in interactive shell mode**:
-   ```bash
-   docker run -it --gpus all \
-       minisgl --model Qwen/Qwen3-0.6B --shell
-   ```
-
-4. **Using Docker Volumes for persistent caches** (recommended for faster subsequent startups):
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       -v huggingface_cache:/app/.cache/huggingface \
-       -v tvm_cache:/app/.cache/tvm-ffi \
-       -v flashinfer_cache:/app/.cache/flashinfer \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-</details>
-
-### 3. Online Serving
-
-Launch an OpenAI-compatible API server with a single command.
+### Install
 
 ```bash
-# Deploy Qwen/Qwen3-0.6B on a single GPU
-python -m minisgl --model "Qwen/Qwen3-0.6B"
-
-# Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
-python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
+conda env create -f environment.cuda130.yml
+./scripts/enter_clean.sh minisgl-cuda130
+pip install -e .
 ```
 
-Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
-
-### 4. Interactive Shell
-
-Chat with your model directly in the terminal by adding the `--shell` flag.
+Install vLLM in the same clean shell if you want to run alignment checks:
 
 ```bash
-python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
+python -m pip install \
+  "https://github.com/vllm-project/vllm/releases/download/v0.19.0/vllm-0.19.0+cu130-cp38-abi3-manylinux_2_35_aarch64.whl" \
+  --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
-![shell-example](https://lmsys.org/images/blog/minisgl/shell.png)
-
-You can also use `/reset` to clear the chat history.
-
-## Benchmark
-
-### Offline inference
-
-See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
-
-Test Configuration:
-
-- Hardware: 1xH200 GPU.
-- Model: Qwen3-0.6B, Qwen3-14B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100-1024 tokens
-- Output Length: Randomly sampled between 100-1024 tokens
-
-![offline](https://lmsys.org/images/blog/minisgl/offline.png)
-
-### Online inference
-
-See [benchmark_qwen.py](./benchmark/online/bench_qwen.py) for more details.
-
-Test Configuration:
-
-- Hardware: 4xH200 GPU, connected by NVLink.
-- Model: Qwen3-32B
-- Dataset: [Qwen trace](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon/blob/main/qwen_traceA_blksz_16.jsonl), replaying first 1000 requests.
-
-Launch command:
+Then apply the runtime overrides used by the AFD/DeepEP path:
 
 ```bash
-# Mini-SGLang
-python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --cache naive
-
-# SGLang
-python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
-    --disable-radix --port 1919 --decode-attention flashinfer
+python -m pip install --no-cache-dir --force-reinstall --no-deps \
+  "nvidia-nccl-cu13==2.30.4" \
+  "setuptools==80.10.2" \
+  "fsspec==2026.2.0"
 ```
 
-> **Note**: If you encounter network issues when downloading models from HuggingFace, try using `--model-source modelscope` to download from ModelScope instead:
-> ```bash
-> python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --model-source modelscope
-> ```
+Validated package versions are `torch 2.10.0+cu130`, `triton 3.6.0`,
+`nvidia-nccl-cu13 2.30.4`, and `vllm 0.19.0+cu130` when alignment is enabled.
 
-![online](https://lmsys.org/images/blog/minisgl/online.png)
+### Supported Models
 
-## 📚 Learn More
+- Quickstart and correctness: `Qwen/Qwen3-30B-A3B-Instruct-2507`
+- Published scaling presets: Qwen3-235B-A22B-FP8 and MiniMax-M2.5-FP8
 
-- **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
-- **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.
+### Quickstart
+
+```bash
+./scripts/quickstart/qwen3_30b_a3b_sample.sh
+```
+
+This starts a local mini-sgl server, samples the Qwen3-30B-A3B prompt set, and
+writes artifacts under `reports/`.
+
+### Correctness Alignment
+
+```bash
+./scripts/validate/qwen3_30b_a3b_alignment.sh
+./scripts/validate/qwen3_30b_a3b_fastafd_alignment.sh
+```
+
+The first script checks mini-sgl against vLLM (single node, 4 GPUs via the `mp`
+backend). The second checks the FastAFD serve path against vLLM and needs a
+running Ray cluster with at least 8 GPUs (attention TP 4 + MLP TP 4).
+
+Both alignment commands are thin 30B presets that call one reusable validator,
+`scripts/validate/fastafd_vllm_alignment.sh`, which aligns the FastAFD serve path
+against vLLM for any model or AFD attention/MLP layout. To validate a different
+model or a custom split, call it directly (run with no arguments for the full
+option list):
+
+```bash
+./scripts/validate/fastafd_vllm_alignment.sh \
+  --env minisgl-cuda130 --model <hf-id-or-path> \
+  --prompt-file <utf8-prompts.txt> \
+  --attn-tp-size 4 --mlp-tp-size 4 --afd-mlp-ep-size 4 \
+  --afd-max-running-requests 64 --sample-concurrency 64 \
+  --max-new-tokens 64
+```
+
+### Large-Scale AFD Experiments
+
+Presets live under `scripts/experiments/afd/` and assume a running Ray GPU cluster,
+launched from the activated `minisgl-cuda130` environment. Nodes are
+auto-discovered from `RAY_ADDRESS=auto` (last node = MLP, the rest = attention);
+on multi-node clusters use a shared local `MODEL_PATH` snapshot to avoid
+per-rank Hugging Face cache resolution.
+
+The 512-prompt long-context caches ship under `prompts/`. Regenerate them only
+if needed (the 16K cache uses `--target-tokens 16384` and adds `--min-source-tokens 20000`):
+
+```bash
+PYTHONPATH=python python scripts/data_gen/generate_realistic_long_prompts.py \
+  --model Qwen/Qwen3-235B-A22B-FP8 --target-tokens 8192 --count 512 \
+  --output prompts/prompts_512x8192_seed20260527.txt --seed 20260527
+```
+
+Run a preset (minimal 4-node, no vLLM scoring or Nsight profiling):
+
+```bash
+MODEL_PATH=/path/to/Qwen3-235B-A22B-FP8 AFD_TOTAL_NODES=4 \
+RUN_VLLM_ALIGNMENT=0 NSYS=0 \
+bash scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_8k_b96_dynamicnode_mb2_nsys_alignment.sh
+```
+
+Optional environment knobs:
+
+| Env var | Effect |
+|---|---|
+| `MODEL_PATH` | Local weight snapshot (recommended for multi-node; required offline, e.g. MiniMax-M2.5). |
+| `AFD_NODE_LIST` / `AFD_MLP_NODE` | Explicit node placement instead of Ray auto-discovery (e.g. `node0,node1,node2,node3` / `node3`). |
+| `RUN_VLLM_ALIGNMENT=1` | Cross-check FastAFD outputs against an expert-parallel vLLM baseline (see below). |
+| `NSYS=1` + `MINISGL_RAY_NSYS_BIN=/path/to/nsys` | Capture Nsight Systems traces. |
+
+Available presets:
+
+| Model | Context | Default workload | Script |
+|---|---:|---|---|
+| Qwen3-235B-A22B-FP8 | 8K | 96 requests / attention GPU | `scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_8k_b96_dynamicnode_mb2_nsys_alignment.sh` |
+| Qwen3-235B-A22B-FP8 | 16K | 48 requests / attention GPU | `scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_16k_b48_dynamicnode_mb2_nsys_alignment.sh` |
+| MiniMax-M2.5-FP8 | 8K | 72 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_8k_b72_dynamicnode_mb2_nsys_alignment.sh` |
+| MiniMax-M2.5-FP8 | 16K | 36 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_16k_b36_dynamicnode_mb2_nsys_alignment.sh` |
+
+**vLLM cross-check (`RUN_VLLM_ALIGNMENT=1`).** Scores through an expert-parallel
+vLLM baseline (`--all2all-backend deepep_low_latency --moe-backend deep_gemm`),
+which needs two optional kernel packages in the same environment: `deep_ep`
+(all-to-all dispatch/combine) and `deep_gemm` (FP8 grouped-GEMM experts — vLLM
+only enables its `BATCHED_DEEPGEMM` MoE backend when `import deep_gemm` succeeds,
+otherwise the engine fails to start). Install both via vLLM's
+[`tools/ep_kernels`](https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md),
+or build `deep_gemm` from source (`pip install --no-deps .` in a
+[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) clone). Both are independent
+of the FastAFD serve path, which uses its own vendored kernels. On memory-tight
+nodes, lower `--gpu-memory-utilization` (e.g. to `0.85`) via `VLLM_EXTRA_ARGS`
+to avoid OOM during CUDA-graph capture.
+
+Each preset prints the selected topology and output directory at startup. See
+`scripts/README.md` for the full script map.
+
+## Acknowledgements
+
+FastAFD started from a [mini-sglang](python/minisgl) serving codebase inspired by
+[SGLang](https://github.com/sgl-project/sglang), and builds on ideas and
+components from the broader open-source LLM systems community, including
+[DeepEP](https://github.com/deepseek-ai/DeepEP),
+[DeepGEMM](https://github.com/deepseek-ai/DeepGEMM),
+[vLLM](https://github.com/vllm-project/vllm).
+
+## Citation
+
+If you find FastAFD useful, please cite:
+
+```bibtex
+@misc{fastafd2026,
+  title  = {FastAFD: Open-Source Large-Scale Attention-FFN Disaggregation on Blackwell NVL72},
+  author = {Fu, Yichao and Zhang, Yuxuan and Wang, Ruitian and Chen, Junda and Zhang, Hao},
+  year   = {2026},
+  url    = {https://github.com/hao-ai-lab/FastAFD},
+  note   = {Technical blog and open-source release}
+}
+```

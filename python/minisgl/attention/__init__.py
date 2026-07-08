@@ -33,13 +33,6 @@ def create_fi_backend(config: ModelConfig):
     return FlashInferBackend(config)
 
 
-@SUPPORTED_ATTENTION_BACKENDS.register("fa")
-def create_fa_backend(config: ModelConfig):
-    from .fa import FlashAttentionBackend
-
-    return FlashAttentionBackend(config)
-
-
 def validate_attn_backend(backend: str, allow_auto: bool = True):
     if backend != "auto":
         required_backends = backend.split(",") if "," in backend else [backend]

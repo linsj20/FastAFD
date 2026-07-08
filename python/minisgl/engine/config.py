@@ -24,11 +24,17 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
-    distributed_timeout: float = 60.0
+    distributed_timeout: float = 300.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    ep_size: int = 1
+    dp_size: int = 1
+    dp_rank: int = 0
+    distributed_rank: int | None = None
+    distributed_world_size: int | None = None
+    distributed_tp_groups: tuple[tuple[int, ...], ...] | None = None
 
     @cached_property
     def hf_config(self):

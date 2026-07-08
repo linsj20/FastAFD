@@ -13,6 +13,7 @@ from minisgl.message import (
     BatchBackendMsg,
     BatchFrontendMsg,
     BatchTokenizerMsg,
+    DetokenizeBatchMsg,
     DetokenizeMsg,
     TokenizeMsg,
     UserMsg,
@@ -24,6 +25,16 @@ from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenize
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
     if isinstance(msg, BatchTokenizerMsg):
         return msg.data
+    if isinstance(msg, DetokenizeBatchMsg):
+        return [
+            DetokenizeMsg(uid=uid, next_token=next_token, finished=finished)
+            for uid, next_token, finished in zip(
+                msg.uids,
+                msg.next_tokens,
+                msg.finished,
+                strict=True,
+            )
+        ]
     return [msg]
 
 
@@ -75,6 +86,7 @@ def tokenize_worker(
                         UserReply(
                             uid=msg.uid,
                             incremental_output=reply,
+                            next_token=msg.next_token,
                             finished=msg.finished,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)

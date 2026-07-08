@@ -32,6 +32,21 @@ class DetokenizeMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class DetokenizeBatchMsg(BaseTokenizerMsg):
+    """Compact form of many DetokenizeMsg objects.
+
+    Large AFD decode steps return thousands of one-token replies per step. Sending
+    three flat lists avoids constructing and serializing one dataclass per request
+    on the coordinator hot path; tokenizer/server.py expands it at the boundary
+    where normal detokenization logic still consumes DetokenizeMsg.
+    """
+
+    uids: List[int]
+    next_tokens: List[int]
+    finished: List[bool]
+
+
+@dataclass
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, str]]

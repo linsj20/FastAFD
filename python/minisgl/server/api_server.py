@@ -18,12 +18,11 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    BatchTokenizerMsg,
     TokenizeMsg,
     UserReply,
 )
 from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
-from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -32,6 +31,7 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+_STOP_BACKEND = None
 
 
 def get_global_state() -> FrontendManager:
@@ -77,9 +77,28 @@ class OpenAICompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stream: bool = False
+    return_token_ids: bool = False
     stop: List[str] = []
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+
+    ignore_eos: bool = False
+
+
+class OpenAIBatchCompletionRequest(BaseModel):
+    """MiniSGL extension: submit many homogeneous chat/completion requests at once."""
+
+    model: str
+
+    prompts: List[str] | None = None
+    messages_batch: List[List[Message]] | None = None
+
+    max_tokens: int = 16
+    temperature: float = 1.0
+
+    top_k: int = -1
+    top_p: float = 1.0
+    return_token_ids: bool = False
 
     ignore_eos: bool = False
 
@@ -113,6 +132,9 @@ class FrontendManager:
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
         return uid
+
+    def new_users(self, count: int) -> list[int]:
+        return [self.new_user() for _ in range(count)]
 
     async def listen(self):
         while True:
@@ -158,7 +180,7 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(self, uid: int, return_token_ids: bool = False):
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
             delta = {}
@@ -171,7 +193,14 @@ class FrontendManager:
             chunk = {
                 "id": f"cmpl-{uid}",
                 "object": "text_completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
+                "choices": [
+                    {
+                        "delta": delta,
+                        "index": 0,
+                        "finish_reason": None,
+                        "token_ids": [ack.next_token] if return_token_ids and ack.next_token is not None else None,
+                    }
+                ],
             }
             yield f"data: {json.dumps(chunk)}\n\n".encode()
 
@@ -187,6 +216,22 @@ class FrontendManager:
         yield f"data: {json.dumps(end_chunk)}\n\n".encode()
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
+
+    async def collect_chat_completion(self, uid: int, return_token_ids: bool = False) -> dict:
+        text_parts: list[str] = []
+        token_ids: list[int] = []
+        async for ack in self.wait_for_ack(uid):
+            if ack.incremental_output:
+                text_parts.append(ack.incremental_output)
+            if return_token_ids and ack.next_token is not None:
+                token_ids.append(int(ack.next_token))
+            if ack.finished:
+                break
+        return {
+            "message": {"role": "assistant", "content": "".join(text_parts)},
+            "token_ids": token_ids if return_token_ids else None,
+            "finish_reason": "stop",
+        }
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
         try:
@@ -218,9 +263,13 @@ class FrontendManager:
 async def lifespan(_: FastAPI):
     yield
     # shutdown code here
-    global _GLOBAL_STATE
+    global _GLOBAL_STATE, _STOP_BACKEND
     if _GLOBAL_STATE is not None:
         _GLOBAL_STATE.shutdown()
+        _GLOBAL_STATE = None
+    if _STOP_BACKEND is not None:
+        _STOP_BACKEND()
+        _STOP_BACKEND = None
 
 
 app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
@@ -279,9 +328,71 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
     )
 
     return StreamingResponse(
-        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+        state.stream_with_cancellation(
+            state.stream_chat_completions(uid, return_token_ids=req.return_token_ids),
+            request,
+            uid,
+        ),
         media_type="text/event-stream",
     )
+
+
+@app.post("/v1/chat/completions/batch")
+async def v1_batch_completions(req: OpenAIBatchCompletionRequest):
+    state = get_global_state()
+    if req.prompts is not None:
+        prompts: list[str | list[dict[str, str]]] = list(req.prompts)
+    else:
+        assert req.messages_batch is not None, "Either 'prompts' or 'messages_batch' must be provided"
+        prompts = [[msg.model_dump() for msg in messages] for messages in req.messages_batch]
+    if not prompts:
+        return {
+            "id": "batchcmpl-empty",
+            "object": "chat.completion.batch",
+            "choices": [],
+        }
+
+    def make_sampling_params() -> SamplingParams:
+        return SamplingParams(
+            ignore_eos=req.ignore_eos,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+        )
+
+    uids = state.new_users(len(prompts))
+    await state.send_one(
+        BatchTokenizerMsg(
+            data=[
+                TokenizeMsg(
+                    uid=uid,
+                    text=prompt,
+                    sampling_params=make_sampling_params(),
+                )
+                for uid, prompt in zip(uids, prompts, strict=True)
+            ]
+        )
+    )
+
+    results = await asyncio.gather(
+        *[
+            state.collect_chat_completion(uid, return_token_ids=req.return_token_ids)
+            for uid in uids
+        ]
+    )
+    choices = [
+        {
+            "index": index,
+            **result,
+        }
+        for index, result in enumerate(results)
+    ]
+    return {
+        "id": f"batchcmpl-{uids[0]}-{uids[-1]}",
+        "object": "chat.completion.batch",
+        "choices": choices,
+    }
 
 
 @app.get("/v1/models")
@@ -321,23 +432,16 @@ async def shell_completion(req: OpenAICompletionRequest):
     )
 
 
-async def read_stdin():
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
-    while True:
-        line = await reader.readline()
-        line = line.decode().rstrip("\n")
-
-
-async def async_input(prompt=""):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: input(prompt))
-
-
 async def shell():
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import WordCompleter
+    except ImportError as exc:
+        raise RuntimeError(
+            "Shell mode requires the optional 'shell' dependencies. "
+            "Install prompt_toolkit or use `pip install -e .[shell]`."
+        ) from exc
+
     commands = ["/exit", "/reset"]
     completer = WordCompleter(commands)
     session = PromptSession("$ ", completer=completer)
@@ -400,7 +504,12 @@ async def shell():
             child.kill()
 
 
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(
+    config: ServerArgs,
+    start_backend: Callable[[], None],
+    stop_backend: Callable[[], None] | None = None,
+    run_shell: bool = False,
+) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -411,7 +520,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         run_shell: If True, run an interactive terminal shell instead of starting uvicorn.
     """
 
-    global _GLOBAL_STATE
+    global _GLOBAL_STATE, _STOP_BACKEND
 
     if run_shell:
         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
@@ -420,6 +529,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     port = config.server_port
 
     assert _GLOBAL_STATE is None, "Global state is already initialized"
+    _STOP_BACKEND = stop_backend
     _GLOBAL_STATE = FrontendManager(
         config=config,
         recv_tokenizer=ZmqAsyncPullQueue(
@@ -438,7 +548,15 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+    try:
+        if not run_shell:
+            uvicorn.run(app, host=host, port=port)
+        else:
+            asyncio.run(shell())
+    finally:
+        if _GLOBAL_STATE is not None:
+            _GLOBAL_STATE.shutdown()
+            _GLOBAL_STATE = None
+        if _STOP_BACKEND is not None:
+            _STOP_BACKEND()
+            _STOP_BACKEND = None

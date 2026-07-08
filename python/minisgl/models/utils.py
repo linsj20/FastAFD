@@ -28,6 +28,7 @@ class GatedMLP(BaseOP):
             config.hidden_size,
             [config.intermediate_size, config.intermediate_size],
             has_bias=False,
+            quant=config.quant,
         )
 
         FN_MAP = {"silu": silu_and_mul, "gelu": gelu_and_mul}
@@ -39,6 +40,7 @@ class GatedMLP(BaseOP):
             config.intermediate_size,
             config.hidden_size,
             has_bias=False,
+            quant=config.quant,
         )
 
     @nvtx_annotate("MLP")
@@ -58,6 +60,7 @@ class MoEMLP(BaseOP):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.norm_topk_prob,
+            quant=config.quant,
         )
         self.gate = LinearReplicated(
             config.hidden_size,
@@ -92,6 +95,7 @@ class RopeAttn(BaseOP):
             num_qo_heads=config.num_qo_heads,
             num_kv_heads=config.num_kv_heads,
             has_bias=has_attn_bias,
+            quant=config.quant,
         )
         self.has_qk_norm = has_qk_norm
         if has_qk_norm:
@@ -113,6 +117,7 @@ class RopeAttn(BaseOP):
             head_dim * config.num_qo_heads,
             config.hidden_size,
             has_bias=False,
+            quant=config.quant,
         )
 
     @nvtx_annotate("MHA")

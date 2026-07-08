@@ -18,4 +18,8 @@ def gelu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
     return gelu_and_mul(x, out=out)
 
 
-__all__ = ["silu_and_mul", "gelu_and_mul"]
+def glm4_silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
+    return silu_and_mul(x, out=out)
+
+
+__all__ = ["silu_and_mul", "gelu_and_mul", "glm4_silu_and_mul"]

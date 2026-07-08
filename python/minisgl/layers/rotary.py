@@ -20,7 +20,7 @@ class RotaryEmbedding(StateLessOP):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         if post_process is not None:
             inv_freq = post_process(inv_freq)
@@ -35,6 +35,10 @@ class RotaryEmbedding(StateLessOP):
         from flashinfer import apply_rope_with_cos_sin_cache_inplace
 
         self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+
+    @property
+    def cos_sin_cache(self) -> torch.Tensor:
+        return self._cos_sin_cache
 
     def forward(
         self,

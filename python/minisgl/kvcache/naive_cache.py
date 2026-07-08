@@ -15,7 +15,6 @@ class NaiveCacheHandle(BaseCacheHandle):
 
 class NaivePrefixCache(BasePrefixCache):
     def __init__(self, device: torch.device):
-        self.device = device
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         NaiveCacheHandle.empty_tensor = self.empty_tensor
         super().__init__()
@@ -33,9 +32,6 @@ class NaivePrefixCache(BasePrefixCache):
         if size == 0:
             return self.empty_tensor
         raise NotImplementedError("NaiveCacheManager does not support eviction.")
-
-    def reset(self) -> None:
-        pass
 
     @property
     def size_info(self) -> SizeInfo:

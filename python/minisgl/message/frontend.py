@@ -26,4 +26,5 @@ class BatchFrontendMsg(BaseFrontendMsg):
 class UserReply(BaseFrontendMsg):
     uid: int
     incremental_output: str
+    next_token: int | None
     finished: bool
