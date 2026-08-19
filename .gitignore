@@ -15,6 +15,10 @@ __pycache__/
 *.nsys-rep
 *.ncu-rep
 
+# local experiment workspaces and macOS metadata
+scratch/
+.DS_Store
+
 # binaries
 build/
 dist/

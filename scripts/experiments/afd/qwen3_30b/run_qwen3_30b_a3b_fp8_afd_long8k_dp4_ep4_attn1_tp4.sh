@@ -60,19 +60,31 @@ export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-0}"
 export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-0}"
 NSYS="${NSYS:-0}"
 NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-${MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE:-graph}}"
-NSYS_START_STEP="${NSYS_START_STEP:-${MINISGL_RAY_NSYS_START_STEP:-0}}"
-NSYS_STOP_STEP="${NSYS_STOP_STEP:-${MINISGL_RAY_NSYS_STOP_STEP:-0}}"
+NSYS_TARGET_BATCH_PER_ATTN_DP="${NSYS_TARGET_BATCH_PER_ATTN_DP:-${MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP:-$PER_ATTN_GPU_BSZ}}"
+NSYS_CAPTURE_DECODE_STEPS="${NSYS_CAPTURE_DECODE_STEPS:-${MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS:-15}}"
+CAPTURE_EXIT_AFTER_WINDOW="${CAPTURE_EXIT_AFTER_WINDOW:-$NSYS}"
 CLEAN_FIRST="${CLEAN_FIRST:-1}"
 CLEAN_AFTER="${CLEAN_AFTER:-1}"
 WAIT_READY_TIMEOUT="${WAIT_READY_TIMEOUT:-1800}"
 SAMPLE_TIMEOUT="${SAMPLE_TIMEOUT:-3600}"
-POST_SHUTDOWN_SLEEP="${POST_SHUTDOWN_SLEEP:-20}"
-# Grace (seconds) for the AFD supervisor tree to shut down on SIGTERM before
-# SIGKILL. The per-rank workers flush their CPU NVTX trace + finalize their
-# nsys-rep during this window; with many workers / multi-node it needs to be
-# larger than the old hardcoded 10s, or the workers get killed mid-flush and
-# their minisgl_rank*.nsys-rep / *_nvtx_cpu.json never get written.
-AFD_STOP_TIMEOUT_S="${AFD_STOP_TIMEOUT_S:-10}"
+CAPTURE_STOP_PROOF_TIMEOUT_S="${CAPTURE_STOP_PROOF_TIMEOUT_S:-$SAMPLE_TIMEOUT}"
+CAPTURE_WORKER_STOP_TIMEOUT_S="${CAPTURE_WORKER_STOP_TIMEOUT_S:-60}"
+CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S="${CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S:-600}"
+
+[[ "$CAPTURE_EXIT_AFTER_WINDOW" == 0 || "$CAPTURE_EXIT_AFTER_WINDOW" == 1 ]]
+if [[ "$CAPTURE_EXIT_AFTER_WINDOW" == 1 ]]; then
+  [[ "$NSYS" == 1 ]] || {
+    echo "CAPTURE_EXIT_AFTER_WINDOW=1 requires NSYS=1" >&2
+    exit 2
+  }
+  [[ "$RUN_VLLM_ALIGNMENT" == 0 ]] || {
+    echo "capture-terminal profiling cannot run the completed-output vLLM alignment" >&2
+    exit 2
+  }
+  [[ "$CAPTURE_STOP_PROOF_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]
+  [[ "$CAPTURE_WORKER_STOP_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]
+  [[ "$CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S" =~ ^[1-9][0-9]*$ ]]
+fi
 
 export MINISGL_LOCAL_CACHE_BASE="${MINISGL_LOCAL_CACHE_BASE:-$CALIB_DIR/cache}"
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$MINISGL_LOCAL_CACHE_BASE/flashinfer}"
@@ -167,16 +179,15 @@ kill_tree() {
 
 stop_process_tree() {
   local pid="$1"
-  local timeout_s="${2:-10}"
   local waited=0
   if ! process_is_running "$pid"; then
     return 0
   fi
+  # Profiling-stop and sample-durability synchronization happens before
+  # teardown. Allow at most ten seconds for graceful shutdown, with no
+  # additional post-shutdown delay.
   kill_tree "$pid" TERM
-  while process_is_running "$pid"; do
-    if (( waited >= timeout_s * 10 )); then
-      break
-    fi
+  while process_is_running "$pid" && (( waited < 100 )); do
     sleep 0.1
     waited=$((waited + 1))
   done
@@ -265,8 +276,9 @@ echo "  max_seq_len: $MINISGL_MAX_SEQ_LEN"
 echo "  page_size: $MINISGL_PAGE_SIZE"
 echo "  nsys: $NSYS"
 echo "  nsys_cuda_graph_trace: $NSYS_CUDA_GRAPH_TRACE"
-echo "  nsys_start_step: $NSYS_START_STEP"
-echo "  nsys_stop_step: $NSYS_STOP_STEP"
+echo "  nsys_target_batch_per_attn_dp: $NSYS_TARGET_BATCH_PER_ATTN_DP"
+echo "  nsys_capture_decode_steps: $NSYS_CAPTURE_DECODE_STEPS"
+echo "  capture_exit_after_window: $CAPTURE_EXIT_AFTER_WINDOW"
 echo "  flashinfer_workspace_base: ${FLASHINFER_WORKSPACE_BASE:-<default>}"
 echo "  tvm_ffi_cache_dir: ${TVM_FFI_CACHE_DIR:-<default>}"
 echo "  ep_jit_cache_dir: ${EP_JIT_CACHE_DIR:-<default>}"
@@ -291,11 +303,14 @@ if [[ "$RUN_VLLM_ALIGNMENT" == "1" ]]; then
 fi
 echo "  clean_first: $CLEAN_FIRST"
 echo "  clean_after: $CLEAN_AFTER"
-echo "  post_shutdown_sleep: $POST_SHUTDOWN_SLEEP"
 
 AFD_PID=""
+SAMPLE_PID=""
 VLLM_PID=""
 cleanup() {
+  if [[ -n "${SAMPLE_PID:-}" ]]; then
+    stop_process_tree "$SAMPLE_PID" 2>/dev/null || true
+  fi
   if [[ -n "${AFD_PID:-}" ]]; then
     stop_process_tree "$AFD_PID" 2>/dev/null || true
   fi
@@ -337,8 +352,8 @@ start_cmd=(
 )
 if [[ "$NSYS" == "1" ]]; then
   export MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE"
-  export MINISGL_RAY_NSYS_START_STEP="$NSYS_START_STEP"
-  export MINISGL_RAY_NSYS_STOP_STEP="$NSYS_STOP_STEP"
+  export MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP="$NSYS_TARGET_BATCH_PER_ATTN_DP"
+  export MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS="$NSYS_CAPTURE_DECODE_STEPS"
   start_cmd+=(--ray-nsys --ray-nsys-output-prefix "$NSYS_OUTPUT_PREFIX")
 fi
 
@@ -383,12 +398,132 @@ fi
 if [[ "$IGNORE_EOS" == "1" ]]; then
   sample_cmd+=(--ignore-eos)
 fi
-"${sample_cmd[@]}" >"$SAMPLE_LOG" 2>&1
+if [[ "$CAPTURE_EXIT_AFTER_WINDOW" == 1 ]]; then
+  "${sample_cmd[@]}" >"$SAMPLE_LOG" 2>&1 &
+  SAMPLE_PID=$!
+  sample_reaped=0
+  expected_worker_stops=$((
+    ATTN_DP_SIZE * ATTN_TP_SIZE + MLP_DP_SIZE * MLP_TP_SIZE
+  ))
+  expected_trace_count=$((NSYS_CAPTURE_DECODE_STEPS + 1))
+  deadline=$((SECONDS + CAPTURE_STOP_PROOF_TIMEOUT_S))
+  worker_stop_deadline=0
+  while true; do
+    capture_lines=$(grep -c \
+      "nsys profiler:target_decode_window target_batch_per_dp=${NSYS_TARGET_BATCH_PER_ATTN_DP} warmup_step_id=.* count=${NSYS_CAPTURE_DECODE_STEPS} trace_count=${expected_trace_count}$" \
+      "$RAY_LOG_DIR/afd_coordinator.log" 2>/dev/null || true)
+    worker_stops=$(
+      grep -l "nsys profiler:stop sync=1" \
+        "$RAY_LOG_DIR"/attention_dp*_rank*.log \
+        "$RAY_LOG_DIR"/mlp_dp*_rank*.log 2>/dev/null | wc -l || true
+    )
+    if (( capture_lines == 1 && worker_stops == expected_worker_stops )); then
+      break
+    fi
+    if (( capture_lines == 1 )); then
+      if (( worker_stop_deadline == 0 )); then
+        worker_stop_deadline=$((SECONDS + CAPTURE_WORKER_STOP_TIMEOUT_S))
+      elif (( SECONDS >= worker_stop_deadline )); then
+        echo "timed out after exact capture window waiting for all GPU workers to stop profiling: marker=$capture_lines worker_stops=$worker_stops/$expected_worker_stops timeout_seconds=$CAPTURE_WORKER_STOP_TIMEOUT_S" >&2
+        exit 3
+      fi
+    fi
+    if (( ! sample_reaped )) && ! process_is_running "$SAMPLE_PID"; then
+      set +e
+      wait "$SAMPLE_PID"
+      sample_status=$?
+      set -e
+      sample_reaped=1
+      (( sample_status == 0 )) || {
+        echo "sampling client exited before the profiling stop proof: status=$sample_status" >&2
+        exit "$sample_status"
+      }
+      (( capture_lines == 1 )) || {
+        echo "sampling completed without one target-decode capture marker" >&2
+        exit 3
+      }
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "timed out waiting for all GPU workers to stop profiling: marker=$capture_lines worker_stops=$worker_stops/$expected_worker_stops" >&2
+      exit 3
+    fi
+    sleep 0.1
+  done
+  python - "$RAY_LOG_DIR/afd_coordinator.log" "$RUN_DIR/capture-complete.json" \
+    "$NSYS_TARGET_BATCH_PER_ATTN_DP" "$NSYS_CAPTURE_DECODE_STEPS" \
+    "$worker_stops" <<'PY'
+from pathlib import Path
+import json
+import re
+import sys
 
-stop_process_tree "$AFD_PID" "$AFD_STOP_TIMEOUT_S" || true
+log_path, output_path = Path(sys.argv[1]), Path(sys.argv[2])
+target, expected_count, worker_stops = map(int, sys.argv[3:])
+matches = re.findall(
+    r"nsys profiler:target_decode_window "
+    r"target_batch_per_dp=(\d+) warmup_step_id=(\d+) "
+    r"step_ids=([0-9,]+) count=(\d+) trace_count=(\d+)",
+    log_path.read_text(errors="replace"),
+)
+if len(matches) != 1:
+    raise RuntimeError(matches)
+observed_target, warmup_text, step_csv, observed_count, trace_count = matches[0]
+warmup_step = int(warmup_text)
+steps = [int(value) for value in step_csv.split(",")]
+if (
+    int(observed_target) != target
+    or int(observed_count) != expected_count
+    or int(trace_count) != expected_count + 1
+):
+    raise RuntimeError(matches[0])
+if len(steps) != expected_count or any(b != a + 1 for a, b in zip(steps, steps[1:])):
+    raise RuntimeError(steps)
+if not steps or steps[0] != warmup_step + 1:
+    raise RuntimeError((warmup_step, steps))
+record = {
+    "target_batch_per_attention_dp": target,
+    "capture_decode_steps": expected_count,
+    "trace_decode_launches": expected_count + 1,
+    "warmup_decode_step_id": warmup_step,
+    "trace_decode_step_ids": [warmup_step, *steps],
+    "decode_step_ids": steps,
+    "gpu_worker_profiler_stop_logs": worker_stops,
+    "terminal_policy": "stop client and server immediately after all GPU workers synchronously stop the exact target-decode capture",
+}
+output_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+print(json.dumps(record, sort_keys=True))
+PY
+  if (( ! sample_reaped )); then
+    sample_durability_deadline=$((SECONDS + CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S))
+    while process_is_running "$SAMPLE_PID" && \
+        (( SECONDS < sample_durability_deadline )); do
+      sleep 1
+    done
+    if process_is_running "$SAMPLE_PID"; then
+      echo "sampling client did not make sample.json durable within ${CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S}s after the exact capture proof" >&2
+      exit 3
+    fi
+    set +e
+    wait "$SAMPLE_PID"
+    sample_status=$?
+    set -e
+    (( sample_status == 0 )) || {
+      echo "sampling client failed after the exact capture proof: status=$sample_status" >&2
+      exit "$sample_status"
+    }
+  fi
+  [[ -s "$SAMPLE_JSON" ]] || {
+    echo "sampling client completed after the exact capture proof without a nonempty sample.json" >&2
+    exit 3
+  }
+  SAMPLE_PID=""
+else
+  "${sample_cmd[@]}" >"$SAMPLE_LOG" 2>&1
+fi
+
+stop_process_tree "$AFD_PID" || true
 wait "$AFD_PID" >/dev/null 2>&1 || true
 AFD_PID=""
-sleep "$POST_SHUTDOWN_SLEEP"
 if [[ "$RUN_VLLM_ALIGNMENT" == "1" || "$CLEAN_AFTER" == "1" ]]; then
   "$SCRIPT_ROOT/kill_afd_ray_tasks.sh" >/dev/null 2>&1 || true
 fi

@@ -528,29 +528,38 @@ def run_api_server(
     host = config.server_host
     port = config.server_port
 
-    assert _GLOBAL_STATE is None, "Global state is already initialized"
-    _STOP_BACKEND = stop_backend
-    _GLOBAL_STATE = FrontendManager(
-        config=config,
-        recv_tokenizer=ZmqAsyncPullQueue(
-            config.zmq_frontend_addr,
-            create=True,
-            decoder=BaseFrontendMsg.decoder,
-        ),
-        send_tokenizer=ZmqAsyncPushQueue(
-            config.zmq_tokenizer_addr,
-            create=config.frontend_create_tokenizer_link,
-            encoder=BaseTokenizerMsg.encoder,
-        ),
-    )
-
-    # start the backend here
-    start_backend()
-
-    logger.info(f"API server is ready to serve on {host}:{port}")
+    uvicorn_socket = None
     try:
+        # Reserve the HTTP listener before starting the backend. AFD startup can
+        # spend minutes loading models and compiling graphs; probing a free port
+        # before that work leaves a TOCTOU window in which another process can
+        # claim the port and waste the entire GPU startup.
         if not run_shell:
-            uvicorn.run(app, host=host, port=port)
+            uvicorn_config = uvicorn.Config(app, host=host, port=port)
+            uvicorn_socket = uvicorn_config.bind_socket()
+
+        assert _GLOBAL_STATE is None, "Global state is already initialized"
+        _STOP_BACKEND = stop_backend
+        _GLOBAL_STATE = FrontendManager(
+            config=config,
+            recv_tokenizer=ZmqAsyncPullQueue(
+                config.zmq_frontend_addr,
+                create=True,
+                decoder=BaseFrontendMsg.decoder,
+            ),
+            send_tokenizer=ZmqAsyncPushQueue(
+                config.zmq_tokenizer_addr,
+                create=config.frontend_create_tokenizer_link,
+                encoder=BaseTokenizerMsg.encoder,
+            ),
+        )
+
+        # start the backend here
+        start_backend()
+
+        logger.info(f"API server is ready to serve on {host}:{port}")
+        if not run_shell:
+            uvicorn.Server(uvicorn_config).run(sockets=[uvicorn_socket])
         else:
             asyncio.run(shell())
     finally:
@@ -560,3 +569,5 @@ def run_api_server(
         if _STOP_BACKEND is not None:
             _STOP_BACKEND()
             _STOP_BACKEND = None
+        if uvicorn_socket is not None:
+            uvicorn_socket.close()

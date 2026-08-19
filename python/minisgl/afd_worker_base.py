@@ -34,6 +34,7 @@ from minisgl.utils import (
 from .afd_protocol import (
     AfdCommand,
     AfdProfilerCmd,
+    AfdProfilerReply,
     AfdReply,
     AfdTopology,
     AfdWorkerReadyReply,
@@ -487,6 +488,7 @@ class BaseAfdWorker:
                 top_k=int(mc.num_experts_per_tok),
                 num_max_dispatch_tokens_per_rank=bucket,
                 num_lanes=adapter_lanes,
+                defer_buffer_allocation=True,
                 gate_renormalize=bool(getattr(mc, "norm_topk_prob", True)),
                 shared_experts_per_rank=1 if remote_shared_experts else 0,
                 routed_scaling_factor=float(model_extra.get("routed_scaling_factor", 1.0)),
@@ -610,6 +612,7 @@ class BaseAfdWorker:
             )
             model.load_state_dict(extract_stage_state_dict(model, full))
             del full
+            sd = None
             try:
                 sd = model.state_dict()
                 tensor_bytes = sum(int(t.numel() * t.element_size()) for t in sd.values())
@@ -645,6 +648,11 @@ class BaseAfdWorker:
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
+            finally:
+                # state_dict() tensors alias the live parameters. Keeping this
+                # debug-only mapping alive would pin the old L1 weights after
+                # each transformed layer clears its source-format attributes.
+                del sd
             if self._afd_moe_backend == "megamoe_m2n":
                 # One-time per-layer requant of FP8 expert weights to the mega
                 # kernel's per-32 UE8M0 interleaved format.
@@ -686,6 +694,21 @@ class BaseAfdWorker:
                 torch.cuda.empty_cache()
             else:
                 self._afd_eg_model = model
+
+        if self._afd_moe_backend == "megamoe_m2n":
+            # Weight transformation has a temporary allocation peak. Allocate
+            # the fan-in-sized symmetric runtime buffers only after the EG
+            # ranks have dropped the source-format expert weights. This is a
+            # collective operation over the AG+EG union world.
+            self._afd_adapter.allocate_buffers()
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_buffers "
+                f"allocated lanes={adapter_lanes} "
+                f"cuda_alloc_gib={torch.cuda.memory_allocated() / (1024**3):.2f} "
+                f"cuda_reserved_gib={torch.cuda.memory_reserved() / (1024**3):.2f}",
+                flush=True,
+            )
 
         # CUDA-graph decode runners (lockstep AG/EG). Built here; captured later
         # by warmup_afd_decode_graphs() once the coordinator drives all ranks
@@ -816,11 +839,18 @@ class BaseAfdWorker:
     def handle_profiler_cmd(self, cmd: AfdProfilerCmd) -> None:
         if cmd.action == "start":
             self.start_cuda_profiler(sync=bool(cmd.sync))
-            return
-        if cmd.action == "stop":
+        elif cmd.action == "stop":
             self.stop_cuda_profiler(sync=bool(cmd.sync))
-            return
-        raise RuntimeError(f"Unsupported AFD profiler command action: {cmd.action!r}")
+        else:
+            raise RuntimeError(f"Unsupported AFD profiler command action: {cmd.action!r}")
+        if cmd.ack:
+            self._send_reply(
+                AfdProfilerReply(
+                    worker_rank=self.worker_rank,
+                    step_id=None,
+                    action=cmd.action,
+                )
+            )
 
     def _send_reply(self, reply: AfdReply) -> None:
         queue = self._send_to_coordinator

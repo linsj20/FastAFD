@@ -208,6 +208,12 @@ Available presets:
 | MiniMax-M2.5-FP8 | 8K | 72 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_8k_b72_dynamicnode_mb2_nsys_alignment.sh` |
 | MiniMax-M2.5-FP8 | 16K | 36 requests / attention GPU | `scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_16k_b36_dynamicnode_mb2_nsys_alignment.sh` |
 
+Reusable OCI-HSG single-case, same-tray sweep, corrected CUDA-metric, and
+wide-EP baseline controls live under `scripts/experiments/afd/oci_hsg/`; see
+that directory's README for the required task-workspace inputs and provenance
+checks. Generated plans, manifests, logs, traces, and results are intentionally
+kept outside the source tree.
+
 **vLLM cross-check (`RUN_VLLM_ALIGNMENT=1`).** Scores through an expert-parallel
 vLLM baseline (`--all2all-backend deepep_low_latency --moe-backend deep_gemm`),
 which needs two optional kernel packages in the same environment: `deep_ep`

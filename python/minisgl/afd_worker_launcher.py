@@ -10,7 +10,6 @@ from minisgl.server.supervisor_ray import _build_ray_nsight_options
 
 from .afd_attention_worker import AfdAttentionWorker
 from .afd_expert_worker import AfdExpertWorker
-from .afd_profiler import start_nsys_runtime_capture
 from .afd_protocol import AfdWorkerReadyReply
 from .afd_support import (
     afd_dp_node_layout,
@@ -251,15 +250,13 @@ def startup_afd_workers(coord: Any) -> None:
     # queues instead of per-step Ray RPC.
     coord._init_centralized_schedulers()
     if coord.server_args.ray_nsys:
-        if coord._nsys_start_step <= 0:
-            start_nsys_runtime_capture(coord, sync=True, reason="startup")
-        else:
-            log_line(
-                coord.log_path,
-                "[afd-coordinator] nsys profiler:defer "
-                f"start_step={coord._nsys_start_step} stop_step={coord._nsys_stop_step}",
-                flush=True,
-            )
+        log_line(
+            coord.log_path,
+            "[afd-coordinator] nsys profiler:defer_until_target_decode "
+            f"target_batch_per_dp={coord._nsys_target_batch_per_dp} "
+            f"capture_steps={coord._nsys_capture_decode_steps}",
+            flush=True,
+        )
     coord._init_worker_queues()
     if coord._worker_inbox is None or coord._worker_inbox_addr is None:
         raise RuntimeError("Failed to initialize AFD worker ZMQ queues")

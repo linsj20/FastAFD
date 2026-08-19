@@ -62,8 +62,8 @@ from .afd_support import (
     normalize_attention_backend_page_size,
 )
 from .afd_profiler import (
-    maybe_start_nsys_runtime_capture_for_step,
-    maybe_stop_nsys_runtime_capture_after_step,
+    finish_nsys_runtime_capture_step_launch,
+    prepare_nsys_runtime_capture_for_decode_step,
     stop_nsys_runtime_capture,
 )
 from .afd_scheduler import CentralizedAfdDpScheduler
@@ -242,9 +242,46 @@ class AfdCoordinator:
         self._afd_reply_seen: dict[int, int] = {}
         self._afd_reply_tokens_by_dp: dict[int, dict[int, list[int]]] = {}
         self._shutdown_requested = False
+        self._worker_hot_loop_shutdown_timeout_s = _env_int(
+            "MINISGL_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S", 300
+        )
+        if self._worker_hot_loop_shutdown_timeout_s <= 0:
+            raise ValueError(
+                "MINISGL_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S must be positive"
+            )
+        self._worker_shutdown_timeout_s = _env_int(
+            "MINISGL_AFD_WORKER_SHUTDOWN_TIMEOUT_S", 120
+        )
+        if self._worker_shutdown_timeout_s <= 0:
+            raise ValueError(
+                "MINISGL_AFD_WORKER_SHUTDOWN_TIMEOUT_S must be positive"
+            )
         self._nsys_runtime_started = False
-        self._nsys_start_step = max(0, _env_int("MINISGL_RAY_NSYS_START_STEP", 0))
-        self._nsys_stop_step = max(0, _env_int("MINISGL_RAY_NSYS_STOP_STEP", 0))
+        self._nsys_target_batch_per_dp = _env_int(
+            "MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP",
+            self.attn_max_running_req,
+        )
+        self._nsys_capture_decode_steps = _env_int(
+            "MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS",
+            15,
+        )
+        if self.server_args.ray_nsys:
+            if self._nsys_target_batch_per_dp <= 0:
+                raise ValueError(
+                    "MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP must be positive"
+                )
+            if self._nsys_target_batch_per_dp > self.attn_max_running_req:
+                raise ValueError(
+                    "Nsight target batch exceeds the per-attention-DP request "
+                    f"capacity: target={self._nsys_target_batch_per_dp} "
+                    f"capacity={self.attn_max_running_req}"
+                )
+            if self._nsys_capture_decode_steps != 15:
+                raise ValueError(
+                    "MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS must be exactly 15"
+                )
+        self._nsys_capture_step_ids: list[int] = []
+        self._nsys_trace_step_ids: list[int] = []
         self._thread: threading.Thread | None = None
         self._failure: str | None = None
 
@@ -488,6 +525,16 @@ class AfdCoordinator:
                 flush=True,
             )
 
+    def _flush_cpu_trace(self, reason: str) -> None:
+        trace_path = shutdown_nvtx_cpu_trace()
+        if trace_path:
+            log_line(
+                self.log_path,
+                f"[afd-coordinator] cpu_trace flushed reason={reason} path={trace_path}",
+                flush=True,
+            )
+        flush_log_lines(self.log_path)
+
     def start(self) -> None:
         """Ray actor entry point.
 
@@ -554,6 +601,13 @@ class AfdCoordinator:
 
     def shutdown(self) -> None:
         self._shutdown_requested = True
+        # Write an immediate snapshot before any distributed shutdown call can
+        # block. The recorder stays live, so later snapshots atomically replace
+        # this one with progressively more complete events on the clean path.
+        self._shutdown_call(
+            "flush_cpu_trace_at_shutdown_entry",
+            lambda: self._flush_cpu_trace("shutdown_entry"),
+        )
         if self._cmd_to_workers:
             self._shutdown_call(
                 "broadcast_stop",
@@ -561,10 +615,20 @@ class AfdCoordinator:
             )
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+        # The coordinator event loop owns the CompleteCollect events required by
+        # postprocessing. Persist them before waiting for worker hot loops, which
+        # can remain blocked until the outer launcher terminates this process.
+        self._shutdown_call(
+            "flush_cpu_trace_after_event_loop",
+            lambda: self._flush_cpu_trace("after_event_loop"),
+        )
         if self._worker_hot_loop_refs:
             self._shutdown_call(
                 "wait_worker_hot_loops",
-                lambda: ray.get(self._worker_hot_loop_refs, timeout=5.0),
+                lambda: ray.get(
+                    self._worker_hot_loop_refs,
+                    timeout=float(self._worker_hot_loop_shutdown_timeout_s),
+                ),
             )
             self._worker_hot_loop_refs = []
         if self._nsys_runtime_started:
@@ -572,6 +636,15 @@ class AfdCoordinator:
                 "stop_cuda_profiler",
                 lambda: stop_nsys_runtime_capture(self, sync=True, reason="shutdown"),
             )
+        # Preserve the complete scheduling trace before entering ZeroMQ and
+        # Ray-worker teardown. Those operations can terminate the coordinator
+        # process on multi-node runs, so a trace written only at the end of
+        # shutdown is not reliable. The final flush below remains useful on the
+        # clean path and atomically replaces this early snapshot.
+        self._shutdown_call(
+            "flush_cpu_trace_before_queue_teardown",
+            lambda: self._flush_cpu_trace("before_queue_teardown"),
+        )
         self._shutdown_call("stop_tokenizer_inbox", self._tokenizer_inbox.stop)
         if self._send_into_detokenizer is not None:
             self._shutdown_call(
@@ -587,16 +660,22 @@ class AfdCoordinator:
                 lambda worker=worker: shutdown_refs.append(worker.shutdown.remote()),
             )
         if shutdown_refs:
-            self._shutdown_call("wait_worker_shutdown", lambda: ray.get(shutdown_refs))
+            self._shutdown_call(
+                "wait_worker_shutdown",
+                lambda: ray.get(
+                    shutdown_refs,
+                    timeout=float(self._worker_shutdown_timeout_s),
+                ),
+            )
         for worker_index, worker in enumerate(self._all_workers()):
             self._shutdown_call(
                 f"kill_worker[{worker_index}]",
                 lambda worker=worker: ray.kill(worker, no_restart=True),
             )
-        trace_path = shutdown_nvtx_cpu_trace()
-        if trace_path:
-            log_line(self.log_path, f"[afd-coordinator] cpu_trace flushed path={trace_path}", flush=True)
-        flush_log_lines(self.log_path)
+        self._shutdown_call(
+            "flush_cpu_trace_final",
+            lambda: self._flush_cpu_trace("final"),
+        )
 
     def _init_centralized_schedulers(self) -> None:
         if not self.attn_workers:
@@ -1172,7 +1251,15 @@ class AfdCoordinator:
             if prepared is None:
                 continue
             bucket, dp_batches, phase, num_mb = prepared
-            maybe_start_nsys_runtime_capture_for_step(self, step_id)
+            capture_included = prepare_nsys_runtime_capture_for_decode_step(
+                self,
+                step_id,
+                phase=phase,
+                real_batch_sizes=tuple(
+                    0 if item.is_dummy else int(item.batch.size)
+                    for item in dp_batches
+                ),
+            )
             items = self._afd_launch_step(
                 step_id=step_id,
                 attn_tp=attn_tp,
@@ -1184,6 +1271,11 @@ class AfdCoordinator:
                 phase=phase,
                 num_mb=num_mb,
             )
+            finish_nsys_runtime_capture_step_launch(
+                self,
+                step_id,
+                included=capture_included,
+            )
             for dp, freed in self._afd_complete_global(
                 (step_id, items),
                 scheds,
@@ -1191,7 +1283,6 @@ class AfdCoordinator:
                 attn_tp,
             ).items():
                 pending_free[dp] = tuple(pending_free[dp]) + tuple(freed)
-            maybe_stop_nsys_runtime_capture_after_step(self, step_id)
             step_id += 1
 
     def _afd_overlap_loop(self) -> None:
@@ -1232,7 +1323,6 @@ class AfdCoordinator:
             workers_flushed = True
 
         def complete_pending(pending_item) -> None:
-            gsid = pending_item[0]
             for dp, freed in self._afd_complete_global(
                 pending_item,
                 scheds,
@@ -1244,7 +1334,6 @@ class AfdCoordinator:
                 # command FIFO means this free reaches the AG worker only after
                 # all older in-flight commands that might still reference it.
                 pending_free[dp] = tuple(pending_free[dp]) + tuple(freed)
-            maybe_stop_nsys_runtime_capture_after_step(self, gsid)
 
         while True:
             blocking = not pending and not self._has_local_scheduler_work()
@@ -1267,7 +1356,15 @@ class AfdCoordinator:
                     scheduled_none = True
                     break
                 bucket, dp_batches, phase, num_mb = prepared
-                maybe_start_nsys_runtime_capture_for_step(self, step_id)
+                capture_included = prepare_nsys_runtime_capture_for_decode_step(
+                    self,
+                    step_id,
+                    phase=phase,
+                    real_batch_sizes=tuple(
+                        0 if item.is_dummy else int(item.batch.size)
+                        for item in dp_batches
+                    ),
+                )
                 items = self._afd_launch_step(
                     step_id=step_id,
                     attn_tp=attn_tp,
@@ -1278,6 +1375,11 @@ class AfdCoordinator:
                     dp_batches=dp_batches,
                     phase=phase,
                     num_mb=num_mb,
+                )
+                finish_nsys_runtime_capture_step_launch(
+                    self,
+                    step_id,
+                    included=capture_included,
                 )
                 pending.append((step_id, items))
                 step_id += 1
@@ -1292,14 +1394,34 @@ class AfdCoordinator:
             if pending and len(pending) >= max_pending:
                 complete_pending(pending.popleft())
 
-    @staticmethod
-    def _afd_next_global_phase(scheds: list[CentralizedAfdDpScheduler]) -> str:
+    def _afd_next_global_phase(
+        self,
+        scheds: list[CentralizedAfdDpScheduler],
+    ) -> str:
+        # Match the baseline's resident-batch warmup contract.  While exact
+        # Nsight capture is pending, never launch decode before every attention
+        # DP lane owns the requested number of live requests.  Returning
+        # prefill when later requests are still arriving makes the event loop
+        # wait for/admit them instead of consuming early decode tokens from a
+        # smaller ramp-up cohort.
+        if (
+            self.server_args.ray_nsys
+            and not self._nsys_runtime_started
+            and not self._nsys_trace_step_ids
+            and not self._nsys_capture_step_ids
+        ):
+            target = int(self._nsys_target_batch_per_dp)
+            live_counts = tuple(s.live_request_count() for s in scheds)
+            if any(count > target for count in live_counts):
+                raise RuntimeError(
+                    "Nsight target-batch admission exceeded the configured "
+                    f"per-DP target: live_counts={live_counts} target={target}"
+                )
+            if any(count < target for count in live_counts):
+                return "prefill"
         # Prefill stays globally prioritized so AG/EG collectives never mix
         # prefill and decode shapes in the same step.
-        if any(
-            s.prefill_manager.runnable and s.table_manager.available_size > 0
-            for s in scheds
-        ):
+        if any(s.can_schedule_prefill() for s in scheds):
             return "prefill"
         if any(s.decode_manager.runnable for s in scheds):
             return "decode"
@@ -1313,13 +1435,23 @@ class AfdCoordinator:
         store = self._afd_reply_tokens_by_dp
         while seen.get(step_id, 0) < expected:
             for reply in self._recv_worker_inbox():
-                sid = int(reply.step_id)
-                seen[sid] = seen.get(sid, 0) + 1
-                if isinstance(reply, AfdAGStepReply) and reply.next_tokens:
-                    lane = int(reply.worker_rank) // attn_tp
-                    store.setdefault(sid, {})[lane] = list(reply.next_tokens)
+                self._afd_store_step_reply(reply, attn_tp=attn_tp)
         seen.pop(step_id, None)
         return store.pop(step_id, {})
+
+    def _afd_store_step_reply(self, reply: AfdReply, *, attn_tp: int) -> None:
+        if reply.step_id is None:
+            raise RuntimeError(
+                f"Unexpected non-step worker reply: {type(reply).__name__}"
+            )
+        sid = int(reply.step_id)
+        seen = self._afd_reply_seen
+        seen[sid] = seen.get(sid, 0) + 1
+        if isinstance(reply, AfdAGStepReply) and reply.next_tokens:
+            lane = int(reply.worker_rank) // int(attn_tp)
+            self._afd_reply_tokens_by_dp.setdefault(sid, {})[lane] = list(
+                reply.next_tokens
+            )
 
     def _afd_complete_global(self, pending_item, scheds, forward_remains, attn_tp):
         step_id, items = pending_item

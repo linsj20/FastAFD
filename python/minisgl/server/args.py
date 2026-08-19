@@ -149,11 +149,6 @@ def _validate_afd_parallel_args(
         if value < 1:
             parser.error(f"{name} must be >= 1, got {value}")
 
-    if not _mutually_divisible(attn_dp, mlp_dp):
-        parser.error(
-            "--afd-attn-dp-size and --afd-mlp-dp-size must be mutually "
-            f"divisible, got attn_dp={attn_dp} mlp_dp={mlp_dp}"
-        )
     if not _mutually_divisible(attn_tp, mlp_tp):
         parser.error(
             "--afd-attn-tp-size and --afd-mlp-tp-size must be mutually "
@@ -414,8 +409,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=int,
         default=ServerArgs.afd_attn_dp_size,
         help=(
-            "AFD runtime attention-side DP size. Must be mutually divisible "
-            "with --afd-mlp-dp-size."
+            "AFD runtime attention-side DP size. Arbitrary positive ratios "
+            "with --afd-mlp-dp-size are supported."
         ),
     )
 
@@ -425,7 +420,8 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         default=ServerArgs.afd_mlp_dp_size,
         help=(
             "AFD runtime model/mlp-side DP size. This is also the dense QKVO "
-            "DP size and must be mutually divisible with --afd-attn-dp-size."
+            "DP size; arbitrary positive ratios with --afd-attn-dp-size are "
+            "supported."
         ),
     )
 
@@ -451,8 +447,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     #       Full-world EP: one expert-parallel group spans the whole MLP world.
     #
     # Target-valid combinations:
-    #   - attn_dp and mlp_dp may be <, ==, or > each other, but must be
-    #     mutually divisible so request ownership can project cleanly.
+    #   - attn_dp and mlp_dp may be arbitrary positive sizes. Balanced integer
+    #     projection assigns ceil(attn_dp/mlp_dp) maximum fan-in and
+    #     ceil(mlp_dp/attn_dp) maximum fan-out.
     #   - attn_tp and mlp_tp may be <, ==, or > each other, but must be
     #     mutually divisible so Q/K/V/O head shards can fan in/out cleanly.
     #   - afd_mlp_ep_size is restricted to the three supported modes above;

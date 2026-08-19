@@ -35,6 +35,8 @@ they dispatch through `scripts/run_afd_qwen3_30b_a3b_fp8_3node_mb2_nsys_alignmen
 - `experiments/afd/qwen3_30b/`: the FastAFD launcher the presets dispatch to.
 - `experiments/afd/qwen3_235b/`: Qwen3-235B published-result presets.
 - `experiments/afd/minimax_m25/`: MiniMax M2.5 published-result presets.
+- `experiments/afd/oci_hsg/`: reusable OCI-HSG case, sweep, metric, and
+  baseline controls.
 - `experiments/vllm/`: the sharded vLLM alignment scorer.
 - `data_gen/`: prompt generation helper.
 - `lib/`: shared shell helpers.

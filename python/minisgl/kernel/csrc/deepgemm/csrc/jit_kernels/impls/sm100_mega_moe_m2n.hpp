@@ -162,6 +162,10 @@ static void sm100_mega_moe_m2n_ag(
     const auto num_sms = num_sms_opt > 0
         ? std::min(num_sms_opt, device_runtime->get_num_sms())
         : device_runtime->get_num_sms();
+    constexpr int kAgClusterDim = 8;
+    DG_HOST_ASSERT(num_sms == 24 and "clustered M2N AG requires exactly 24 SMs");
+    DG_HOST_ASSERT(num_sms % kAgClusterDim == 0 and
+                   "M2N AG SM count must be divisible by 8");
     const auto [num_chunks, smem_size] = get_ag_combine_smem_config_m2n(
         hidden, num_experts, kNumCombineThreads);
 
@@ -206,7 +210,7 @@ static void sm100_mega_moe_m2n_ag(
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .launch_args = LaunchArgs(num_sms,
                                   kNumDispatchThreads + kNumCombineThreads,
-                                  smem_size, 1)
+                                  smem_size, kAgClusterDim)
     };
 
     const bool host_debug = mega_moe_m2n_host_debug_enabled();

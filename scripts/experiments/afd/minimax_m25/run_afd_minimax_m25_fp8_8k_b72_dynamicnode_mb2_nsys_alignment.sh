@@ -169,8 +169,6 @@ export ALIGN_MIN_TOP10_RATE="${ALIGN_MIN_TOP10_RATE:-0.999}"
 
 export CLEAN_FIRST="${CLEAN_FIRST:-1}"
 export CLEAN_AFTER="${CLEAN_AFTER:-1}"
-export POST_SHUTDOWN_SLEEP="${POST_SHUTDOWN_SLEEP:-20}"
-export AFD_STOP_TIMEOUT_S="${AFD_STOP_TIMEOUT_S:-90}"
 
 PROMPT_BASE_FILE="${PROMPT_BASE_FILE:-$CALIB_DIR/prompts/prompts_512x8192_seed20260527.txt}"
 DEFAULT_PROMPT_FILE="$CALIB_DIR/reports/prompts_${NUM_PROMPTS}x${PROMPT_LEN}_from512_seed20260527.txt"
@@ -195,33 +193,8 @@ PY
 fi
 export PROMPT_KIND="${PROMPT_KIND:-existing}"
 
-# MiniMax tokenizes the reused Qwen 8k prompt file slightly longer than 8192
-# tokens, while chunked prefill is intentionally small to keep large-node runs
-# below the memory ceiling. Start nsys at the conservative 8192-token estimate
-# and stop at the max-seq estimate so decode replay is not missed.
-_PREFILL_CHUNK_TOKENS="$AFD_MAX_BATCHED_TOKENS"
-if (( _PREFILL_CHUNK_TOKENS > PROMPT_LEN )); then
-  _PREFILL_CHUNK_TOKENS="$PROMPT_LEN"
-fi
-_PREFILL_MIN_CHUNKS_PER_REQ=$(( (PROMPT_LEN + _PREFILL_CHUNK_TOKENS - 1) / _PREFILL_CHUNK_TOKENS ))
-_PREFILL_TOKEN_BUDGET=$(( MINISGL_MAX_SEQ_LEN - MAX_TOKENS ))
-if (( _PREFILL_TOKEN_BUDGET < PROMPT_LEN )); then
-  _PREFILL_TOKEN_BUDGET="$PROMPT_LEN"
-fi
-_PREFILL_MAX_CHUNKS_PER_REQ=$(( (_PREFILL_TOKEN_BUDGET + _PREFILL_CHUNK_TOKENS - 1) / _PREFILL_CHUNK_TOKENS ))
-_PREFILL_CHUNKS_PER_DP_STEP=$(( AFD_MAX_BATCHED_TOKENS / _PREFILL_CHUNK_TOKENS ))
-if (( _PREFILL_CHUNKS_PER_DP_STEP < 1 )); then
-  _PREFILL_CHUNKS_PER_DP_STEP=1
-fi
-_PREFILL_START_STEP=$(( (NUM_PROMPTS * _PREFILL_MIN_CHUNKS_PER_REQ + ATTN_DP_SIZE * _PREFILL_CHUNKS_PER_DP_STEP - 1) / (ATTN_DP_SIZE * _PREFILL_CHUNKS_PER_DP_STEP) ))
-_PREFILL_STOP_STEP=$(( (NUM_PROMPTS * _PREFILL_MAX_CHUNKS_PER_REQ + ATTN_DP_SIZE * _PREFILL_CHUNKS_PER_DP_STEP - 1) / (ATTN_DP_SIZE * _PREFILL_CHUNKS_PER_DP_STEP) ))
-_DECODE_GRAPH_STEPS=$(( MAX_TOKENS > 0 ? MAX_TOKENS - 1 : 0 ))
-_NSYS_START_DEFAULT=$(( _PREFILL_START_STEP - PER_ATTN_GPU_BSZ ))
-if (( _NSYS_START_DEFAULT < 1 )); then
-  _NSYS_START_DEFAULT=1
-fi
-export NSYS_START_STEP="${NSYS_START_STEP:-$_NSYS_START_DEFAULT}"
-export NSYS_STOP_STEP="${NSYS_STOP_STEP:-$((_PREFILL_STOP_STEP + _DECODE_GRAPH_STEPS + 2))}"
+export NSYS_TARGET_BATCH_PER_ATTN_DP="${NSYS_TARGET_BATCH_PER_ATTN_DP:-$PER_ATTN_GPU_BSZ}"
+export NSYS_CAPTURE_DECODE_STEPS="${NSYS_CAPTURE_DECODE_STEPS:-15}"
 
 if [[ -z "${MINISGL_PORT:-}" || ( "$RUN_VLLM_ALIGNMENT" == "1" && -z "${VLLM_PORT:-}" ) ]]; then
   eval "$(
@@ -267,8 +240,8 @@ echo "  num_prompts: $NUM_PROMPTS"
 echo "  per_attn_gpu_bsz: $PER_ATTN_GPU_BSZ"
 echo "  per_attn_gpu_mb_bsz: $AFD_DECODE_GRAPH_BS"
 echo "  max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
-echo "  prefill_step_window_estimate: $_PREFILL_START_STEP..$_PREFILL_STOP_STEP"
-echo "  nsys_step_window: $NSYS_START_STEP..$NSYS_STOP_STEP"
+echo "  nsys_target_batch_per_attn_dp: $NSYS_TARGET_BATCH_PER_ATTN_DP"
+echo "  nsys_capture_decode_steps: $NSYS_CAPTURE_DECODE_STEPS"
 echo "  run_vllm_alignment: $RUN_VLLM_ALIGNMENT"
 
 exec bash "$RUNNER_DIR/run_afd_qwen3_30b_a3b_fp8_3node_mb2_nsys_alignment.sh"

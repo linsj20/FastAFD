@@ -16,7 +16,6 @@ from .supervisor import (
 )
 from .supervisor_ray import (
     _RAY_NSYS_BIN_ENV,
-    _build_ray_nsight_options,
     _build_ray_runtime_env,
     _get_ray_node_resource_key,
     _get_ray_nsys_output_prefix,
@@ -84,7 +83,11 @@ class AfdBackendSupervisor:
             nsys_dir = os.path.dirname(nsys_prefix)
             if nsys_dir:
                 os.makedirs(nsys_dir, exist_ok=True)
-            self.logger.info("AFD backend Nsight Systems profiling enabled; output prefix: %s", nsys_prefix)
+            self.logger.info(
+                "AFD GPU-worker Nsight Systems profiling enabled; coordinator "
+                "actor excluded; output prefix: %s",
+                nsys_prefix,
+            )
 
         # (b) log dir
         if self.server_args.ray_log_dir:
@@ -94,14 +97,6 @@ class AfdBackendSupervisor:
         # Build coordinator runtime env
         coordinator_runtime_env: dict[str, Any] = _build_ray_runtime_env(nsys_bin=driver_nsys_path)
         coordinator_runtime_env.setdefault("env_vars", {})["RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"] = "0"
-        if self.server_args.ray_nsys:
-            nsight = _build_ray_nsight_options(
-                self.server_args,
-                rank=0,
-                actor_kind="coordinator",
-            )
-            if nsight is not None:
-                coordinator_runtime_env["nsight"] = nsight
 
         # (c) propagate multi_node so AfdCoordinator.start() can set up node-scoped cache
         actor_args = replace(self.server_args, ray_node_scoped_cache=multi_node)

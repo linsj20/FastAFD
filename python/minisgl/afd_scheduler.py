@@ -232,6 +232,30 @@ class CentralizedAfdDpScheduler:
     def has_runnable_reqs(self) -> bool:
         return bool(self.prefill_manager.runnable or self.decode_manager.runnable)
 
+    def can_schedule_prefill(self) -> bool:
+        """Return whether the next pending prefill can make progress.
+
+        A chunked request already owns its request-table slot.  Requiring a new
+        free slot before continuing that request prematurely switches the
+        global scheduler to decode and creates a batch-(B-1) wave followed by
+        a batch-1 tail.  Continue allocated chunks first so decode begins only
+        after the complete resident batch has finished prefill.
+        """
+        pending = self.prefill_manager.pending_list
+        if not pending:
+            return False
+        return (
+            pending[0].chunked_req is not None
+            or self.table_manager.available_size > 0
+        )
+
+    def live_request_count(self) -> int:
+        """Count requests owned by this DP across prefill and decode state."""
+        return (
+            len(self.prefill_manager.pending_list)
+            + len(self.decode_manager.running_reqs)
+        )
+
     def schedule_step(
         self,
         step_id: int,

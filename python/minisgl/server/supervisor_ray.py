@@ -37,8 +37,8 @@ _RAY_ENV_KEYS = (
     "CONDA_DEFAULT_ENV",
     "MINISGL_RAY_NSYS_BIN",
     "MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE",
-    "MINISGL_RAY_NSYS_START_STEP",
-    "MINISGL_RAY_NSYS_STOP_STEP",
+    "MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP",
+    "MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS",
     "MINISGL_AFD_CONTROL_PROFILE_START_STEP",
     "MINISGL_AFD_CONTROL_PROFILE_STOP_STEP",
     "MINISGL_NVTX_CPU_TRACE",
@@ -237,16 +237,6 @@ def _build_ray_nsight_options(
     if not server_args.ray_nsys:
         return None
     output_prefix = _get_ray_nsys_output_prefix(server_args)
-    if actor_kind == "coordinator":
-        return {
-            "trace": "cuda,nvtx,osrt",
-            "cuda-event-trace": "false",
-            "kill": "none",
-            "sample": "none",
-            "capture-range": "none",
-            "stop-on-exit": "true",
-            "o": f"{output_prefix}_coordinator_%p",
-        }
     if actor_kind != "worker":
         raise ValueError(f"Unknown Ray nsight actor_kind={actor_kind!r}")
     worker_options = {

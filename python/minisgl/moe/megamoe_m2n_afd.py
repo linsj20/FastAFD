@@ -51,6 +51,7 @@ class MegaMoEM2NAfdAdapter:
         top_k: int,
         num_max_dispatch_tokens_per_rank: int,
         num_lanes: int = 1,
+        defer_buffer_allocation: bool = False,
         gate_renormalize: bool = True,
         shared_experts_per_rank: int = 0,
         routed_scaling_factor: float = 1.0,
@@ -89,19 +90,9 @@ class MegaMoEM2NAfdAdapter:
         self.num_lanes = max(1, int(num_lanes))
         self.routed_scaling_factor = float(routed_scaling_factor)
 
-        self.buffers = [
-            _mm.MegaMoEM2NSymmBuffer(
-                group,
-                ag_size=self.ag_size,
-                eg_size=self.eg_size,
-                num_experts=self.num_experts,
-                num_max_tokens_per_rank=self.bucket,
-                num_topk=self.top_k,
-                hidden=self.hidden_size,
-                intermediate_hidden=self.intermediate_size,
-            )
-            for _ in range(self.num_lanes)
-        ]
+        self.buffers: list[_mm.MegaMoEM2NSymmBuffer] = []
+        if not defer_buffer_allocation:
+            self.allocate_buffers()
         self._y_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._eg_weights: dict[int, tuple] = {}
         self._eg_desc_blobs: dict[int, torch.Tensor] = {}
@@ -158,6 +149,29 @@ class MegaMoEM2NAfdAdapter:
         # next layer's transformed FP8 weights; Qwen did not in the tuned runs.
         self.eg_prefetch_bytes = (64 << 20) if is_minimax_m25_shape else 0
         self.gate_renormalize = bool(gate_renormalize)
+
+    def allocate_buffers(self) -> None:
+        """Collectively allocate the per-lane symmetric runtime buffers.
+
+        Expert ranks may defer this until after one-time weight transformation
+        so the fan-in-sized buffers do not consume headroom during the
+        transform's temporary allocation peak.
+        """
+        if self.buffers:
+            return
+        self.buffers = [
+            _mm.MegaMoEM2NSymmBuffer(
+                self.group,
+                ag_size=self.ag_size,
+                eg_size=self.eg_size,
+                num_experts=self.num_experts,
+                num_max_tokens_per_rank=self.bucket,
+                num_topk=self.top_k,
+                hidden=self.hidden_size,
+                intermediate_hidden=self.intermediate_size,
+            )
+            for _ in range(self.num_lanes)
+        ]
 
     @property
     def role(self) -> str:

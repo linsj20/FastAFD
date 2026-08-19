@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
+import flashinfer
+import flashinfer.decode as flashinfer_decode
 import torch
 from minisgl.core import Batch, get_global_ctx
 
@@ -36,6 +38,21 @@ class TensorRTLLMBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
         self.kvcache = ctx.kv_cache
+        if flashinfer.__version__ != "0.6.6":
+            raise RuntimeError(
+                "the hardcoded TRT-LLM attention SM policy requires FlashInfer 0.6.6, "
+                f"got {flashinfer.__version__}"
+            )
+        device_properties = torch.cuda.get_device_properties(self.kvcache.device)
+        if (
+            device_properties.name != "NVIDIA GB200"
+            or device_properties.multi_processor_count != 152
+        ):
+            raise RuntimeError(
+                "the hardcoded TRT-LLM attention SM policy requires an NVIDIA GB200 "
+                f"with 152 SMs, got {device_properties.name} with "
+                f"{device_properties.multi_processor_count} SMs"
+            )
         self.page_size = ctx.page_size
         self.capture: TRTLLMCaptureData | None = None
         self.capture_bs: List[int] = []
@@ -93,7 +110,6 @@ class TensorRTLLMBackend(BaseAttnBackend):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
-        from flashinfer.decode import trtllm_batch_decode_with_kv_cache
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
         metadata = batch.attn_metadata
@@ -120,7 +136,11 @@ class TensorRTLLMBackend(BaseAttnBackend):
                 out_dtype=q.dtype,
             )
         else:
-            return trtllm_batch_decode_with_kv_cache(
+            attention_sm_count = 120 if q.shape[0] == 8 else 128
+            flashinfer_decode.get_device_sm_count = (
+                lambda _device, sm_count=attention_sm_count: sm_count
+            )
+            return flashinfer_decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
                 workspace_buffer=self.workspace_buffer,
