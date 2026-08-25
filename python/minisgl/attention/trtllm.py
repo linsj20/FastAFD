@@ -110,12 +110,21 @@ class TensorRTLLMBackend(BaseAttnBackend):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
+        if not batch.afd_kv_store_merged:
+            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
+        return self.forward_prepared(q, layer_id, batch)
+
+    def forward_prepared(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
+        """Run only FMHA over prepared Q and an already-populated KV cache."""
         from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
         metadata = batch.attn_metadata
         assert isinstance(metadata, TRTLLMMetadata)
-        if not batch.afd_kv_store_merged:
-            self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
 
         if batch.is_prefill:

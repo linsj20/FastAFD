@@ -33,7 +33,11 @@ static torch::Event create_event(const at::cuda::CUDAStream& s) {
 }
 
 static void stream_wait(const at::cuda::CUDAStream& s_0, const at::cuda::CUDAStream& s_1) {
-    EP_HOST_ASSERT(s_0.id() != s_1.id());
+    // In the FMHA-only MB2 schedule, DeepEP communication and compute are
+    // intentionally bound to the same microbatch stream.  Same-stream order
+    // already provides the dependency, so inserting an event is unnecessary.
+    if (s_0.id() == s_1.id())
+        return;
     s_0.unwrap().wait(create_event(s_1));
 }
 

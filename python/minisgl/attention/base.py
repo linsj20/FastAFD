@@ -21,6 +21,16 @@ class BaseAttnBackend(ABC):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor: ...
 
+    def forward_prepared(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
+        raise RuntimeError(
+            f"{type(self).__name__} does not implement FMHA-only prepared-Q execution"
+        )
+
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
 
@@ -48,6 +58,15 @@ class HybridBackend(BaseAttnBackend):
     ) -> torch.Tensor:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.forward(q, k, v, layer_id, batch)
+
+    def forward_prepared(
+        self,
+        q: torch.Tensor,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
+        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        return backend.forward_prepared(q, layer_id, batch)
 
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend

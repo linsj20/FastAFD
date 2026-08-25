@@ -13,6 +13,46 @@ from minisgl.engine.sample import BatchSamplingArgs, make_device_tensor
 _TENSOR_CODEC_TAG = "__minisgl_afd_tensor__"
 _TOKEN_BLOCK_CODEC_TAG = "__minisgl_afd_token_block__"
 _AG_STEP_CMD_CODEC_TAG = "__minisgl_afd_ag_step_cmd__"
+_MODEL_STEP_CMD_CODEC_TAG = "__minisgl_afd_model_step_cmd__"
+
+
+def build_two_lane_pipeline_actions(
+    *,
+    num_layers: int,
+    num_microbatches: int,
+) -> tuple[tuple[str, int, int], ...]:
+    """Return dispatch/complete actions for a two-item rolling window."""
+
+    if num_layers < 1 or num_microbatches < 1:
+        raise ValueError(
+            "AFD pipeline requires positive layer and microbatch counts: "
+            f"layers={num_layers} microbatches={num_microbatches}"
+        )
+    num_lanes = min(2, int(num_microbatches))
+    rounds_by_lane = tuple(
+        tuple(
+            (layer, microbatch)
+            for layer in range(int(num_layers))
+            for microbatch in range(int(num_microbatches))
+            if microbatch % num_lanes == lane
+        )
+        for lane in range(num_lanes)
+    )
+    actions: list[tuple[str, int, int]] = []
+    for lane_rounds in rounds_by_lane:
+        layer, microbatch = lane_rounds[0]
+        actions.append(("dispatch", layer, microbatch))
+    for round_index in range(max(len(rounds) for rounds in rounds_by_lane)):
+        for lane_rounds in rounds_by_lane:
+            if round_index >= len(lane_rounds):
+                continue
+            layer, microbatch = lane_rounds[round_index]
+            actions.append(("complete", layer, microbatch))
+            next_index = round_index + 1
+            if next_index < len(lane_rounds):
+                next_layer, next_microbatch = lane_rounds[next_index]
+                actions.append(("dispatch", next_layer, next_microbatch))
+    return tuple(actions)
 
 
 @dataclass(frozen=True)
@@ -133,6 +173,19 @@ class AfdTopology:
     def attn_dp_for_mlp_dp(self, mlp_dp_rank: int) -> int:
         """Primary attention DP lane paired with an MLP DP lane."""
         return int(mlp_dp_rank) * self.attn_dp_size // self.mlp_dp_size
+
+    def attn_dps_for_mlp_dp(self, mlp_dp_rank: int) -> tuple[int, ...]:
+        """All attention DP lanes served by one MLP DP lane."""
+        mlp_dp_rank = int(mlp_dp_rank)
+        if mlp_dp_rank < 0 or mlp_dp_rank >= self.mlp_dp_size:
+            raise ValueError(
+                f"mlp_dp_rank={mlp_dp_rank} is outside [0, {self.mlp_dp_size})"
+            )
+        return tuple(
+            attn_dp_rank
+            for attn_dp_rank in range(self.attn_dp_size)
+            if self.mlp_dp_for_attn_dp(attn_dp_rank) == mlp_dp_rank
+        )
 
     def attn_worker_rank(self, attn_dp_rank: int, tp_rank: int) -> int:
         return int(attn_dp_rank) * self.attn_tp_size + int(tp_rank)
@@ -324,9 +377,9 @@ class AfdTokenBlock:
 #     dispatch/combine routing is data-driven (topk ids), so it only needs the
 #     step id, phase, num_mb and the shared dispatch_bucket.
 #
-# One command per (step, microbatch); the worker runs the WHOLE layer loop on
-# GPU and the per-layer DeepEP collectives keep AG/EG in lockstep (no per-layer
-# coordinator round-trip).
+# One command covers the whole DP step. The worker runs every microbatch through
+# the full layer loop on GPU, and per-layer DeepEP collectives keep the roles in
+# lockstep without a per-layer coordinator round trip.
 # ============================================================================
 
 
@@ -335,6 +388,7 @@ class AfdAGStepPlan:
     step_id: int
     phase: Literal["prefill", "decode"]
     real_size: int
+    attn_dp_rank: int = 0
     # KV / req scheduling (AG owns the KV cache)
     table_indices: tuple[int, ...] = ()
     extend_lens: tuple[int, ...] = ()
@@ -362,6 +416,11 @@ class AfdAGStepPlan:
     def __post_init__(self) -> None:
         self.step_id = int(self.step_id)
         self.real_size = int(self.real_size)
+        self.attn_dp_rank = int(self.attn_dp_rank)
+        if self.attn_dp_rank < 0:
+            raise ValueError(
+                f"AFD attention DP rank must be non-negative, got {self.attn_dp_rank}"
+            )
         self.table_indices = tuple(int(x) for x in self.table_indices)
         self.extend_lens = tuple(int(x) for x in self.extend_lens)
         self.free_table_indices = tuple(int(x) for x in self.free_table_indices)
@@ -458,6 +517,149 @@ class AfdAGStepPlan:
     @property
     def num_mb(self) -> int:
         return max(1, len(self.microbatch_offsets) - 1)
+
+
+@dataclass
+class AfdModelStepPlan:
+    """One model-side step containing every attention source in its DP fan-in."""
+
+    source_plans: tuple[AfdAGStepPlan, ...]
+    dispatch_bucket: int
+
+    def __post_init__(self) -> None:
+        self.source_plans = tuple(self.source_plans)
+        self.dispatch_bucket = int(self.dispatch_bucket)
+        if not self.source_plans:
+            raise ValueError("AfdModelStepPlan requires at least one attention source")
+        if self.dispatch_bucket < 1:
+            raise ValueError(
+                "AfdModelStepPlan dispatch_bucket must be positive, "
+                f"got {self.dispatch_bucket}"
+            )
+        source_ranks = tuple(int(plan.attn_dp_rank) for plan in self.source_plans)
+        if source_ranks != tuple(sorted(set(source_ranks))):
+            raise ValueError(
+                "AfdModelStepPlan sources must be unique and sorted: "
+                f"{source_ranks}"
+            )
+        reference = self.source_plans[0]
+        reference_graph_spans = tuple(
+            int(right) - int(left)
+            for left, right in zip(
+                reference.microbatch_token_offsets,
+                reference.microbatch_token_offsets[1:],
+            )
+        )
+        for plan in self.source_plans[1:]:
+            if (
+                int(plan.step_id) != int(reference.step_id)
+                or str(plan.phase) != str(reference.phase)
+                or int(plan.num_mb) != int(reference.num_mb)
+                or bool(plan.use_decode_graph) != bool(reference.use_decode_graph)
+            ):
+                raise ValueError(
+                    "AfdModelStepPlan sources must share step/phase/num_mb/graph: "
+                    f"reference={(reference.step_id, reference.phase, reference.num_mb, reference.use_decode_graph)} "
+                    f"source={(plan.step_id, plan.phase, plan.num_mb, plan.use_decode_graph)}"
+                )
+            graph_spans = tuple(
+                int(right) - int(left)
+                for left, right in zip(
+                    plan.microbatch_token_offsets,
+                    plan.microbatch_token_offsets[1:],
+                )
+            )
+            if self.use_decode_graph and graph_spans != reference_graph_spans:
+                raise ValueError(
+                    "AfdModelStepPlan decode-graph sources must use identical "
+                    "microbatch buckets: "
+                    f"reference={reference_graph_spans} source={graph_spans}"
+                )
+
+    @property
+    def step_id(self) -> int:
+        return int(self.source_plans[0].step_id)
+
+    @property
+    def phase(self) -> Literal["prefill", "decode"]:
+        return self.source_plans[0].phase
+
+    @property
+    def num_mb(self) -> int:
+        return int(self.source_plans[0].num_mb)
+
+    @property
+    def use_decode_graph(self) -> bool:
+        return bool(self.source_plans[0].use_decode_graph)
+
+    @property
+    def real_size(self) -> int:
+        return sum(int(plan.real_size) for plan in self.source_plans)
+
+    @property
+    def microbatch_offsets(self) -> tuple[int, ...]:
+        offsets = [0]
+        for mb in range(self.num_mb):
+            offsets.append(
+                offsets[-1]
+                + sum(
+                    int(plan.microbatch_offsets[mb + 1])
+                    - int(plan.microbatch_offsets[mb])
+                    for plan in self.source_plans
+                )
+            )
+        return tuple(offsets)
+
+    @property
+    def microbatch_token_offsets(self) -> tuple[int, ...]:
+        offsets = [0]
+        for mb in range(self.num_mb):
+            offsets.append(
+                offsets[-1]
+                + sum(
+                    int(plan.microbatch_token_offsets[mb + 1])
+                    - int(plan.microbatch_token_offsets[mb])
+                    for plan in self.source_plans
+                )
+            )
+        return tuple(offsets)
+
+    @property
+    def microbatch_real_token_counts(self) -> tuple[int, ...]:
+        return tuple(
+            sum(int(plan.microbatch_real_token_counts[mb]) for plan in self.source_plans)
+            for mb in range(self.num_mb)
+        )
+
+    @property
+    def sampling(self) -> AfdSamplingPlan:
+        if all(not plan.sampling.temperatures for plan in self.source_plans):
+            return AfdSamplingPlan([], [], [])
+        temperatures: list[float] = []
+        top_ks: list[int] = []
+        top_ps: list[float] = []
+        for plan in self.source_plans:
+            sampling = plan.sampling
+            if not sampling.temperatures:
+                temperatures.extend([0.0] * int(plan.real_size))
+                top_ks.extend([-1] * int(plan.real_size))
+                top_ps.extend([1.0] * int(plan.real_size))
+                continue
+            if not (
+                len(sampling.temperatures)
+                == len(sampling.top_ks)
+                == len(sampling.top_ps)
+                == int(plan.real_size)
+            ):
+                raise ValueError(
+                    "AfdModelStepPlan source sampling size mismatch: "
+                    f"attn_dp={plan.attn_dp_rank} real_size={plan.real_size} "
+                    f"sampling={len(sampling.temperatures)}"
+                )
+            temperatures.extend(float(value) for value in sampling.temperatures)
+            top_ks.extend(int(value) for value in sampling.top_ks)
+            top_ps.extend(float(value) for value in sampling.top_ps)
+        return AfdSamplingPlan(temperatures, top_ks, top_ps)
 
 
 @dataclass
@@ -831,6 +1033,7 @@ def build_afd_ag_plan(
     model_plan: AfdModelPlan,
     batch: Batch,
     *,
+    attn_dp_rank: int = 0,
     dispatch_bucket: int,
     free_table_indices: tuple[int, ...] = (),
     use_decode_graph: bool = False,
@@ -843,6 +1046,7 @@ def build_afd_ag_plan(
         plan.step_id = int(step_id)
         plan.phase = "decode"
         plan.real_size = int(batch.size)
+        plan.attn_dp_rank = int(attn_dp_rank)
         plan.table_indices = table_indices
         plan.extend_lens = extend_lens
         plan.free_table_indices = tuple(int(x) for x in free_table_indices)
@@ -863,6 +1067,7 @@ def build_afd_ag_plan(
         step_id=int(step_id),
         phase=str(model_plan.phase),  # type: ignore[arg-type]
         real_size=int(batch.size),
+        attn_dp_rank=int(attn_dp_rank),
         table_indices=table_indices,
         extend_lens=extend_lens,
         free_table_indices=tuple(int(x) for x in free_table_indices),
@@ -893,6 +1098,12 @@ class AfdRunAGStepCmd(AfdCommand):
 
 
 @dataclass
+class AfdRunModelStepCmd(AfdCommand):
+    plan: AfdModelStepPlan
+    sent_ns: int = 0
+
+
+@dataclass
 class AfdRunEGStepCmd(AfdCommand):
     plan: AfdEGStepPlan
     sent_ns: int = 0
@@ -901,6 +1112,7 @@ class AfdRunEGStepCmd(AfdCommand):
 @dataclass
 class AfdAGStepReply(AfdReply):
     next_tokens: list[int] = field(default_factory=list)
+    attn_dp_rank: int | None = None
 
 
 @dataclass
@@ -933,29 +1145,59 @@ def _decode_token_block(payload: Any) -> AfdTokenBlock:
     )
 
 
-def _encode_ag_step_cmd(cmd: AfdRunAGStepCmd) -> dict[str, Any]:
-    plan = cmd.plan
-    plan_payload = {
+def _encode_ag_step_plan(plan: AfdAGStepPlan) -> dict[str, Any]:
+    payload = {
         dataclass_field.name: getattr(plan, dataclass_field.name)
         for dataclass_field in fields(AfdAGStepPlan)
     }
-    plan_payload["token_blocks"] = tuple(
+    payload["token_blocks"] = tuple(
         _encode_token_block(block) for block in plan.token_blocks
     )
+    return payload
+
+
+def _decode_ag_step_plan(payload: dict[str, Any]) -> AfdAGStepPlan:
+    plan_payload = dict(payload)
+    plan_payload["token_blocks"] = tuple(
+        _decode_token_block(block) for block in plan_payload.get("token_blocks", ())
+    )
+    return AfdAGStepPlan(**plan_payload)
+
+
+def _encode_ag_step_cmd(cmd: AfdRunAGStepCmd) -> dict[str, Any]:
     return {
         _AG_STEP_CMD_CODEC_TAG: True,
         "sent_ns": int(cmd.sent_ns),
-        "plan": plan_payload,
+        "plan": _encode_ag_step_plan(cmd.plan),
     }
 
 
 def _decode_ag_step_cmd(payload: dict[str, Any]) -> AfdRunAGStepCmd:
-    plan_payload = dict(payload["plan"])
-    plan_payload["token_blocks"] = tuple(
-        _decode_token_block(block) for block in plan_payload.get("token_blocks", ())
-    )
     return AfdRunAGStepCmd(
-        plan=AfdAGStepPlan(**plan_payload),
+        plan=_decode_ag_step_plan(payload["plan"]),
+        sent_ns=int(payload.get("sent_ns", 0)),
+    )
+
+
+def _encode_model_step_cmd(cmd: AfdRunModelStepCmd) -> dict[str, Any]:
+    return {
+        _MODEL_STEP_CMD_CODEC_TAG: True,
+        "sent_ns": int(cmd.sent_ns),
+        "dispatch_bucket": int(cmd.plan.dispatch_bucket),
+        "source_plans": tuple(
+            _encode_ag_step_plan(plan) for plan in cmd.plan.source_plans
+        ),
+    }
+
+
+def _decode_model_step_cmd(payload: dict[str, Any]) -> AfdRunModelStepCmd:
+    return AfdRunModelStepCmd(
+        plan=AfdModelStepPlan(
+            source_plans=tuple(
+                _decode_ag_step_plan(plan) for plan in payload["source_plans"]
+            ),
+            dispatch_bucket=int(payload["dispatch_bucket"]),
+        ),
         sent_ns=int(payload.get("sent_ns", 0)),
     )
 
@@ -963,12 +1205,18 @@ def _decode_ag_step_cmd(payload: dict[str, Any]) -> AfdRunAGStepCmd:
 def _encode_afd_payload(payload: Any) -> Any:
     if isinstance(payload, AfdRunAGStepCmd) and payload.plan.token_blocks:
         return _encode_ag_step_cmd(payload)
+    if isinstance(payload, AfdRunModelStepCmd) and any(
+        plan.token_blocks for plan in payload.plan.source_plans
+    ):
+        return _encode_model_step_cmd(payload)
     return payload
 
 
 def _decode_afd_payload(payload: Any) -> Any:
     if isinstance(payload, dict) and payload.get(_AG_STEP_CMD_CODEC_TAG) is True:
         return _decode_ag_step_cmd(payload)
+    if isinstance(payload, dict) and payload.get(_MODEL_STEP_CMD_CODEC_TAG) is True:
+        return _decode_model_step_cmd(payload)
     return payload
 
 
@@ -996,8 +1244,10 @@ AfdReply.decoder = staticmethod(_decode_afd_reply)  # type: ignore[attr-defined]
 __all__ = [
     "AfdAGStepPlan",
     "AfdEGStepPlan",
+    "AfdModelStepPlan",
     "AfdModelPlan",
     "AfdRunAGStepCmd",
+    "AfdRunModelStepCmd",
     "AfdRunEGStepCmd",
     "AfdAGStepReply",
     "AfdEGStepReply",
@@ -1012,4 +1262,5 @@ __all__ = [
     "AfdSamplingPlan",
     "AfdStopCmd",
     "build_afd_ag_plan",
+    "build_two_lane_pipeline_actions",
 ]

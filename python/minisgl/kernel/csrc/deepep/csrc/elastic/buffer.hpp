@@ -772,8 +772,17 @@ public:
                 num_channels_per_sm);
             num_channels_per_sm = std::min<int>(
                 /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
-            if (not prefer_overlap_with_compute)
+            if (prefer_overlap_with_compute) {
+                // Decode sends only a few tokens. Retain all 24 communication
+                // CTAs/three CGAs, but do not give each CTA more channel warps
+                // than the declared token bucket can use. Large buckets still
+                // scale up to the hardware/shared-memory channel limit.
+                num_channels_per_sm = std::min<int>(
+                    num_channels_per_sm,
+                    std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms)));
+            } else {
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -1122,6 +1131,8 @@ public:
             const int& num_sms, const int& num_qps,
             const std::optional<EventHandle>& previous_event,
             const std::optional<EventHandle>& previous_event_before_epilogue,
+            const std::optional<torch::Tensor>& release_turn,
+            const int64_t& release_value,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout) const {
@@ -1175,6 +1186,18 @@ public:
             }
         }
 
+        int64_t* release_turn_ptr = nullptr;
+        if (release_turn.has_value()) {
+            const auto [release_words] = get_shape<1>(release_turn.value());
+            EP_HOST_ASSERT(release_words == 2);
+            EP_HOST_ASSERT(release_turn->is_cuda() and release_turn->is_contiguous());
+            EP_HOST_ASSERT(release_turn->scalar_type() == torch::kLong);
+            EP_HOST_ASSERT(release_value > 0);
+            release_turn_ptr = release_turn->data_ptr<int64_t>();
+        } else {
+            EP_HOST_ASSERT(release_value == 0);
+        }
+
         // Stream control
         // All new tensor allocations should happen after this
         const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
@@ -1226,6 +1249,7 @@ public:
             nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
             nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
             nccl_context->is_scaleup_nvlink,
+            release_turn_ptr, release_value,
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,

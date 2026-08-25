@@ -40,6 +40,23 @@ class Qwen3DecoderLayer(BaseOP):
         x = self.mlp.forward(x)
         return x, residual
 
+    def prepare_attention(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x, residual = self.input_layernorm.forward(x, residual)
+        return self.self_attn.prepare_qkv(x), residual
+
+    def finish_attention(
+        self,
+        o: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.self_attn.finish_attention(o)
+        x, residual = self.post_attention_layernorm.forward(x, residual)
+        return self.mlp.forward(x), residual
+
 
 class Qwen3Model(BaseOP):
     def __init__(self, config: ModelConfig):
@@ -62,6 +79,32 @@ class Qwen3Model(BaseOP):
             x, residual = layer.forward(x, residual)
         return self.norm.forward(x, residual)[0]
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens.forward(input_ids)
+
+    def prepare_attention(
+        self,
+        layer_id: int,
+        x: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.layers.op_list[layer_id].prepare_attention(x, residual)
+
+    def finish_attention(
+        self,
+        layer_id: int,
+        o: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.layers.op_list[layer_id].finish_attention(o, residual)
+
+    def finalize_hidden(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self.norm.forward(x, residual)[0]
+
 
 class Qwen3MoeForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
@@ -78,6 +121,21 @@ class Qwen3MoeForCausalLM(BaseLLMModel):
         output = self.model.forward(get_global_ctx().batch.input_ids)
         logits = self.lm_head.forward(output)
         return logits
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
+
+    def prepare_attention(self, layer_id, x, residual=None):
+        return self.model.prepare_attention(layer_id, x, residual)
+
+    def finish_attention(self, layer_id, o, residual):
+        return self.model.finish_attention(layer_id, o, residual)
+
+    def finalize_hidden(self, x, residual=None):
+        return self.model.finalize_hidden(x, residual)
+
+    def forward_lm_head(self, x):
+        return self.lm_head.forward(x)
 
 
 __all__ = ["Qwen3MoeForCausalLM"]

@@ -91,6 +91,12 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
 
     // Initialize NCCL device communicator
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    // Elastic kernels assign tags 0..9 to device, explicit, dispatch, combine,
+    // and hybrid barriers. Provision NCCL's graph-safe LSA barrier state and
+    // its single-instruction multimem arrival path instead of issuing one
+    // symmetric atomic per peer.
+    reqs.lsaMultimem = true;
+    reqs.lsaBarrierCount = 10;
     if (num_ranks > 1 and get_env("EP_DISABLE_GIN", 0) == 0) {
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;

@@ -10,6 +10,7 @@ import importlib.util
 import json
 import math
 from pathlib import Path
+import sqlite3
 import statistics
 import tempfile
 
@@ -39,6 +40,8 @@ LATENCY_SAMPLE_POLICY = (
     "of its median; retain at least 10 steps, break equal-size ties by tighter "
     "range then higher mean, and use the retained arithmetic mean as latency"
 )
+FMHA_METRIC_VERSION = "20260820-fmha-only-dual-role-cuda-graph-span-v1"
+FMHA_LATENCY_BASIS = "max_complete_cuda_graph_span_across_profiled_attention_and_model_roles"
 
 
 def sha256(path: Path) -> str:
@@ -276,6 +279,257 @@ def representative_ranks(data: dict[str, object]) -> tuple[list[int], list[str]]
     return ranks, nodes
 
 
+def fmha_graph_spans_ms(path: Path) -> tuple[list[float], list[int]]:
+    """Return ordered complete CUDA-graph spans and node counts."""
+
+    with sqlite3.connect(path) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        required = {
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "CUPTI_ACTIVITY_KIND_RUNTIME",
+            "StringIds",
+        }
+        if not required <= tables:
+            raise RuntimeError(f"{path} lacks tables {sorted(required - tables)}")
+        launches = connection.execute(
+            """
+            SELECT r.correlationId
+            FROM CUPTI_ACTIVITY_KIND_RUNTIME AS r
+            JOIN StringIds AS s ON s.id=r.nameId
+            WHERE s.value LIKE 'cudaGraphLaunch%'
+            ORDER BY r.start
+            """
+        ).fetchall()
+        durations: list[float] = []
+        counts: list[int] = []
+        for (correlation_id,) in launches:
+            row = (None, None, 0)
+            if "CUPTI_ACTIVITY_KIND_GRAPH_TRACE" in tables:
+                row = connection.execute(
+                    """
+                    SELECT min(start),max(end),count(*)
+                    FROM CUPTI_ACTIVITY_KIND_GRAPH_TRACE
+                    WHERE correlationId=?
+                    """,
+                    (correlation_id,),
+                ).fetchone()
+            if not int(row[2]):
+                row = connection.execute(
+                    """
+                    SELECT min(start),max(end),count(*)
+                    FROM CUPTI_ACTIVITY_KIND_KERNEL
+                    WHERE correlationId=? AND graphId IS NOT NULL
+                    """,
+                    (correlation_id,),
+                ).fetchone()
+            start, end, count = row
+            if not int(count) or start is None or end is None or int(end) <= int(start):
+                raise RuntimeError(
+                    f"{path} graph launch {correlation_id} has no positive CUDA span"
+                )
+            durations.append((int(end) - int(start)) / 1e6)
+            counts.append(int(count))
+    return durations, counts
+
+
+def collapse_fmha_graph_spans(
+    durations_ms: list[float],
+    graph_node_counts: list[int],
+    trace_steps: list[int],
+    launches_per_step: int,
+) -> tuple[list[float], int, list[list[float]]]:
+    """Collapse ordered graph launches into one CUDA span per trace step."""
+
+    if launches_per_step < 1:
+        raise RuntimeError(f"invalid graph launches per trace step: {launches_per_step}")
+    expected = len(trace_steps) * launches_per_step
+    if len(durations_ms) != expected or len(graph_node_counts) != expected:
+        raise RuntimeError(
+            "FMHA graph launch count does not match trace topology: "
+            f"durations={len(durations_ms)} counts={len(graph_node_counts)} "
+            f"steps={len(trace_steps)} launches_per_step={launches_per_step} "
+            f"expected={expected}"
+        )
+    if not all(math.isfinite(value) and value > 0 for value in durations_ms):
+        raise RuntimeError(f"invalid FMHA graph spans: {durations_ms}")
+    if len(set(graph_node_counts)) != 1:
+        raise RuntimeError(
+            f"FMHA graph node counts are not stable: {graph_node_counts}"
+        )
+    grouped = [
+        durations_ms[index : index + launches_per_step]
+        for index in range(0, expected, launches_per_step)
+    ]
+    return [sum(group) for group in grouped], graph_node_counts[0], grouped
+
+
+def fmha_profile_launches_per_step(
+    attention_dp_size: int,
+    mlp_dp_size: int,
+) -> tuple[int, int]:
+    """Return attention/model graph launches for the grouped FMHA-only path."""
+
+    if (
+        attention_dp_size < 1
+        or mlp_dp_size < 1
+        or attention_dp_size % mlp_dp_size
+    ):
+        raise RuntimeError(
+            "FMHA attention/model DP fan-in is not integral: "
+            f"attention_dp={attention_dp_size} model_dp={mlp_dp_size}"
+        )
+    # Every attention DP owns one graph. Each model DP now receives one grouped
+    # command containing its complete source fan-in, so it also owns one graph
+    # per step independent of A:F ratio.
+    return 1, 1
+
+
+def extract_fmha_only(
+    *,
+    args: argparse.Namespace,
+    data: dict[str, object],
+    plan: dict[str, str],
+    span_module: object,
+    measured_steps: list[int],
+    warmup_step: int,
+    max_outlier_count: int,
+) -> None:
+    """Extract the critical span across one attention and one model graph."""
+
+    active_gpus = int(data["active_gpus"])
+    attention_workers = int(data["attention_workers"])
+    attention_dp_size = int(data["attention_dp_size"])
+    placement = data.get("placement")
+    if not isinstance(placement, dict):
+        raise RuntimeError("FMHA result has no placement proof")
+    mlp_dp_rank_nodes = placement.get("mlp_dp_rank_nodes")
+    if not isinstance(mlp_dp_rank_nodes, list) or not mlp_dp_rank_nodes:
+        raise RuntimeError("FMHA placement has no model-DP mapping")
+    mlp_dp_size = len(mlp_dp_rank_nodes)
+    attention_launches_per_step, model_launches_per_step = (
+        fmha_profile_launches_per_step(attention_dp_size, mlp_dp_size)
+    )
+    profile_specs = (
+        ("attention", 1, attention_launches_per_step),
+        ("model", attention_workers + 1, model_launches_per_step),
+    )
+    reports = span_module.gpu_worker_reports(  # type: ignore[attr-defined]
+        args.result.parent / "ray_logs", active_gpus
+    )
+    trace_steps = [warmup_step, *measured_steps]
+    per_profile: dict[str, object] = {}
+    per_step: dict[int, list[float]] = {step: [] for step in trace_steps}
+    with tempfile.TemporaryDirectory(prefix="afd-fmha-", dir=args.temp_root) as temporary:
+        temporary_path = Path(temporary)
+        for role, rank, launches_per_step in profile_specs:
+            report = reports[rank - 1]
+            sqlite_path = temporary_path / f"{role}-rank-{rank}.sqlite"
+            span_module.export_nsys(  # type: ignore[attr-defined]
+                args.nsys,
+                report,
+                sqlite_path,
+                span_module.AFD_TABLES,  # type: ignore[attr-defined]
+            )
+            raw_durations, counts = fmha_graph_spans_ms(sqlite_path)
+            durations, node_count, grouped_durations = collapse_fmha_graph_spans(
+                raw_durations,
+                counts,
+                trace_steps,
+                launches_per_step,
+            )
+            label = f"{role}:rank{rank}"
+            per_profile[label] = {
+                "role": role,
+                "rank": rank,
+                "report_path": str(report),
+                "graph_launches_per_trace_step": launches_per_step,
+                "graph_node_count_per_launch": node_count,
+                "per_trace_step_cuda_graph_launch_ms": dict(
+                    zip(map(str, trace_steps), grouped_durations)
+                ),
+                "per_trace_step_cuda_graph_ms": dict(
+                    zip(map(str, trace_steps), durations)
+                ),
+            }
+            for step, duration in zip(trace_steps, durations):
+                per_step[step].append(duration)
+
+    critical_ms = [max(per_step[step]) for step in measured_steps]
+    latency = select_latency_samples(
+        measured_steps,
+        critical_ms,
+        max_outlier_count=max_outlier_count,
+    )
+    mean_ms = float(latency["mean_ms"])
+    allocated_gpus = int(data["allocated_gpus"])
+    global_prompts = int(data["samples"])
+    output = {
+        "case_id": plan["case_id"],
+        "plan_index": int(plan["plan_index"]),
+        "metric_version": FMHA_METRIC_VERSION,
+        "latency_basis": FMHA_LATENCY_BASIS,
+        "cuda_wall_time_ms": mean_ms,
+        "cuda_wall_time_mean_ms": mean_ms,
+        "cuda_wall_time_median_ms": latency["median_ms"],
+        "cuda_wall_time_max_ms": latency["max_ms"],
+        "dominant_range_percent": latency["range_percent"],
+        "dominant_range_percent_limit": DOMINANT_RANGE_PERCENT_LIMIT,
+        "max_median_diff_percent": latency["diff_percent"],
+        "max_median_diff_percent_limit": MAX_MEDIAN_DIFF_PERCENT_LIMIT,
+        "max_outlier_count": max_outlier_count,
+        "outlier_count": len(latency["excluded_steps"]),
+        "sample_count": len(latency["retained_ms"]),
+        "eligible_target_batch_sample_count": len(critical_ms),
+        "excluded_decode_step_ids": latency["excluded_steps"],
+        "latency_decode_step_ids": latency["retained_steps"],
+        "warmup_decode_step_id": warmup_step,
+        "trace_decode_step_ids": trace_steps,
+        "warmup_cuda_execution_critical_ms": max(per_step[warmup_step]),
+        "decode_step_ids": measured_steps,
+        "per_step_cuda_execution_critical_ms": critical_ms,
+        "per_step_per_profiled_role_ms": {
+            str(step): per_step[step] for step in trace_steps
+        },
+        "profiled_roles": per_profile,
+        "target_batch_per_attention_dp_lane": int(
+            data["batch_per_attention_dp_lane"]
+        ),
+        "num_microbatches": int(data["cuda_graph"]["num_microbatches"]),
+        "global_prompts": global_prompts,
+        "active_gpus": active_gpus,
+        "allocated_gpus": allocated_gpus,
+        "tps_per_active_gpu": global_prompts * 1000 / (active_gpus * mean_ms),
+        "tps_per_allocated_gpu_diagnostic": (
+            global_prompts * 1000 / (allocated_gpus * mean_ms)
+        ),
+        "result_path": str(args.result),
+        "result_sha256": sha256(args.result),
+        "mapping_proof": (
+            "the selected attention and model reports each contain exactly the "
+            "declared warmup plus 15 ordered graph launches"
+        ),
+    }
+    args.output.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+    print(
+        json.dumps(
+            {
+                "case_id": output["case_id"],
+                "cuda_wall_time_ms": mean_ms,
+                "dominant_range_percent": latency["range_percent"],
+                "sample_count": len(latency["retained_ms"]),
+                "tps_per_active_gpu": output["tps_per_active_gpu"],
+                "profiled_gpu_ranks": [rank for _, rank, _ in profile_specs],
+            },
+            sort_keys=True,
+        )
+    )
+
+
 def main() -> None:
     args = parse_args()
     args.result = args.result.resolve()
@@ -315,9 +569,11 @@ def main() -> None:
     cuda_graph = data.get("cuda_graph")
     if not isinstance(cuda_graph, dict):
         raise RuntimeError("result lacks CUDA graph contract")
+    num_microbatches = int(cuda_graph.get("num_microbatches", 0))
+    batch_per_attention_dp_lane = int(data["batch_per_attention_dp_lane"])
     if (
         cuda_graph.get("enabled") is not True
-        or int(cuda_graph.get("num_microbatches", 0)) != 2
+        or not 1 <= num_microbatches <= batch_per_attention_dp_lane
         or cuda_graph.get("nsys_cuda_graph_trace") != "node"
         or int(cuda_graph.get("nsys_target_batch_per_attention_dp_lane", 0))
         != int(data["batch_per_attention_dp_lane"])
@@ -362,6 +618,18 @@ def main() -> None:
         raise RuntimeError("allocated-GPU arithmetic mismatch")
     if active_gpus != int(plan["active_gpus"]):
         raise RuntimeError("plan/result active-GPU mismatch")
+
+    if data.get("afd_model_placement") == "fmha-only":
+        extract_fmha_only(
+            args=args,
+            data=data,
+            plan=plan,
+            span_module=span_module,
+            measured_steps=selected,
+            warmup_step=warmup_step,
+            max_outlier_count=max_outlier_count,
+        )
+        return
 
     all_reports = span_module.gpu_worker_reports(
         args.result.parent / "ray_logs", active_gpus

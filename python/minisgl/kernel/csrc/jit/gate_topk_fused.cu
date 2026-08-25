@@ -19,6 +19,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdint>
 
@@ -31,6 +32,11 @@ inline constexpr int kRowPad = 72;         // chunk + 8 pad
 inline constexpr int kMaxExperts = 128;     // one block owns all experts
 inline constexpr int kTPB = 256;            // 8 warps
 inline constexpr int kNTilesPerWarp = kMaxExperts / 8 / (kTPB / kWarpSize);
+
+template <typename T>
+struct TypeTag {
+  using type = T;
+};
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
@@ -252,10 +258,14 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
 // Second kernel: top-k over the assembled logits (one block per token tile,
 // one warp per token).  The kernel boundary is the cheapest device-wide
 // barrier — much faster than an in-kernel ticket + memory fence round.
+template <typename IndexT, typename MapT>
 __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_kernel(
     const float* __restrict__ logits_gmem,  // [mtiles, 16, kMaxExperts]
     float* __restrict__ topk_weights,
-    int32_t* __restrict__ topk_ids,
+    IndexT* __restrict__ topk_ids,
+    const MapT* __restrict__ expert_map,    // optional global -> group-local map
+    const int64_t* __restrict__ valid_token_count,
+    int valid_count_size,
     float* __restrict__ w_stage,            // optional symm-buffer staging copy
     const int num_tokens, const int num_experts, const int topk,
     const bool renormalize) {
@@ -272,6 +282,17 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     const int t = warp;
     const int token = m0 + t;
     if (token >= num_tokens) return;
+    if (valid_count_size != 0 &&
+        token >= min(static_cast<int>(valid_token_count[0]), num_tokens)) {
+      if (lane < topk) {
+        topk_ids[static_cast<size_t>(token) * topk + lane] =
+            static_cast<IndexT>(-1);
+        topk_weights[static_cast<size_t>(token) * topk + lane] = 0.0f;
+        if (w_stage != nullptr)
+          w_stage[static_cast<size_t>(token) * topk + lane] = 0.0f;
+      }
+      return;
+    }
 
     float logit[kMaxExpertsPerLane];
     #pragma unroll
@@ -336,7 +357,11 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     for (int off = 16; off > 0; off >>= 1)
       w_sum += __shfl_xor_sync(0xffffffffu, w_sum, off);
     if (lane < topk) {
-      topk_ids[static_cast<size_t>(token) * topk + lane] = my_expert;
+      const auto mapped_expert = expert_map == nullptr
+                                     ? static_cast<MapT>(my_expert)
+                                     : __ldg(expert_map + my_expert);
+      topk_ids[static_cast<size_t>(token) * topk + lane] =
+          static_cast<IndexT>(mapped_expert);
       const float w_out = renormalize ? w / w_sum : w / denom_all;
       topk_weights[static_cast<size_t>(token) * topk + lane] = w_out;
       if (w_stage != nullptr)
@@ -355,6 +380,8 @@ struct GateTopkFusedKernel {
       const tvm::ffi::TensorView gate_weight,
       const tvm::ffi::TensorView partials,
       const tvm::ffi::TensorView counters,
+      const tvm::ffi::TensorView expert_map,
+      const tvm::ffi::TensorView valid_token_count,
       bool renormalize,
       tvm::ffi::Optional<tvm::ffi::TensorView> x_q,
       tvm::ffi::Optional<tvm::ffi::TensorView> x_sf,
@@ -366,6 +393,8 @@ struct GateTopkFusedKernel {
     auto hidden_size = SymbolicSize{"H"};
     auto device_ref = SymbolicDevice{};
     auto data_dtype_ = SymbolicDType{};
+    auto index_dtype_ = SymbolicDType{};
+    auto map_dtype_ = SymbolicDType{};
 
     TensorMatcher({num_tokens, topk})
         .with_device<kDLCUDA>(device_ref)
@@ -373,7 +402,7 @@ struct GateTopkFusedKernel {
         .verify(topk_weights);
     TensorMatcher({num_tokens, topk})
         .with_device<kDLCUDA>(device_ref)
-        .with_dtype<int32_t>()
+        .with_dtype<int32_t, int64_t>(index_dtype_)
         .verify(topk_indices);
     TensorMatcher({num_tokens, hidden_size})
         .with_device<kDLCUDA>(device_ref)
@@ -383,6 +412,14 @@ struct GateTopkFusedKernel {
         .with_device<kDLCUDA>(device_ref)
         .with_dtype(data_dtype_)
         .verify(gate_weight);
+    TensorMatcher({-1})
+        .with_device<kDLCUDA>(device_ref)
+        .with_dtype<int32_t, int64_t>(map_dtype_)
+        .verify(expert_map);
+    TensorMatcher({-1})
+        .with_device<kDLCUDA>(device_ref)
+        .with_dtype<int64_t>()
+        .verify(valid_token_count);
     {
       const auto dt = data_dtype_.unwrap();
       RuntimeCheck(dt.code == DLDataTypeCode::kDLBfloat && dt.bits == 16,
@@ -398,6 +435,13 @@ struct GateTopkFusedKernel {
     RuntimeCheck(experts % 8 == 0 && experts <= kMaxExperts,
                  "num_experts must be a multiple of 8 and <= 128");
     RuntimeCheck(topk_value <= 32, "topk must be <= 32");
+    RuntimeCheck(expert_map.size(0) == 0 || expert_map.size(0) == experts,
+                 "expert_map must be empty or have num_experts entries, got ",
+                 expert_map.size(0), " vs ", experts);
+    RuntimeCheck(valid_token_count.size(0) == 0 ||
+                     valid_token_count.size(0) == 1,
+                 "valid_token_count must be empty or shape [1], got ",
+                 valid_token_count.size(0));
 
     const auto stream = LaunchKernel::resolve_device(device_ref.unwrap());
     const int num_mtiles = (rows + kTokensPerBlock - 1) / kTokensPerBlock;
@@ -432,12 +476,38 @@ struct GateTopkFusedKernel {
         static_cast<int*>(counters.data_ptr()),
         x_q_ptr, x_sf_ptr,
         rows, experts, hsize, topk_value, renormalize);
-    gate_topk_select_kernel<<<num_mtiles, kTokensPerBlock * kWarpSize, 0, stream>>>(
-        static_cast<const float*>(partials.data_ptr()),
-        static_cast<float*>(topk_weights.data_ptr()),
-        static_cast<int32_t*>(topk_indices.data_ptr()),
-        w_stage_ptr,
-        rows, experts, topk_value, renormalize);
+    const auto* count_ptr = valid_token_count.size(0) == 0
+                                ? nullptr
+                                : static_cast<const int64_t*>(
+                                      valid_token_count.data_ptr());
+    const int count_size = static_cast<int>(valid_token_count.size(0));
+    const bool use_int32_indices = index_dtype_.unwrap().bits == 32;
+    const bool use_int32_map = map_dtype_.unwrap().bits == 32;
+    auto launch_select = [&](auto index_tag, auto map_tag) {
+      using IndexT = typename decltype(index_tag)::type;
+      using MapT = typename decltype(map_tag)::type;
+      const auto* map_ptr = expert_map.size(0) == 0
+                                ? nullptr
+                                : static_cast<const MapT*>(expert_map.data_ptr());
+      gate_topk_select_kernel<IndexT, MapT>
+          <<<num_mtiles,
+             std::min(kTokensPerBlock, rows) * kWarpSize,
+             0, stream>>>(
+              static_cast<const float*>(partials.data_ptr()),
+              static_cast<float*>(topk_weights.data_ptr()),
+              static_cast<IndexT*>(topk_indices.data_ptr()),
+              map_ptr, count_ptr, count_size, w_stage_ptr,
+              rows, experts, topk_value, renormalize);
+    };
+    if (use_int32_indices && use_int32_map) {
+      launch_select(TypeTag<int32_t>{}, TypeTag<int32_t>{});
+    } else if (use_int32_indices && !use_int32_map) {
+      launch_select(TypeTag<int32_t>{}, TypeTag<int64_t>{});
+    } else if (!use_int32_indices && use_int32_map) {
+      launch_select(TypeTag<int64_t>{}, TypeTag<int32_t>{});
+    } else {
+      launch_select(TypeTag<int64_t>{}, TypeTag<int64_t>{});
+    }
   }
 
  private:

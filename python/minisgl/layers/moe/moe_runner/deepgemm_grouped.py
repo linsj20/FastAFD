@@ -108,6 +108,13 @@ class DeepGEMMGroupedRunner(MoeRunner):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.DEEP_GEMM
 
+    def prepare_layer(self, layer: Any) -> None:
+        """Materialize per-layer FP8 weights before decode communication starts."""
+        w1 = layer.gate_up_proj
+        w2 = layer.down_proj
+        if w1.dtype == torch.float8_e4m3fn and w2.dtype == torch.float8_e4m3fn:
+            self._get_fp8_weights_for_deepgemm(layer)
+
     def _invoke_bf16_grouped(
         self,
         *,
@@ -327,7 +334,11 @@ class DeepGEMMGroupedRunner(MoeRunner):
             )
         N = w1.shape[1]
         I = w2.shape[2]
-        expected_m = max(1, int(M) // max(1, E))
+        expected_m = int(dispatch_output.expected_m_per_expert)
+        if expected_m <= 0:
+            raise RuntimeError(
+                "DeepGEMM psum layout requires a positive routing-density hint"
+            )
         device = x.device
         intermediate_cache1 = torch.empty((M, N), dtype=torch.bfloat16, device=device)
         output = torch.empty((M, H), dtype=torch.bfloat16, device=device)
@@ -386,6 +397,7 @@ class DeepGEMMGroupedRunner(MoeRunner):
             intermediate_cache1,
             psum_tokens_per_expert,
             alignment=self._contiguous_alignment(),
+            worker_blocks=min(M, expected_m * E),
             topk_weights=getattr(dispatch_output, "topk_weights", None),
             group_size=128,
         )

@@ -69,6 +69,7 @@ public:
             CUDA_DRIVER_CHECK(lazy_cuMemCreate(&handle, size, &prop, 0));
             CUDA_DRIVER_CHECK(lazy_cuMemAddressReserve(reinterpret_cast<CUdeviceptr*>(ptr), size, alignment, 0, 0));
             CUDA_DRIVER_CHECK(lazy_cuMemMap(reinterpret_cast<CUdeviceptr>(*ptr), size, 0, handle, 0));
+            CUDA_DRIVER_CHECK(lazy_cuMemRelease(handle));
             cu_mem_set_access_all(*ptr, size);
         } else {
             CUDA_RUNTIME_CHECK(cudaMalloc(ptr, size));
@@ -84,17 +85,22 @@ public:
     }
 
     void get_mem_handle(MemHandle* mem_handle, void* ptr) const {
-        size_t size = 0;
-        CUDA_DRIVER_CHECK(lazy_cuMemGetAddressRange_v2(nullptr, &size, reinterpret_cast<CUdeviceptr>(ptr)));
-        mem_handle->size = size;
+        mem_handle->size = get_size(ptr);
 
         if (use_fabric) {
             CUmemGenericAllocationHandle handle;
             CUDA_DRIVER_CHECK(lazy_cuMemRetainAllocationHandle(&handle, ptr));
             CUDA_DRIVER_CHECK(lazy_cuMemExportToShareableHandle(&mem_handle->inner.cu_mem_fabric_handle, handle, CU_MEM_HANDLE_TYPE_FABRIC, 0));
+            CUDA_DRIVER_CHECK(lazy_cuMemRelease(handle));
         } else {
             CUDA_RUNTIME_CHECK(cudaIpcGetMemHandle(&mem_handle->inner.cuda_ipc_mem_handle, ptr));
         }
+    }
+
+    size_t get_size(void* ptr) const {
+        size_t size = 0;
+        CUDA_DRIVER_CHECK(lazy_cuMemGetAddressRange_v2(nullptr, &size, reinterpret_cast<CUdeviceptr>(ptr)));
+        return size;
     }
 
     void open_mem_handle(void** ptr, MemHandle* mem_handle) const {
@@ -106,6 +112,7 @@ public:
 
             CUDA_DRIVER_CHECK(lazy_cuMemAddressReserve(reinterpret_cast<CUdeviceptr*>(ptr), size, 0, 0, 0));
             CUDA_DRIVER_CHECK(lazy_cuMemMap(reinterpret_cast<CUdeviceptr>(*ptr), size, 0, handle, 0));
+            CUDA_DRIVER_CHECK(lazy_cuMemRelease(handle));
             cu_mem_set_access_all(*ptr, size);
         } else {
             CUDA_RUNTIME_CHECK(cudaIpcOpenMemHandle(ptr, mem_handle->inner.cuda_ipc_mem_handle, cudaIpcMemLazyEnablePeerAccess));

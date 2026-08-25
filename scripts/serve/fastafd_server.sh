@@ -22,6 +22,7 @@ Options:
   --afd-attn-tp-size N           Default: 4
   --afd-mlp-tp-size N            Default: 4
   --afd-mlp-ep-size N            Default: 1
+  --afd-model-placement NAME     legacy or fmha-only. Default: legacy
   --afd-moe-a2a-backend NAME     Default: none
   --afd-moe-runner-backend NAME  Default: auto
   --afd-batch-size N             Default: 8
@@ -54,6 +55,7 @@ AFD_MLP_DP_SIZE="1"
 AFD_ATTN_TP_SIZE="4"
 AFD_MLP_TP_SIZE="4"
 AFD_MLP_EP_SIZE="1"
+AFD_MODEL_PLACEMENT="legacy"
 AFD_MOE_A2A_BACKEND="${AFD_MOE_A2A_BACKEND:-none}"
 AFD_MOE_RUNNER_BACKEND="${AFD_MOE_RUNNER_BACKEND:-auto}"
 AFD_BATCH_SIZE="8"
@@ -86,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --afd-attn-tp-size) AFD_ATTN_TP_SIZE="$2"; shift 2 ;;
     --afd-mlp-tp-size) AFD_MLP_TP_SIZE="$2"; shift 2 ;;
     --afd-mlp-ep-size) AFD_MLP_EP_SIZE="$2"; shift 2 ;;
+    --afd-model-placement) AFD_MODEL_PLACEMENT="$2"; shift 2 ;;
     --afd-moe-a2a-backend) AFD_MOE_A2A_BACKEND="$2"; shift 2 ;;
     --afd-moe-runner-backend) AFD_MOE_RUNNER_BACKEND="$2"; shift 2 ;;
     --afd-batch-size) AFD_BATCH_SIZE="$2"; shift 2 ;;
@@ -144,6 +147,7 @@ cmd=(
   --afd-attn-tp-size "$AFD_ATTN_TP_SIZE"
   --afd-mlp-tp-size "$AFD_MLP_TP_SIZE"
   --afd-mlp-ep-size "$AFD_MLP_EP_SIZE"
+  --afd-model-placement "$AFD_MODEL_PLACEMENT"
   --afd-moe-a2a-backend "$AFD_MOE_A2A_BACKEND"
   --afd-moe-runner-backend "$AFD_MOE_RUNNER_BACKEND"
   --afd-batch-size "$AFD_BATCH_SIZE"

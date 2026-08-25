@@ -25,6 +25,7 @@ class DeepEPElasticDispatchOutput(NamedTuple):
     topk_weights: torch.Tensor | None
     recv_count: torch.Tensor | None = None
     hidden_states_scale: torch.Tensor | None = None
+    expected_m_per_expert: int = 0
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -46,6 +47,15 @@ class DeepEPElasticCombineInput(NamedTuple):
 assert isinstance(DeepEPElasticCombineInput, CombineInput)
 
 
+class DeepEPElasticPreparedDispatch(NamedTuple):
+    dispatch_x: torch.Tensor
+    dispatch_x_scale: torch.Tensor | None
+    group_topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    expert_alignment: int
+    expected_m_per_expert: int
+
+
 class DeepEPDispatcher(BaseDispatcher):
     """DeepEP V2 elastic dispatcher for one dense-TP column.
 
@@ -64,11 +74,27 @@ class DeepEPDispatcher(BaseDispatcher):
         self.top_k = int(moe_runner_config.top_k or 0)
         self._group_expert_map: torch.Tensor | None = None
 
+    def _expected_m_per_expert(self, max_tokens_per_rank: int) -> int:
+        """Return a graph-static DeepGEMM hint from the real routing capacity."""
+        if self.num_experts <= 0:
+            raise RuntimeError("DeepEP routing-density hint requires expert counts")
+        numerator = (
+            4
+            * max(1, int(max_tokens_per_rank))
+            * max(1, self.dp_size)
+            * max(1, self.top_k)
+        )
+        return max(1, (numerator + self.num_experts - 1) // self.num_experts)
+
     @staticmethod
-    def _deepgemm_expert_alignment() -> int:
+    def _deepgemm_expert_alignment(expected_m_per_expert: int) -> int:
         from minisgl.kernel import deepgemm as deep_gemm
 
-        alignment = int(deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout())
+        alignment = int(
+            deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(
+                int(expected_m_per_expert)
+            )
+        )
         deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)
         return alignment
 
@@ -102,21 +128,66 @@ class DeepEPDispatcher(BaseDispatcher):
         self._group_expert_map = expert_map.to(device=device)
         return self._group_expert_map
 
+    def prepare_for_capture(self, device: torch.device) -> None:
+        """Materialize dispatcher state that CUDA graph capture cannot allocate."""
+        self._map_global_to_group_experts(device)
+
     def _should_use_fp8_dispatch(self) -> bool:
         return self.config.params_dtype == torch.float8_e4m3fn
 
-    def dispatch(
+    def _topk_idx_dtype(self, buffer: Any) -> torch.dtype:
+        topk_idx_dtype = getattr(buffer, "topk_idx_dtype", None)
+        return deepep_topk_idx_dtype() if topk_idx_dtype is None else topk_idx_dtype
+
+    def _finish_prepared_dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        group_topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        expected_m_per_expert: int,
+    ) -> DeepEPElasticPreparedDispatch:
+        buffer = self._buffer()
+        if not bool(getattr(buffer, "is_elastic", False)):
+            raise RuntimeError(
+                "DeepEPDispatcher requires DeepEP V2 ElasticBuffer; "
+                f"got buffer={type(buffer).__name__}"
+            )
+        dispatch_x = hidden_states.contiguous()
+        dispatch_x_scale = None
+        if self._should_use_fp8_dispatch():
+            from minisgl.kernel.fp8_quant import per_token_cast_to_fp8
+
+            dispatch_x, dispatch_x_scale = per_token_cast_to_fp8(
+                dispatch_x,
+                use_ue8m0=True,
+                gran_k=128,
+                use_packed_ue8m0=True,
+                backend="cuda",
+            )
+        return DeepEPElasticPreparedDispatch(
+            dispatch_x=dispatch_x,
+            dispatch_x_scale=dispatch_x_scale,
+            group_topk_ids=group_topk_ids.contiguous(),
+            topk_weights=topk_weights.contiguous(),
+            expert_alignment=self._deepgemm_expert_alignment(
+                expected_m_per_expert
+            ),
+            expected_m_per_expert=expected_m_per_expert,
+        )
+
+    def prepare_dispatch(
         self, hidden_states: torch.Tensor, topk_output: Any
-    ) -> DeepEPElasticDispatchOutput:
+    ) -> DeepEPElasticPreparedDispatch:
+        """Run router top-k and FP8 quantization, stopping before 24-SM comm."""
         if not isinstance(topk_output, torch.Tensor):
             raise RuntimeError("DeepEPDispatcher expects raw router logits")
         from minisgl.kernel import topk_softmax_group_local
 
         ctx = get_global_ctx()
         buffer = self._buffer()
-        topk_idx_dtype = getattr(buffer, "topk_idx_dtype", None)
-        if topk_idx_dtype is None:
-            topk_idx_dtype = deepep_topk_idx_dtype()
+        max_tokens_per_rank = int(ctx.moe_deepep_dispatch_max_tokens_per_rank)
+        expected_m_per_expert = self._expected_m_per_expert(max_tokens_per_rank)
+        topk_idx_dtype = self._topk_idx_dtype(buffer)
         topk_weights = torch.empty(
             (hidden_states.shape[0], self.top_k),
             dtype=torch.float32,
@@ -135,62 +206,125 @@ class DeepEPDispatcher(BaseDispatcher):
             num_token_non_padded=ctx.moe_num_token_non_padded,
             renormalize=bool(self.config.renormalize),
         )
-        if bool(getattr(buffer, "is_elastic", False)):
-            dispatch_x = hidden_states.contiguous()
-            dispatch_x_scale = None
-            if self._should_use_fp8_dispatch():
-                from minisgl.kernel.fp8_quant import per_token_cast_to_fp8
-
-                dispatch_x, dispatch_x_scale = per_token_cast_to_fp8(
-                    dispatch_x,
-                    use_ue8m0=True,
-                    gran_k=128,
-                    use_packed_ue8m0=True,
-                    backend="cuda",
-                )
-            (
-                recv_x,
-                recv_x_scale,
-                recv_group_topk_ids,
-                recv_topk_weights,
-                handle,
-            ) = buffer.dispatch(
-                dispatch_x,
-                group_topk_ids.contiguous(),
-                topk_weights.contiguous(),
-                hidden_states_scale=dispatch_x_scale,
-                expert_alignment=self._deepgemm_expert_alignment(),
-                num_max_dispatch_tokens_per_rank=ctx.moe_deepep_dispatch_max_tokens_per_rank,
-            )
-            return DeepEPElasticDispatchOutput(
-                hidden_states=recv_x,
-                handle=handle,
-                # ElasticBuffer returns top-k ids in the receiving rank's
-                # local expert namespace.  The runner must consume them without
-                # applying the global expert_map again.
-                topk_ids=recv_group_topk_ids,
-                topk_weights=recv_topk_weights[: recv_x.shape[0]],
-                recv_count=handle.handle.psum_num_recv_tokens_per_expert,
-                hidden_states_scale=recv_x_scale,
-            )
-        raise RuntimeError(
-            "DeepEPDispatcher requires DeepEP V2 ElasticBuffer; "
-            f"got buffer={type(buffer).__name__}"
+        return self._finish_prepared_dispatch(
+            hidden_states,
+            group_topk_ids,
+            topk_weights,
+            expected_m_per_expert,
         )
 
-    def combine(self, combine_input: CombineInput) -> torch.Tensor:
+    def prepare_dispatch_from_gate(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> DeepEPElasticPreparedDispatch:
+        """Fuse the decode router GEMM and group-local top-k selection."""
+        from minisgl.kernel.moe_topk import gate_topk
+
+        if hidden_states.ndim != 2 or gate_weight.ndim != 2:
+            raise RuntimeError(
+                "fused DeepEP router expects hidden/gate matrices, got "
+                f"hidden={tuple(hidden_states.shape)} gate={tuple(gate_weight.shape)}"
+            )
+        if gate_weight.shape != (self.num_experts, hidden_states.shape[1]):
+            raise RuntimeError(
+                "fused DeepEP router shape mismatch: "
+                f"hidden={tuple(hidden_states.shape)} gate={tuple(gate_weight.shape)} "
+                f"experts={self.num_experts}"
+            )
+        ctx = get_global_ctx()
+        buffer = self._buffer()
+        max_tokens_per_rank = int(ctx.moe_deepep_dispatch_max_tokens_per_rank)
+        expected_m_per_expert = self._expected_m_per_expert(max_tokens_per_rank)
+        group_topk_ids, topk_weights = gate_topk(
+            hidden_states,
+            gate_weight,
+            self.top_k,
+            renormalize=bool(self.config.renormalize),
+            expert_map=self._map_global_to_group_experts(hidden_states.device),
+            num_token_non_padded=ctx.moe_num_token_non_padded,
+            topk_idx_dtype=self._topk_idx_dtype(buffer),
+        )
+        return self._finish_prepared_dispatch(
+            hidden_states,
+            group_topk_ids,
+            topk_weights,
+            expected_m_per_expert,
+        )
+
+    def dispatch_prepared(
+        self, prepared: DeepEPElasticPreparedDispatch
+    ) -> DeepEPElasticDispatchOutput:
+        """Launch DeepEP dispatch from a pre-quantized routing packet."""
+        ctx = get_global_ctx()
+        buffer = self._buffer()
+        if not bool(getattr(buffer, "is_elastic", False)):
+            raise RuntimeError(
+                "DeepEPDispatcher requires DeepEP V2 ElasticBuffer; "
+                f"got buffer={type(buffer).__name__}"
+            )
+        (
+            recv_x,
+            recv_x_scale,
+            recv_group_topk_ids,
+            recv_topk_weights,
+            handle,
+        ) = buffer.dispatch(
+            prepared.dispatch_x,
+            prepared.group_topk_ids,
+            prepared.topk_weights,
+            hidden_states_scale=prepared.dispatch_x_scale,
+            expert_alignment=prepared.expert_alignment,
+            num_max_dispatch_tokens_per_rank=ctx.moe_deepep_dispatch_max_tokens_per_rank,
+        )
+        return DeepEPElasticDispatchOutput(
+            hidden_states=recv_x,
+            handle=handle,
+            # ElasticBuffer returns top-k ids in the receiving rank's
+            # local expert namespace.  The runner must consume them without
+            # applying the global expert_map again.
+            topk_ids=recv_group_topk_ids,
+            topk_weights=recv_topk_weights[: recv_x.shape[0]],
+            recv_count=handle.handle.psum_num_recv_tokens_per_expert,
+            hidden_states_scale=recv_x_scale,
+            expected_m_per_expert=prepared.expected_m_per_expert,
+        )
+
+    def dispatch(
+        self, hidden_states: torch.Tensor, topk_output: Any
+    ) -> DeepEPElasticDispatchOutput:
+        prepared = self.prepare_dispatch(hidden_states, topk_output)
+        return self.dispatch_prepared(prepared)
+
+    def combine(
+        self,
+        combine_input: CombineInput,
+        *,
+        release_turn: torch.Tensor | None = None,
+        release_value: int = 0,
+    ) -> torch.Tensor:
         if isinstance(combine_input, DeepEPElasticCombineInput):
-            return self.combine_elastic(combine_input)
+            return self.combine_elastic(
+                combine_input,
+                release_turn=release_turn,
+                release_value=release_value,
+            )
         raise RuntimeError(
             f"DeepEPDispatcher expected DeepEPElasticCombineInput, "
             f"got {type(combine_input).__name__}"
         )
 
-    def combine_elastic(self, combine_input: DeepEPElasticCombineInput) -> torch.Tensor:
+    def combine_elastic(
+        self,
+        combine_input: DeepEPElasticCombineInput,
+        *,
+        release_turn: torch.Tensor | None = None,
+        release_value: int = 0,
+    ) -> torch.Tensor:
         return self._buffer().combine(
             combine_input.hidden_states,
             None,
             combine_input.handle,
+            release_turn=release_turn,
+            release_value=release_value,
         )
 
 
@@ -218,4 +352,5 @@ __all__ = [
     "DeepEPDispatcher",
     "DeepEPElasticCombineInput",
     "DeepEPElasticDispatchOutput",
+    "DeepEPElasticPreparedDispatch",
 ]

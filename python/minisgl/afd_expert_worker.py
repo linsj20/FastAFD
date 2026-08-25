@@ -10,6 +10,7 @@ from typing import Any
 import torch
 import torch.distributed
 from .afd_protocol import (
+    AfdAGStepReply,
     AfdCommand,
     AfdFlushStepCmd,
     AfdProfilerCmd,
@@ -17,6 +18,8 @@ from .afd_protocol import (
     AfdEGStepPlan,
     AfdEGStepReply,
     AfdRunEGStepCmd,
+    AfdRunModelStepCmd,
+    build_two_lane_pipeline_actions,
 )
 from minisgl.core import Context, get_global_ctx, set_global_ctx
 from minisgl.engine.config import EngineConfig
@@ -26,6 +29,7 @@ from minisgl.utils import nvtx_range
 from .cuda_graph_utils import capture_cuda_graph
 from .afd_support import AfdRuntimeConfig, log_line
 from .afd_worker_base import BaseAfdWorker, ensure_afd_parallel_info
+from .afd_attention_runtime import AfdAttentionRuntime
 
 __all__ = ["AfdExpertWorker", "AfdEgDecodeGraphRunner"]
 
@@ -54,6 +58,66 @@ class AfdExpertState:
             self.ctx = Context(config.page_size)
             set_global_ctx(self.ctx)
         self.stream = torch.cuda.Stream(device=self.device)
+
+
+class AfdModelState:
+    """FMHA-split EG state: model/token/page ledger, but no KV or backend."""
+
+    def __init__(self, config: EngineConfig):
+        self.config = config
+        self.dtype = config.dtype
+        device_env = os.environ.get("MINISGL_DEVICE_INDEX")
+        device_index = (
+            int(device_env) if device_env is not None else int(torch.cuda.current_device())
+        )
+        self.device = torch.device(f"cuda:{device_index}")
+        torch.cuda.set_device(self.device)
+        ensure_afd_parallel_info(config)
+        self.tp_cpu_group = (
+            torch.distributed.group.WORLD
+            if torch.distributed.is_initialized()
+            else _init_tp_communication(config, self.dtype)
+        )
+        self.ctx = Context(config.page_size)
+        self.ctx.server_args = config
+        self.ctx.replica_id = int(getattr(config, "dp_rank", 0))
+        set_global_ctx(self.ctx)
+        # EG must mirror the AG page allocator exactly because it computes the
+        # direct-write K/V locations.  The common capacity is only known after
+        # every AG actor has measured its physical allocation, so construction
+        # deliberately starts with an unusable placeholder.  The launcher
+        # configures all AG/EG runtimes before model initialization or serving.
+        self.num_pages = 0
+        self.max_seq_len = 0
+        aligned_max_seq_len = 32
+        self.page_configuration_pending = True
+        self.ctx.page_table = self.page_table = torch.zeros(
+            (config.max_running_req + 1, aligned_max_seq_len),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.stream = torch.cuda.Stream(device=self.device)
+
+    def install_dummy_req(self, table_idx: int, num_tokens: int):
+        from minisgl.core import Req
+
+        dummy_req = Req(
+            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
+            table_idx=table_idx,
+            cached_len=0,
+            output_len=1,
+            uid=-1,
+            sampling_params=None,  # type: ignore[arg-type]
+            cache_handle=None,  # type: ignore[arg-type]
+        )
+        self.page_table[dummy_req.table_idx].fill_(num_tokens)
+        return dummy_req
+
+    def shutdown(self) -> None:
+        torch.distributed.destroy_process_group()
+        from minisgl.distributed import destroy_distributed
+
+        destroy_distributed()
 
 
 @dataclass
@@ -192,18 +256,18 @@ def _run_eg_deepep_pipeline_body(
         dispatches[layer][mb] = None
         expert_outputs[layer][mb] = None
 
-    # EG collective order:
-    #   D(L0, mb0), D(L0, mb1), ...
-    #   expert/combine each MB for layer L, then immediately post D(L+1, mb).
-    # This mirrors the AG pipeline order without a separate schedule object.
-    for mb in range(num_mb):
-        launch_dispatch(0, mb)
-    for layer in range(num_layers):
-        for mb in range(num_mb):
+    # Mirror the AG two-lane rolling window exactly. Each physical lane retires
+    # combine before reusing its adapter workspace for another logical MB.
+    actions = build_two_lane_pipeline_actions(
+        num_layers=num_layers,
+        num_microbatches=num_mb,
+    )
+    for action, layer, mb in actions:
+        if action == "dispatch":
+            launch_dispatch(layer, mb)
+        else:
             launch_expert(layer, mb)
             launch_combine(layer, mb)
-            if layer + 1 < num_layers:
-                launch_dispatch(layer + 1, mb)
 
     if retire_async_objects:
         retire(force=True)
@@ -269,10 +333,12 @@ class AfdEgDecodeGraphRunner:
         self.expert_stage = expert_stage
         self.adapters = list(adapters)
         self.num_mb = max(1, int(num_mb))
-        if len(self.adapters) < self.num_mb:
+        required_lanes = min(2, self.num_mb)
+        if len(self.adapters) < required_lanes:
             raise RuntimeError(
-                f"EG decode graph requires >= num_mb adapters, "
-                f"got adapters={len(self.adapters)} num_mb={self.num_mb}"
+                "EG decode graph requires one adapter per physical lane: "
+                f"adapters={len(self.adapters)} required={required_lanes} "
+                f"num_mb={self.num_mb}"
             )
         self.comm_stream = comm_stream
         self.lane_comm_streams = (
@@ -408,10 +474,63 @@ class AfdExpertWorker(BaseAfdWorker):
 
     def _run_hot_rpc_loop(self) -> None:
         self._prepare_hot_rpc_runtime()
+        if self.model_placement == "fmha-only":
+            self._fmha_only_loop()
+            return
         if self.disable_overlap:
             self.afd_normal_loop()
         else:
             self.afd_overlap_loop()
+
+    def _fmha_only_loop(self) -> None:
+        pending = deque()
+
+        def retire(force: bool = False) -> None:
+            while pending and (force or len(pending) > 2):
+                handle = pending.popleft()
+                handle.done.synchronize()
+                for source_index, attn_dp_rank in enumerate(handle.attn_dp_ranks):
+                    start = int(handle.next_token_offsets[source_index])
+                    end = int(handle.next_token_offsets[source_index + 1])
+                    tokens = (
+                        [
+                            int(token)
+                            for token in handle.next_tokens_cpu[start:end].tolist()
+                        ]
+                        if self.tp_rank == 0
+                        else []
+                    )
+                    self._send_reply(
+                        AfdAGStepReply(
+                            worker_rank=self.worker_rank,
+                            step_id=handle.step_id,
+                            sent_ns=handle.sent_ns,
+                            next_tokens=tokens,
+                            attn_dp_rank=attn_dp_rank,
+                        )
+                    )
+
+        while True:
+            cmd = self._recv_hot_command(blocking=True)
+            if cmd is None:
+                continue
+            if isinstance(cmd, AfdFlushStepCmd):
+                retire(force=True)
+                continue
+            if isinstance(cmd, AfdStopCmd):
+                retire(force=True)
+                return
+            if isinstance(cmd, AfdProfilerCmd):
+                self.handle_profiler_cmd(cmd)
+                continue
+            if not isinstance(cmd, AfdRunModelStepCmd):
+                raise RuntimeError(
+                    f"Unsupported FMHA-only model command: {type(cmd).__name__}"
+                )
+            pending.append(
+                self._afd_fmha.run_fanin_step(cmd.plan, sent_ns=cmd.sent_ns)
+            )
+            retire(force=self.disable_overlap)
 
     def _run_afd_eg_step(
         self,
@@ -504,10 +623,12 @@ class AfdExpertWorker(BaseAfdWorker):
         expert_stage = self._afd_eg_model
         is_megamoe_backend = _eg_uses_megamoe(adapter)
         lane_streams = tuple(self._afd_comm_streams) or (self.runtime_state.stream,)
-        if len(adapters) < max(1, int(plan.num_mb)):
+        required_lanes = min(2, max(1, int(plan.num_mb)))
+        if len(adapters) < required_lanes:
             raise RuntimeError(
-                f"EG afd requires >= num_mb adapters, "
-                f"got adapters={len(adapters)} num_mb={int(plan.num_mb)}"
+                "EG AFD requires one adapter per physical lane: "
+                f"adapters={len(adapters)} required={required_lanes} "
+                f"num_mb={int(plan.num_mb)}"
         )
         num_mb = max(1, int(plan.num_mb))
         if is_megamoe_backend:
@@ -638,7 +759,7 @@ class AfdExpertWorker(BaseAfdWorker):
         blocking: bool,
         recv_wait_ms: float,
     ) -> None:
-        if not isinstance(cmd, AfdRunEGStepCmd):
+        if not isinstance(cmd, (AfdRunEGStepCmd, AfdRunModelStepCmd)):
             return
         if not self._control_profile_enabled(int(cmd.plan.step_id)):
             return
@@ -654,4 +775,13 @@ class AfdExpertWorker(BaseAfdWorker):
     # ------------------------------------------------------------------
 
     def _create_runtime(self, config: AfdRuntimeConfig):
+        if self.model_placement == "fmha-only":
+            runtime = AfdAttentionRuntime(
+                config,
+                AfdModelState(config),
+                owns_model_state=True,
+                prepare_attention_metadata=False,
+            )
+            runtime._page_configuration_pending = True
+            return runtime
         return AfdExpertState(config)

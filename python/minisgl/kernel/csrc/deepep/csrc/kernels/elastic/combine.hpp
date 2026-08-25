@@ -38,6 +38,8 @@ public:
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
+        int64_t* release_turn;
+        int64_t release_value;
 
         jit::LaunchArgs launch_args;
     };
@@ -90,7 +92,8 @@ static void __instantiate_kernel() {{
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
                                                      args.scaleup_rank_idx,
-                                                     args.num_reduced_tokens));
+                                                     args.num_reduced_tokens,
+                                                     args.release_turn, args.release_value));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
                                                      args.x, args.topk_weights,
@@ -101,7 +104,8 @@ static void __instantiate_kernel() {{
                                                      args.nccl_dev_comm, args.nccl_window,
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
-                                                     args.num_reduced_tokens));
+                                                     args.num_reduced_tokens,
+                                                     args.release_turn, args.release_value));
         }
     }
 };
@@ -126,6 +130,7 @@ static void* launch_combine(void* x,
                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                             const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                             const bool& is_scaleup_nvlink,
+                            int64_t* release_turn, const int64_t& release_value,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
@@ -133,6 +138,14 @@ static void* launch_combine(void* x,
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    if (num_scaleout_ranks == 1) {
+        // Match the decode dispatch width: the fixed 24-CTA grid already has
+        // at least one warp for every token in a small bucket.  Extra warps do
+        // no useful work but extend the launch and synchronization tail.
+        num_warps = std::min<int>(
+            num_warps,
+            std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms)));
+    }
 
     // Decide warps
     int num_scaleup_warps = 0, num_forward_warps = 0;
@@ -170,9 +183,15 @@ static void* launch_combine(void* x,
         .buffer = buffer, .workspace = workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
-        // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
+        .release_turn = release_turn, .release_value = release_value,
+        // FMHA-only selects one to three complete 8-CTA communication CGAs
+        // and gives DeepGEMM the complementary device-width launch budget.
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 8, true)
     };
+    EP_HOST_ASSERT((num_sms == 8 or num_sms == 16 or num_sms == 24) and
+                   "overlapped DeepEP combine requires 8, 16, or 24 SMs");
+    EP_HOST_ASSERT(num_sms % args.launch_args.cluster_dim == 0 and
+                   "DeepEP combine SM count must form complete 8-CTA CGAs");
     const auto code = CombineRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine", code);
     CombineRuntime::launch(runtime, args, stream);
@@ -258,11 +277,19 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                                            const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
-    // Too many warps may cause performance degrade, so we limit into 1024
+    // One warp reduces one output token.  Decode needs only the declared
+    // per-rank token capacity, not a full-device grid of idle CTAs/warps.
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);
-    const auto num_warps = std::min<int>(num_smem_bytes / token_layout.get_num_bytes<false>(), 32);
+    const auto epilogue_num_sms = std::min(
+        num_sms, std::max(1, num_max_tokens_per_rank));
+    const auto useful_warps = math::ceil_div(
+        num_max_tokens_per_rank, epilogue_num_sms);
+    const auto num_warps = std::min<int>(
+        num_smem_bytes / token_layout.get_num_bytes<false>(),
+        std::min(useful_warps, 32));
     const auto num_threads = num_warps * 32;
+    const auto epilogue_smem_bytes = static_cast<int>(
+        layout::BufferLayout<false>(token_layout, num_warps, 1).get_num_bytes());
 
     // Generate, build and launch
     const CombineReduceEpilogueRuntime::Args args = {
@@ -279,7 +306,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .bias_0 = bias_0, .bias_1 = bias_1,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
+        .launch_args = jit::LaunchArgs(epilogue_num_sms, num_threads, epilogue_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine_reduce_epilogue", code);

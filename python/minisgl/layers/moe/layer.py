@@ -1,4 +1,7 @@
+from typing import Any
+
 import torch
+
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info, try_get_ep_info
 from minisgl.models.config import QuantConfig
@@ -212,6 +215,83 @@ class MoELayer(BaseOP):
         dispatch_output = self.dispatcher.dispatch(hidden_states, router_logits)
         combine_input = self._run_moe_core(dispatch_output)
         final_hidden_states = self.dispatcher.combine(combine_input)
+        if self.tp_size > 1:
+            final_hidden_states = self._comm.all_reduce(final_hidden_states)
+        if empty_deepep:
+            return final_hidden_states[:0]
+        return final_hidden_states
+
+    def prepare_deepep(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> tuple[Any, bool]:
+        """Run MoE routing and quantization, stopping before DeepEP dispatch."""
+        if not isinstance(self.dispatcher, DeepEPDispatcher):
+            raise RuntimeError(
+                "staged MoE execution requires the DeepEP elastic dispatcher"
+            )
+        empty_deepep = hidden_states.shape[0] == 0
+        if empty_deepep:
+            hidden_states = hidden_states.new_zeros((1, self.hidden_size))
+            router_logits = router_logits.new_zeros((1, self.num_experts))
+        return (
+            self.dispatcher.prepare_dispatch(hidden_states, router_logits),
+            empty_deepep,
+        )
+
+    def prepare_deepep_from_gate(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor
+    ) -> tuple[Any, bool]:
+        """Fuse the staged DeepEP router GEMM and group-local top-k."""
+        if not isinstance(self.dispatcher, DeepEPDispatcher):
+            raise RuntimeError(
+                "staged MoE execution requires the DeepEP elastic dispatcher"
+            )
+        empty_deepep = hidden_states.shape[0] == 0
+        if empty_deepep:
+            hidden_states = hidden_states.new_zeros((1, self.hidden_size))
+        return (
+            self.dispatcher.prepare_dispatch_from_gate(hidden_states, gate_weight),
+            empty_deepep,
+        )
+
+    def finish_deepep(self, prepared: tuple[Any, bool]) -> torch.Tensor:
+        """Run DeepEP dispatch, experts, combine, and the optional TP reduction."""
+        dispatched = self.dispatch_deepep(prepared)
+        expert_output = self.run_deepep_experts(dispatched)
+        return self.combine_deepep(expert_output)
+
+    def dispatch_deepep(self, prepared: tuple[Any, bool]) -> tuple[Any, bool]:
+        """Launch DeepEP dispatch for an already routed and quantized input."""
+        if not isinstance(self.dispatcher, DeepEPDispatcher):
+            raise RuntimeError(
+                "staged MoE execution requires the DeepEP elastic dispatcher"
+            )
+        dispatch_input, empty_deepep = prepared
+        return self.dispatcher.dispatch_prepared(dispatch_input), empty_deepep
+
+    def run_deepep_experts(self, dispatched: tuple[Any, bool]) -> tuple[Any, bool]:
+        """Run local experts, stopping before DeepEP combine/cleanup."""
+        dispatch_output, empty_deepep = dispatched
+        return self._run_moe_core(dispatch_output), empty_deepep
+
+    def combine_deepep(
+        self,
+        expert_output: tuple[Any, bool],
+        *,
+        release_turn: torch.Tensor | None = None,
+        release_value: int = 0,
+    ) -> torch.Tensor:
+        """Combine expert output, release DeepEP buffers, and reduce dense TP."""
+        combine_input, empty_deepep = expert_output
+        if not isinstance(self.dispatcher, DeepEPDispatcher):
+            raise RuntimeError(
+                "staged MoE combine requires the DeepEP elastic dispatcher"
+            )
+        final_hidden_states = self.dispatcher.combine(
+            combine_input,
+            release_turn=release_turn,
+            release_value=release_value,
+        )
         if self.tp_size > 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         if empty_deepep:

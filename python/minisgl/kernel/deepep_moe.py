@@ -401,6 +401,12 @@ class DeepEPMoeElasticHandle:
 class DeepEPMoeElasticBuffer:
     """Minisgl-owned DeepEP V2 ElasticBuffer wrapper."""
 
+    OVERLAP_NUM_SMS = 24
+    HIGH_FANIN_OVERLAP_NUM_SMS = 8
+    HIGH_FANIN_MIN_SOURCES = 8
+    SUPPORTED_OVERLAP_NUM_SMS = (8, 16, 24)
+    OVERLAP_CLUSTER_DIM = 8
+
     is_elastic = True
 
     def __init__(
@@ -411,6 +417,7 @@ class DeepEPMoeElasticBuffer:
         hidden_size: int,
         num_experts: int,
         top_k: int,
+        overlap_num_sms: int = OVERLAP_NUM_SMS,
         num_allocated_qps: int = 0,
         log: Callable[[str], None] | None = None,
     ) -> None:
@@ -436,6 +443,13 @@ class DeepEPMoeElasticBuffer:
         self.hidden_size = int(hidden_size)
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
+        self.overlap_num_sms = int(overlap_num_sms)
+        if self.overlap_num_sms not in self.SUPPORTED_OVERLAP_NUM_SMS:
+            raise ValueError(
+                "DeepEP communication SMs must be one to three complete "
+                f"{self.OVERLAP_CLUSTER_DIM}-CTA clusters, got "
+                f"{self.overlap_num_sms}"
+            )
         deterministic = False
         allow_hybrid_mode = True
         allow_multiple_reduction = True
@@ -454,6 +468,8 @@ class DeepEPMoeElasticBuffer:
             f"deterministic={deterministic} allow_hybrid={allow_hybrid_mode} "
             f"allow_multi_reduce={allow_multiple_reduction} "
             f"prefer_overlap={self.prefer_overlap_with_compute} "
+            f"overlap_num_sms={self.overlap_num_sms} "
+            f"overlap_cluster_dim={self.OVERLAP_CLUSTER_DIM} "
             f"num_qps={self.num_allocated_qps} sl={sl_idx}"
         )
         _log("nccl_handle_start")
@@ -529,7 +545,13 @@ class DeepEPMoeElasticBuffer:
     def _num_sms(self) -> int:
         num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         if self.prefer_overlap_with_compute:
-            return max(4, min(num_sms, 24))
+            if num_sms < self.overlap_num_sms:
+                raise RuntimeError(
+                    "DeepEP compute overlap requires exactly "
+                    f"{self.overlap_num_sms} communication SMs, but the device "
+                    f"has only {num_sms}"
+                )
+            return self.overlap_num_sms
         return max(4, min(num_sms, max(64, num_sms)))
 
     def _num_qps(self, num_sms: int) -> int:
@@ -646,6 +668,9 @@ class DeepEPMoeElasticBuffer:
         expert_output: torch.Tensor,
         topk_weights: torch.Tensor | None,
         handle: DeepEPMoeElasticHandle,
+        *,
+        release_turn: torch.Tensor | None = None,
+        release_value: int = 0,
     ) -> torch.Tensor:
         runtime_handle = handle.handle
         if tuple(expert_output.shape) != tuple(handle.recv_shape):
@@ -654,6 +679,18 @@ class DeepEPMoeElasticBuffer:
                 f"recv_shape={handle.recv_shape}, got={tuple(expert_output.shape)}"
             )
         send = expert_output if expert_output.is_contiguous() else expert_output.contiguous()
+        if release_turn is not None:
+            if (
+                release_turn.dtype != torch.int64
+                or not release_turn.is_cuda
+                or not release_turn.is_contiguous()
+                or release_turn.numel() != 2
+                or int(release_value) <= 0
+            ):
+                raise ValueError(
+                    "DeepEP combine residency release requires a contiguous "
+                    "two-element CUDA int64 ticket and a positive value"
+                )
         num_sms = int(runtime_handle.num_sms)
         num_qps = self._num_qps(num_sms)
         combined, _combined_topk_weights, _event = self._runtime.combine(
@@ -672,6 +709,8 @@ class DeepEPMoeElasticBuffer:
             num_qps,
             None,
             None,
+            release_turn,
+            int(release_value),
             False,
             False,
             True,

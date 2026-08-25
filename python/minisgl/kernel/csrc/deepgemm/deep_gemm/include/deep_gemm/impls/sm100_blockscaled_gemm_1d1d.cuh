@@ -5,6 +5,7 @@
 #include <cutlass/arch/barrier.h>
 
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
@@ -101,7 +102,7 @@ sm100_blockscaled_gemm_1d1d_impl(int* grouped_layout,
     DG_STATIC_ASSERT(32 <= kNumTmemCols and kNumTmemCols <= 512, "Invalid tensor memory columns");
 
     // Synchronize the cluster before 2-CTA TMEM allocation
-    kNumMulticast > 1 ? cute::cluster_sync() : void();
+    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
 
     // Utils
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -180,7 +181,7 @@ sm100_blockscaled_gemm_1d1d_impl(int* grouped_layout,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
-    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Wait for primary kernel completion
     cudaGridDependencySynchronize();
@@ -496,8 +497,8 @@ sm100_blockscaled_gemm_1d1d_impl(int* grouped_layout,
         }
     }
 
-    // TODO: Remove redundant synchronization
-    kNumMulticast > 1 ? cute::cluster_sync() : __syncthreads();
+    // Finish local TMEM use; 2-CTA free synchronizes peer warp 0.
+    __syncthreads();
 
     // Deallocate tensor memory
     if (warp_idx == 0)

@@ -253,6 +253,7 @@ def persistent_psum_silu_mul_quant(
     psum_tokens_per_expert: torch.Tensor,
     *,
     alignment: int,
+    worker_blocks: int,
     topk_weights: torch.Tensor | None = None,
     group_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -264,6 +265,7 @@ def persistent_psum_silu_mul_quant(
         y,
         psum_tokens_per_expert,
         alignment=alignment,
+        worker_blocks=worker_blocks,
         topk_weights=topk_weights,
         group_size=group_size,
     )

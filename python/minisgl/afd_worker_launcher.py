@@ -136,6 +136,7 @@ def startup_afd_workers(coord: Any) -> None:
         "ray_nsys": bool(coord.server_args.ray_nsys),
         "disable_overlap": bool(coord.server_args.afd_disable_overlap),
         "afd_num_mb": coord.afd_num_mb,
+        "model_placement": coord.server_args.afd_model_placement,
         "rpc_timeout_ms": coord._rpc_timeout_ms,
         "moe_a2a_backend": coord.server_args.afd_moe_a2a_backend,
         "moe_runner_backend": coord.server_args.afd_moe_runner_backend,
@@ -244,6 +245,34 @@ def startup_afd_workers(coord: Any) -> None:
             for worker in coord._all_workers()
         ]
     )
+
+    # FMHA-only EG mirrors AG page allocation so its direct K/V writes use the
+    # same token locations as the physical AG cache.  Per-GPU physical capacity
+    # can vary slightly; constrain every logical allocator to the minimum before
+    # any model initialization, graph capture, or request materialization.
+    if coord.server_args.afd_model_placement == "fmha-only":
+        attn_infos = ray.get(
+            [worker.get_runtime_info.remote() for worker in coord.attn_workers]
+        )
+        physical_pages = tuple(int(info["num_pages"]) for info in attn_infos)
+        common_num_pages = min(physical_pages)
+        configured = ray.get(
+            [
+                worker.configure_fmha_num_pages.remote(common_num_pages)
+                for worker in coord._all_workers()
+            ]
+        )
+        if any(int(info["num_pages"]) != common_num_pages for info in configured):
+            raise RuntimeError(
+                "FMHA logical page configuration diverged across workers: "
+                f"expected={common_num_pages} configured={configured}"
+            )
+        log_line(
+            coord.log_path,
+            "[afd-coordinator] fmha_page_capacity "
+            f"physical_pages={physical_pages} common_num_pages={common_num_pages}",
+            flush=True,
+        )
 
     # Stage 9: initialize coordinator-side scheduling/profiling/queues.  From
     # this point on the coordinator talks to workers through ZMQ command/result

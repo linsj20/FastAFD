@@ -30,6 +30,7 @@ Options:
   --attn-tp-size N            AFD attention-side TP size. Default: 4
   --mlp-tp-size N             AFD model/mlp-side TP size. Default: 4
   --afd-mlp-ep-size N         AFD model/mlp-side EP size. Default: 1
+  --afd-model-placement NAME  legacy or fmha-only. Default: legacy
   --vllm-tp-size N            vLLM TP size. Default: number of GPUs in --gpus
   --ray-address ADDR          Ray address for AFD phase. Default: auto
   --ray-nsys                 Enable Nsight Systems profiling for AFD Ray workers
@@ -233,6 +234,7 @@ MLP_DP_SIZE="1"
 ATTN_TP_SIZE="4"
 MLP_TP_SIZE="4"
 AFD_MLP_EP_SIZE="1"
+AFD_MODEL_PLACEMENT="legacy"
 AFD_MOE_A2A_BACKEND="${AFD_MOE_A2A_BACKEND:-none}"
 AFD_MOE_RUNNER_BACKEND="${AFD_MOE_RUNNER_BACKEND:-auto}"
 VLLM_TP_SIZE=""
@@ -281,6 +283,7 @@ while [[ $# -gt 0 ]]; do
     --attn-tp-size) ATTN_TP_SIZE="$2"; shift 2 ;;
     --mlp-tp-size) MLP_TP_SIZE="$2"; shift 2 ;;
     --afd-mlp-ep-size) AFD_MLP_EP_SIZE="$2"; shift 2 ;;
+    --afd-model-placement) AFD_MODEL_PLACEMENT="$2"; shift 2 ;;
     --afd-moe-a2a-backend) AFD_MOE_A2A_BACKEND="$2"; shift 2 ;;
     --afd-moe-runner-backend) AFD_MOE_RUNNER_BACKEND="$2"; shift 2 ;;
     --vllm-tp-size) VLLM_TP_SIZE="$2"; shift 2 ;;
@@ -420,6 +423,7 @@ echo "  afd_decode_graph_bs: ${AFD_DECODE_GRAPH_BS:-<auto>}"
 echo "  afd_max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
 echo "  afd_max_running_requests: ${AFD_MAX_RUNNING_REQUESTS:-0}"
 echo "  afd_mlp_ep_size: $AFD_MLP_EP_SIZE"
+echo "  afd_model_placement: $AFD_MODEL_PLACEMENT"
 echo "  afd_moe_a2a_backend: $AFD_MOE_A2A_BACKEND"
 echo "  afd_moe_runner_backend: $AFD_MOE_RUNNER_BACKEND"
 echo "  vllm_extra_args: ${VLLM_EXTRA_ARGS:-<none>}"
@@ -472,6 +476,7 @@ afd_start_cmd+=(
   --afd-attn-tp-size "$ATTN_TP_SIZE"
   --afd-mlp-tp-size "$MLP_TP_SIZE"
   --afd-mlp-ep-size "$AFD_MLP_EP_SIZE"
+  --afd-model-placement "$AFD_MODEL_PLACEMENT"
   --afd-moe-a2a-backend "$AFD_MOE_A2A_BACKEND"
   --afd-moe-runner-backend "$AFD_MOE_RUNNER_BACKEND"
   --afd-batch-size "$AFD_BATCH_SIZE"

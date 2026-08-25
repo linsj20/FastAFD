@@ -23,14 +23,26 @@ class MHAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        storage: torch.Tensor | None = None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
-        self._kv_buffer = torch.empty(
-            (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
-            device=device,
-            dtype=dtype,
-        )
+        storage_shape = (2, num_layers, num_pages, page_size, local_kv_heads, head_dim)
+        if storage is None:
+            storage = torch.empty(storage_shape, device=device, dtype=dtype)
+        elif (
+            tuple(storage.shape) != storage_shape
+            or storage.device != device
+            or storage.dtype != dtype
+            or not storage.is_contiguous()
+        ):
+            raise ValueError(
+                "MHA KV backing storage does not match the required layout: "
+                f"required={storage_shape}/{dtype}/{device} "
+                f"actual={tuple(storage.shape)}/{storage.dtype}/{storage.device} "
+                f"contiguous={storage.is_contiguous()}"
+            )
+        self._kv_buffer = storage
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device

@@ -118,6 +118,7 @@ class BaseAfdWorker:
         ray_nsys: bool = False,
         disable_overlap: bool = False,
         afd_num_mb: int = 1,
+        model_placement: str = "legacy",
         rpc_timeout_ms: int = 300_000,
         attn_dp_rank: int = 0,
         attn_dp_size: int = 1,
@@ -206,6 +207,9 @@ class BaseAfdWorker:
         self.ep_size = self.mlp_ep_size if role == "mlp" else 1
         self.disable_overlap = bool(disable_overlap)
         self.afd_num_mb = max(1, int(afd_num_mb))
+        self.model_placement = str(model_placement)
+        if self.model_placement not in ("legacy", "fmha-only"):
+            raise ValueError(f"unsupported AFD model placement {self.model_placement!r}")
         self._control_profile_start_step = int(
             os.environ.get("MINISGL_AFD_CONTROL_PROFILE_START_STEP", "0") or 0
         )
@@ -216,7 +220,8 @@ class BaseAfdWorker:
         self._dual_stream_microbatch = self.afd_num_mb > 1
         self._comm_stream = torch.cuda.Stream(device=self.device)
         self._afd_comm_streams = [
-            torch.cuda.Stream(device=self.device) for _ in range(max(1, self.afd_num_mb))
+            torch.cuda.Stream(device=self.device)
+            for _ in range(min(2, self.afd_num_mb))
         ]
         # Dedicated D2H stream for the one-step-ahead (overlap) AG/EG loops: the
         # sampled next_tokens copy runs here async, its copy_done_event is
@@ -297,6 +302,8 @@ class BaseAfdWorker:
             afd_mlp_tp_size=self.mlp_tp_size,
             afd_moe_a2a_backend=str(moe_a2a_backend),
             afd_moe_runner_backend=str(moe_runner_backend),
+            afd_model_placement=self.model_placement,
+            afd_max_comm_tokens=self.max_comm_tokens,
         )
         self.runtime = self._create_runtime(config)
         self.runtime_state = getattr(self.runtime, "state", self.runtime)
@@ -328,6 +335,7 @@ class BaseAfdWorker:
             f"attn_tp_size={self.attn_tp_size} mlp_tp_size={self.mlp_tp_size} "
             f"device_comm_num_sms={self.device_comm_num_sms} "
             f"afd_num_mb={self.afd_num_mb} "
+            f"model_placement={self.model_placement} "
             f"dual_stream_microbatch={self._dual_stream_microbatch} "
             f"rpc_timeout_ms={self._recv_timeout_ms} "
             f"decode_graph_bs={list(self.decode_graph_bs)} "
@@ -428,11 +436,38 @@ class BaseAfdWorker:
             info["max_seq_len"] = int(self.runtime_state.max_seq_len)
         return info
 
+    def configure_fmha_num_pages(self, num_pages: int) -> dict[str, int]:
+        if self.model_placement != "fmha-only":
+            raise RuntimeError("FMHA page configuration is only valid for fmha-only placement")
+        configure = getattr(self.runtime, "configure_num_pages", None)
+        if configure is None:
+            raise RuntimeError(f"{self.role} runtime cannot configure FMHA page capacity")
+        configure(int(num_pages))
+        log_line(
+            self.log_path,
+            f"[{self.role} rank={self.tp_rank}] fmha_page_capacity "
+            f"num_pages={int(self.runtime_state.num_pages)} "
+            f"max_seq_len={int(self.runtime_state.max_seq_len)}",
+            flush=True,
+        )
+        return {
+            "num_pages": int(self.runtime_state.num_pages),
+            "max_seq_len": int(self.runtime_state.max_seq_len),
+        }
+
     def _init_afd_runtime(self) -> None:
         """afd AG/EG: build the role model + role-split weights + the directional
         DeepEP adapter over the union world. Collective (all union ranks build the
         adapter together); idempotent; called once at hot-loop start."""
         if getattr(self, "_afd_initialized", False):
+            return
+        if self.model_placement == "fmha-only":
+            from .afd_fmha_runtime import AfdFmhaRuntime
+
+            self._afd_fmha = AfdFmhaRuntime(self)
+            self._afd_ag_graph = None
+            self._afd_eg_graph = None
+            self._afd_initialized = True
             return
         import torch.distributed as dist
         from minisgl.engine.sample import Sampler
@@ -454,11 +489,11 @@ class BaseAfdWorker:
         bucket = max(int(self.cuda_graph_max_bs), afd_max_dispatch_tokens)
 
         # Directional dispatch/combine over the union world (all AG+EG ranks).
-        # Pipeline scheduling intentionally keeps multiple dispatch handles alive:
-        # D(L,MB0), D(L,MB1), C(L,MB0), D(L+1,MB0), ...
+        # Pipeline scheduling intentionally keeps dispatch handles alive across
+        # the two alternating communication lanes.
         # A DeepEP ElasticBuffer owns the metadata/workspace that combine reads
-        # through the dispatch handle, so each in-flight MB gets one adapter lane.
-        adapter_lanes = max(1, int(self.afd_num_mb))
+        # through the dispatch handle, so each physical lane gets one adapter.
+        adapter_lanes = min(2, int(self.afd_num_mb))
         arch0 = getattr(mc, "architectures", [""])[0]
         model_extra = getattr(mc, "model_extra", {})
         self._afd_moe_backend = afd_env("MOE_BACKEND", "deepep")
@@ -768,6 +803,15 @@ class BaseAfdWorker:
         per-bucket capture — which runs the DeepEP dispatch/combine COLLECTIVES —
         stays in lockstep across ranks. Buckets captured ascending, same order on
         every rank."""
+        if self.model_placement == "fmha-only":
+            captured = self._afd_fmha.warmup_decode_graphs(tuple(bs_list))
+            log_line(
+                self.log_path,
+                f"[{self.role} rank={self.tp_rank}] fmha_decode_graphs:captured "
+                f"{captured}",
+                flush=True,
+            )
+            return {"role": self.role, "rank": self.tp_rank, "captured": captured}
         if not self.enable_decode_graph:
             return {"role": self.role, "rank": self.tp_rank, "captured": []}
         runner = self._afd_ag_graph if self.role == "attention" else self._afd_eg_graph

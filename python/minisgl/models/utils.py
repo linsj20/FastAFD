@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, NamedTuple
+
+import torch
 
 from minisgl.layers import (
     AttentionLayer,
@@ -17,9 +19,6 @@ from minisgl.layers import (
 )
 from minisgl.models import ModelConfig
 from minisgl.utils import nvtx_annotate
-
-if TYPE_CHECKING:
-    import torch
 
 
 class GatedMLP(BaseOP):
@@ -52,6 +51,12 @@ class GatedMLP(BaseOP):
         return self.down_proj.forward(y)
 
 
+class _MoEMLPPrepared(NamedTuple):
+    experts: Any
+    num_tokens: int
+    hidden_dim: int
+
+
 class MoEMLP(BaseOP):
     def __init__(self, config: ModelConfig):
         self.experts = MoELayer(
@@ -77,6 +82,54 @@ class MoEMLP(BaseOP):
         )
         final_hidden_states = final_hidden_states.view(num_tokens, hidden_dim)
         return final_hidden_states
+
+    def prepare_deepep(self, hidden_states: torch.Tensor) -> _MoEMLPPrepared:
+        """Fuse decode routing and prepare FP8 dispatch before communication."""
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        return _MoEMLPPrepared(
+            experts=self.experts.prepare_deepep_from_gate(
+                hidden_states, self.gate.weight
+            ),
+            num_tokens=num_tokens,
+            hidden_dim=hidden_dim,
+        )
+
+    def finish_deepep(self, prepared: _MoEMLPPrepared) -> torch.Tensor:
+        """Complete communication and expert execution for a prepared MoE input."""
+        dispatched = self.dispatch_deepep(prepared)
+        expert_output = self.run_deepep_experts(dispatched)
+        return self.combine_deepep(expert_output)
+
+    def dispatch_deepep(self, prepared: _MoEMLPPrepared) -> _MoEMLPPrepared:
+        return _MoEMLPPrepared(
+            experts=self.experts.dispatch_deepep(prepared.experts),
+            num_tokens=prepared.num_tokens,
+            hidden_dim=prepared.hidden_dim,
+        )
+
+    def run_deepep_experts(self, dispatched: _MoEMLPPrepared) -> _MoEMLPPrepared:
+        return _MoEMLPPrepared(
+            experts=self.experts.run_deepep_experts(dispatched.experts),
+            num_tokens=dispatched.num_tokens,
+            hidden_dim=dispatched.hidden_dim,
+        )
+
+    def combine_deepep(
+        self,
+        expert_output: _MoEMLPPrepared,
+        *,
+        release_turn: torch.Tensor | None = None,
+        release_value: int = 0,
+    ) -> torch.Tensor:
+        final_hidden_states = self.experts.combine_deepep(
+            expert_output.experts,
+            release_turn=release_turn,
+            release_value=release_value,
+        )
+        return final_hidden_states.view(
+            expert_output.num_tokens, expert_output.hidden_dim
+        )
 
 
 class RopeAttn(BaseOP):
@@ -122,10 +175,26 @@ class RopeAttn(BaseOP):
 
     @nvtx_annotate("MHA")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        qkv = self.qkv_proj.forward(x)
+        qkv = self.prepare_qkv(x)
         del x
         o = self.attn.forward(qkv)
+        return self.finish_attention(o)
+
+    def prepare_qkv(self, x: torch.Tensor) -> torch.Tensor:
+        return self.qkv_proj.forward(x)
+
+    def finish_attention(self, o: torch.Tensor) -> torch.Tensor:
         return self.o_proj.forward(o)
+
+    def finish_attention_fp8(
+        self, o_fp8: torch.Tensor, o_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return self.o_proj.forward_fp8_prequant(
+            o_fp8,
+            o_scale,
+            output_shape_prefix=tuple(o_fp8.shape[:-1]),
+            output_dtype=torch.bfloat16,
+        )
 
 
 __all__ = ["GatedMLP", "RopeAttn", "MoEMLP"]

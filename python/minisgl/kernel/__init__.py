@@ -17,6 +17,12 @@ from .deepep_moe import (
     DeepEPMoeElasticHandle,
     ensure_deepep_moe_built,
 )
+from .fabric_memory import (
+    FabricTensor,
+    allocate_fabric_tensor,
+    allocate_fabric_tensors,
+    import_fabric_tensor,
+)
 from .pynccl import PyNCCLCommunicator, init_pynccl
 from .qk_norm_rope import qk_norm_rope_cuda, qk_norm_rope_store_kv_cuda
 from .radix import fast_compare_key
@@ -31,6 +37,10 @@ __all__ = [
     "DeepEPMoeElasticBuffer",
     "DeepEPMoeElasticHandle",
     "ensure_deepep_moe_built",
+    "FabricTensor",
+    "allocate_fabric_tensor",
+    "allocate_fabric_tensors",
+    "import_fabric_tensor",
     "moe_align_block_size",
     "topk_softmax",
     "topk_softmax_group_local",

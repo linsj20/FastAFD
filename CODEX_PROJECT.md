@@ -1,5 +1,418 @@
 # Project Memory
 
+## Current stop state (2026-08-24 PDT)
+
+The user ended the exact-two-FFN-stream follow-up and selected the staged
+accepted CUDA-event implementation as the final state. Local source/tests and
+the canonical remote `source_two_lane_final` workspace were restored to that
+staged code. No new performance run was submitted: the user explicitly waived
+it because this is the already validated job-6474505 source. Report the retained
+evidence as 25.7321745 ms E2E, 25.6797822 ms strict CUDA, 116.585561 TPS/GPU,
+15/15 samples with zero outliers, and perfect official alignment from job
+6474804. The trace retains 95 model CUDA Graph execution stream IDs because of
+the event-created segments; this topology limitation is accepted for the stop
+state. Do not resume the two-stream experiments unless the user reopens them.
+
+Newer work has reopened the general FFN/communication optimization path.  The
+authoritative current checkpoint and active validation state are in
+`CODEX_PROJECT_qwen3_ffn_overheads.md`; its aligned NCCL plus minimal
+DeepGEMM-teardown job `6502925` at remote commit `bc9ab7f` supersedes this
+historical two-stream stop state.
+
+## Active Qwen3 FMHA-only placement work
+
+Minimum resume handoff: `CODEX_PROJECT_qwen3_ffn_handoff.md`.
+
+The authoritative design, accepted evidence, campaign state, rejected-path
+lessons, and completion boundary are in
+`CODEX_PROJECT_qwen3_ffn_overheads.md`. That file is intentionally compact;
+do not restore the chronological experiment transcript here.
+
+On 2026-08-23 the user reopened the exact EP4 FFN path to separate DeepEP
+buffer-ready control from payload transfer. Standalone prearming is numerically
+correct (CPU 6473516, GPU 6473688) but rejected: job 6473693 regressed E2E to
+26.0383275 ms and expanded the model graph by 376 nodes. Trace export 6473952
+shows 27.843 ms in 6,016 control kernels versus 25.306 ms saved in the data
+kernels. A full-handshake epilogue-tail candidate retained only two graph-start
+bootstraps but job 6474094 still regressed to 26.071802 ms E2E because the tail
+wait serialized following compute. The retained candidate posts readiness at
+the epilogue tail without waiting and performs only a local ready-word check in
+the later payload grid. Exact job 6474505 improves E2E/strict CUDA to
+25.7321745/25.6797822 ms with the expected 564/3,678 graph shape. Official
+alignment job 6474804 completed `0:0`: 24 prompts / 408 tokens,
+top-1/top-10/top-100 all 1.0, and average/max rank 1.0. All eight raw Nsight
+reports from this best case are copied locally under
+`scratch/qwen3_ffn_overheads_20260820/preposted_buffer_ready_validation/trace/nsys/`.
+
+The active follow-up is FFN stream reuse. SQLite inspection of the best-case
+rank-1 attention trace finds 9,024 graph kernel calls, 564 nodes, and exactly
+two kernel stream IDs. Rank-5 model has 58,848 graph kernel calls, 3,678 nodes,
+but 95 kernel stream IDs: the two intended lanes plus 93 per-layer CUDA-event
+segments. The first replacement reused one device turn and one-warp wait across
+all layers. Job 6475180 plus SQLite export 6475310 proved exactly two model
+kernel streams, but its 187 wait kernels raised model graph nodes to 3,865 and
+regressed E2E to 26.429704 ms (+2.711%) and strict CUDA to 26.3694974 ms
+(+2.686%); it is rejected. The current candidate retains the fused QKV release
+but captures `cuStreamWaitValue32` operations on the two persistent lanes, so
+the handoff has no standalone wait kernel. All 94 layers must reuse the same
+two streams and two DeepEP buffers. Acceptance still requires an Nsight trace
+proving exactly two model kernel streams and E2E no worse than the
+25.7321745-ms aligned best case. See the two Qwen3 project files for current
+validation state. The memory-wait candidate passes local 15/15, remote CPU
+job 6475380 at 60/60, and fresh SM100 job 6475381, including a captured
+two-stream wait/release replay. Exact job 6475460 and export 6475603 prove the
+target 58,848/3,678 model kernel shape on exactly two streams with 1.811-ms
+median productive overlap, but regress E2E/strict CUDA to
+26.945252/26.8631071 ms (+4.714%/+4.608%); stream-memory waits are rejected.
+The active candidate retains only same-layer lane-0-to-lane-1 event handoffs
+and removes the cyclic lane-1-to-next-layer dependency responsible for extra
+graph execution streams. It adds no steady-state wait kernel or stream-memory
+operation. Local contract validation passes 15/15. CPU job 6475707 found one
+stale negative-test setup before any GPU ran. Replacement CPU job 6475725
+passes 60/60, and dependent fresh SM100 job 6475726 passes transport prebuild
+plus two fabric pairs x nine 8,192-row iterations. Exact job 6475770 completes
+`0:0` but regresses E2E/strict CUDA to 26.319437/26.2625085 ms,
++2.282%/+2.269% versus job 6474505. It is rejected without alignment. CPU
+export 6475829 shows it still has 95 model stream IDs: lane 0 stays on one
+stream, while every per-layer event splits lane 1 into a separate 19-node
+execution segment. The next candidate removes all model-side events and relies
+only on the existing per-lane O-ready waits, attention turn, and DeepEP cleanup
+handshake; it adds no wait operation or kernel. Local contract remains 15/15
+and remote CPU job 6475982 passes 60/60. Exact job 6475991 measures
+26.1218645/26.0498022 ms E2E/strict CUDA, +1.514%/+1.441% versus job 6474505.
+Export 6475992 proves the original 58,848/3,678 model shape now runs on exactly
+streams 32/164, with both DeepEP lanes on the same streams and 1.148382-ms
+median productive overlap. The topology succeeds but neutral-priority latency
+does not. The model-lane-priority follow-up passes remote CPU 60/60 in job
+6476267. Exact job 6476272 measures 26.015458/25.9618923 ms E2E/strict CUDA,
++1.101%/+1.099% versus job 6474505. Export 6476274 retains the original
+58,848/3,678 shape on exactly streams 28/164; those same streams carry both
+DeepEP lanes, whose productive overlap improves to 1.329086 ms median /
+0.974784 ms minimum. Performance still rejects this candidate. The final
+directional test extends the same lane-0 priority to attention while retaining
+the zero-event graph. Local contract passes 15/15 and remote CPU job 6476500
+passes 60/60. Exact job 6476535 measures 26.1026495/26.0252253 ms E2E/strict
+CUDA, +1.440%/+1.345% versus job 6474505 and worse than model-only priority.
+Export 6476537 again proves 58,848/3,678 on exactly model streams 28/164, with
+both DeepEP lanes on those streams and 1.324384-ms median productive overlap.
+The candidate is rejected. The accepted neutral-stream, per-round event
+schedule has been restored locally and remotely; local contract passes 15/15,
+and restored CPU job 6476746 passes 60/60. TODO remains: redesign the FFN handoff
+so all 94 layers reuse exactly two CUDA Graph execution streams and two DeepEP
+buffers while maintaining E2E at or below 25.7321745 ms. Transport code is
+unchanged from fresh-passing job 6475726, so no redundant fabric smoke is
+needed.
+
+The active two-stream follow-up is trace-directed. Compared with accepted job
+6474505, fastest exact-two-stream job 6476272 adds about 0.548 ms of attention
+Q-ready wait and 0.191 ms of model O-ready wait per replay, but only 0.013 ms
+of productive attention kernels. The first retained-graph candidate applied
+priority -1 to every QKV publication and its four nearest productive ancestors
+without adding a stream, node, or dependency. Local contract passes 15/15,
+remote CPU job 6476950 passes 61/61, and focused raw-graph GPU smoke job
+6476955 completes `0:0`. Full job 6476970 found 188 QKV anchors / 940 selected
+kernels but regressed to 27.7717195 ms E2E and 27.6719843 ms strict CUDA:
+symmetric signal-path priority synchronizes the lanes instead of staggering
+them. It is rejected; trace export 6476971 is retained, and the next candidate
+prioritizes only lane 0's QKV wavefront while leaving both FFN tails neutral.
+The export proves 58,848/3,678 model kernels/nodes on exactly streams 32/164,
+both used by DeepEP, with 2.168475-ms median productive overlap. That overlap
+is counterproductive: attention Q-ready waits add 3.695024 ms and model summed
+kernel time adds 3.761959 ms per replay versus job 6474505.
+The asymmetric follow-up tags only model lane 0 at capture, resets that entire
+lane to default, then reapplies priority -1 only to its QKV publication
+ancestors. Local contract passes 15/15 and remote full CPU job 6477233 passes
+61/61; job 6477192 was cancelled as a zero-output `cpu-0001` infrastructure
+stall. GPU smoke 6477245 proves exactly one of two stream nodes carries the
+tag and survives reset/reprioritization/replay. Exact job 6477252 and trace
+export 6477253 are queued.
+Exact job 6477252 found 94 lane-0 anchors / 470 selected kernels after resetting
+all 1,889 tagged lane-0 kernels, but measured 26.223880 ms E2E and 26.1863071
+ms strict CUDA. It is slower than both job 6474505 and neutral two-stream job
+6475991, so per-layer node priority is rejected. Export 6477253 failed only
+because its container could not reopen the transient Slurm spool path;
+replacement 6477539 passes the durable script path explicitly.
+Export 6477539 proves 58,848/3,678 model calls/nodes on exactly streams 28/164,
+both used by DeepEP, but it adds 0.132855 ms model span and 0.136505 ms
+attention span versus neutral exact-two-stream job 6475991. The active
+replacement removes node priority, restores neutral streams, and seeds the
+stagger once: lane 1 waits, lane 0 releases after its first QKV compute and
+before publication, then lane 1 resets the ticket. Local contract passes 15/15
+and remote CPU job 6477689 passes 60/60.
+GPU replay smoke 6477708 completed `0:0` on a real GPU: nine replays ended
+with `turn=0`, `timeout=(0,0)`, `produced=9`, and `observed=45`, allowing the
+candidate to advance to exact performance and dependent durable trace export.
+Exact job 6477716 completed `0:0` but is rejected: 26.222327 ms E2E,
+26.1675189 ms strict CUDA, 114.406323 E2E TPS/GPU, 15/15 samples, and zero
+outliers. Export 6477721 completed `0:0`; its local rank-1/rank-5 SQLite traces
+prove 564 attention nodes on two streams and 3,680 model nodes on exactly two
+streams (32/164), both used by DeepEP. The startup seed did not actually wait:
+lane 1's 16 startup `wait_turn_kernel` calls average only 1.938 us. CUDA Graph
+scheduled lane 0's release first, so the candidate added two nodes without
+establishing the intended stagger. Productive model overlap rose to 1.564894 ms
+median, but the attention/model spans are +0.487737/+0.489323 ms versus aligned
+job 6474505 and the MB2 ping-pong gate fails.
+The active directional replacement makes only persistent model lane 1
+high-priority so its one-warp startup waiter becomes resident before lane 0's
+release; attention and all other streams remain neutral. Remote CPU job 6478123
+passes 60/60. Smoke 6478213 replayed correctly but its cross-stream CUDA-event
+timing query was unsupported; replacement 6478515 uses a test-only device entry
+probe and passes nine replays with `entered=9` and
+`release_saw_entered=45`, proving waiter-before-release every time. Exact job
+This advanced to exact job 6478604 and dependent durable export 6478605.
+Exact job 6478604 completed `0:0` but is rejected at 26.1627855 ms E2E,
+26.0976459 ms strict CUDA, 114.666689 E2E TPS/GPU, 15/15 samples, and zero
+outliers. Export 6478605 produced intact local SQLite databases before its
+signal-terminated teardown; both pass `PRAGMA integrity_check`. The model is
+58,880 calls / 3,680 nodes / exactly streams 28/164, both carrying DeepEP.
+Lane 1's startup wait still averages only 1.824 us: priority makes it enter just
+before release, but graph root lane 0 has already executed QKV compute. The
+active correction roots only the model graph on lane 1 so the waiting branch is
+scheduled before lane 0 starts; attention remains rooted on lane 0.
+The waiter-root candidate passes local contract 15/15 and remote CPU job
+6479023 at 60/60; pending pin job 6479014 was cancelled because `cpu-0015` was
+fully allocated. GPU smoke 6479044 completes `0:0` with nine clean replays and
+5,007,285 waiter cycles, directly proving the wait spans lane-0 work. This
+advanced to exact job 6479079 and dependent rank-1/rank-5 export 6479081.
+Exact waiter-root job 6479079 completed `0:0` but is rejected at 26.158717 ms
+E2E and 26.2745685 ms strict CUDA mean (26.115999-ms median), with 15/15
+samples and zero outliers. Export 6479081 completed `0:0`; integrity-clean
+local traces prove 58,880 calls / 3,680 nodes on exactly streams 28/164, both
+carrying DeepEP. The full graph still delays the lane-1 waiter until just before
+release (2.100-us mean), despite lane-1 rooting. The active correction uses an
+in-kernel waiter-entry publication plus a one-time lane-0 entry gate, which
+guarantees waiter residency before first QKV compute while adding only one node.
+The guaranteed-entry candidate passes local contract 15/15, remote CPU job
+6479470 at 60/60, and GPU smoke 6479372 with nine replay-stable iterations
+(`turn=0`, `entered=0`, no timeout, `observed=45`). Exact job 6479509 is
+rejected at 26.167521 ms E2E and 26.1245205 ms strict CUDA mean
+(26.119584-ms median), 15/15 samples, zero outliers, and 114.645938 E2E
+TPS/GPU. Export 6479521 proves rank 5 has 58,896 calls / 3,681 nodes on exactly
+streams 28/164, both carrying DeepEP; productive overlap is 1.377312 ms median
+but the bidirectional ping-pong gate still fails. The waiter itself now spans
+30.064 us, but the first lane-0 entry gate is exposed for about 383.9 us on
+every measured replay: CUDA Graph schedules lane 0's bootstrap and gate before
+lane 1's bootstrap/waiter. The active correction enqueues the lane-1 waiter
+before either DeepEP bootstrap, preserving the same two streams/buffers while
+removing that exposed scheduler delay. If needed afterward, fold the 93
+steady-state expert admission waits into their existing dispatch epilogues.
+
+Waiter-first jobs 6479731/6479735 are rejected at 26.2094891-ms strict/E2E
+CUDA mean (26.166656 median), 114.462361 TPS/GPU, 15/15 samples, zero outliers,
+and +0.477315 ms versus the aligned target. Exported rank 5 is exactly streams
+28/164 with both DeepEP lanes, but bidirectional FFN ping-pong fails. The active
+replacement moves the accepted cadence into existing kernels: QKV publication
+releases a local signal before its data transfer, steady-state lane admission
+waits inside fused add-RMSNorm+QKV-FP8 quant, and every deferred combine
+releases a one-CTA wait fused into the peer dispatch-copy epilogue. It therefore
+targets exact two-stream/buffer reuse, 186 fewer norm/quant nodes, no standalone
+cleanup waits, a 3,400-node model graph, and symmetric FFN cleanup/expert
+overlap. Local static contract passes 15/15, remote CPU job 6480201 passes
+60/60, and fresh SM100 extension compile job 6480387 passes. GPU smoke 6480416
+failed before kernel launch because its wrapper omitted a writable FlashInfer
+cache. After fixing the reusable wrapper, replacement GPU smoke 6480441 passes
+all three gates in 6:59: fused admitted add-RMSNorm/FP8 is bit-exact across nine
+two-stream graph replays, four-rank fabric signaling/data transfer passes, and
+the prearmed DeepEP admission ticket is consumed and reset. Exact job 6480443
+completes 15/15 with zero outliers and proves the intended 3,400-node model
+graph, but is rejected at 26.2396121-ms E2E (26.211742-ms median), 114.330959
+TPS/GPU: +0.507438 ms/+1.972% versus the aligned 25.7321745-ms target. Trace
+export 6480445 is running to localize that remaining critical-path loss;
+alignment is intentionally withheld from the known performance miss.
+
+### Current terminal update (2026-08-23 PDT)
+
+This update supersedes the older in-progress chronology below. The focused
+128K/b6/A1:F1/ATP1/FEP4 goal is complete and Pareto remains frozen. Fresh
+same-code E2E results are legacy job 6470598 at 30.6157295 ms,
+32.6629486 TPS/user, and 97.9888459 TPS/GPU versus `fmha-only` job 6472328 at
+25.9524935 ms, 38.5319430 TPS/user, and 115.5958290 TPS/GPU. The new mode is
+15.2315% lower latency and 17.9684% higher throughput, with 15/15 eligible
+samples and zero outliers in both runs.
+
+Official new-mode alignment job 6472537 completed `0:0`: 24 prompts / 408
+tokens, top-1/top-10/top-100 all 100%, average/max vLLM rank 1.0, and valid
+attention/model trace audits with 16 graph launches each. Legacy official
+scoring from job 6470699 has the same perfect summary; its scorer artifact is
+valid even though an obsolete placement-blind post-auditor made that Slurm
+record exit 1 after scoring. Manual legacy rank-1 trace validation passed.
+
+The final code keeps generic flattened fan-in publication and adds exact
+compile-time single-edge/single-ready QKV and O publication variants for A1.
+Remote CPU job 6472263 passes 60/60; SM100 compile/fabric job 6472264 and trace
+export job 6472538 complete `0:0`. The exact template variants are present in
+the capture. The current source and runs use no source-hash manifest:
+`control/final_candidate_source_manifest.sha256` is absent locally/remotely,
+and focused jobs use `FASTAFD_ALLOW_DIRTY_SOURCE=1`. See
+`CODEX_PROJECT_qwen3_ffn_handoff.md` for the concise final evidence and paths.
+
+The corrected historical no-new-mode sweep row for this nominal case is
+33.6810167 ms / 29.6903152 TPS/user / 89.0709455 TPS/GPU, but that row uses an
+attention CUDA critical-range mean rather than E2E. Use job 6470598 for the
+final apples-to-apples E2E control. The literal optimized target was `<26 ms`;
+the historical accepted reference was 25.967383 ms.
+
+Follow-on exact-A1 FEP8 job 6473036 completed `0:0` in 13:47 on four contiguous
+trays / 16 active GPUs. Its E2E result is 25.391392 ms, 39.3834257 TPS/user,
+and 118.1502771 TPS/GPU; strict CUDA mean is 25.3729383 ms with 15/15 samples,
+zero outliers, and the expected 564/3,676 attention/model graph shapes. All 32
+raw Nsight reports across legacy EP4, new-mode EP4, and new-mode EP8 are copied
+under `scratch/qwen3_ffn_overheads_20260820/nsys_three_case_collection_20260823`.
+
+### Older experiment chronology
+
+The validation base is remote branch `generic-two-lane-final` at campaign head
+`5d07865` and original runtime boundary `5bc6b1a` under the canonical Lustre
+`qwen3_ffn_overheads_20260820/source_two_lane_final` workspace.
+That tree currently contains the tracked dirty grouped-fan-in correction frozen
+by the focused validation source manifest.
+It accepts every `1 <= num_microbatches <= batch_size`: decode N=1 uses one
+active stream, and decode N>1 uses exactly two parity-reused streams/slots for
+FMHA, FFN, and legacy adapters. Eager prefill bounds the same resources with a
+two-live-round wavefront. Each FMHA boundary has only Q/K/V payload+ready and O
+payload+ready across GPUs; all reuse clearing and turn ordering is GPU-local.
+
+The grouped-fan-in candidate passes 59/59 pinned remote tests; the final
+harness's 15-test GB200 contract gate also passes locally. Its CUDA transport
+build, four-GPU fabric smoke, and unchanged 8K prefill-reference smoke pass.
+Final grouped focused jobs measure 26.1905406667 ms for A1:F1 and
+27.8508985333 ms for A2:F1 at 128K/b6/MB2. Both use one attention and one
+grouped model graph per trace step. Both execute exactly 188 gate/up and 188
+down expert GEMMs per replay (94 layers * two FFN rounds). A2's dominant
+kernel-duration increases are expert gate/up +1.334426 ms (+31.58%) and expert
+down +0.665562 ms (+26.09%); dense QKV/O are effectively unchanged. The expert
+psum scheduler streams weights per active expert, so merging six tokens rather
+than three can broaden expert coverage even with skinny M. This is not
+serialized FFN launching or host synchronization, and overlapping kernel sums
+must not be equated directly to the E2E delta.
+Unchanged official alignment job `6459889` completed `0:0` on the A2 run's own
+48-prompt / 816-token sample: top-1/top-10/top-100 are all 100% and average/max
+vLLM rank are 1.0. Its representative attention/model ranks contain 16/16
+graph launches, proving grouped replay remains intact. A fresh exact 30-point
+campaign root `fmha_only_optimized_attention_128k_pareto_grouped_fanin` was
+started only after those gates, then stopped when its first large
+grouped-prefill points exposed an unbounded transport-publication grid. Jobs
+`6460176` and `6460178` failed r11 b5/b4 and r14 b4 after every attention rank
+hit the intentional 300-second Q-ready timeout; model GPUs remained at 100%.
+Each publication CTA executes the required system fence, so the fan-in-sized
+128K prefill grid created hundreds of thousands of fenced CTAs before the sole
+ready release. All eight GPU/controller jobs
+`6460175/6460180/6460176/6460178/6460220/6460181/6460177/6460179` were stopped.
+The bounded-publication correction caps each QKV/O launch at 1,024 CTAs while
+retaining grid-stride payload coverage and the same one-ready protocol; A1/A2
+decode grids are only 24/48 CTAs and therefore unchanged. Compile and direct
+transport/prefill stress gates pass, including 1,600 large bidirectional
+publications and 94 layers across a 128K prompt. Full-runtime A1/A2 jobs
+`6461502/6461503` nevertheless failed asynchronously in prefill. The accepted
+candidate retains each materialized batch in its in-flight handle
+until the existing completion event is synchronized, closing a cross-stream
+allocator-lifetime hazard without adding synchronization. Remote tests pass
+59/59. Initial jobs `6462635/6462636` failed preflight before `srun` because
+their retired `/home` EP-venv path was absent. Replacements `6462757/6462758`
+exposed the migrated EP overlay's stale `/home` base-runtime `.pth` before Ray
+startup. The one relocation record now names the canonical Lustre base and all
+pinned packages resolve; both failed records are archived/released. Fresh
+manifest-backed `short` jobs `6462898` (A1:F1) and `6462899` (A2:F1)
+completed `0:0` at 26.0990376667 and 27.6199447333 ms: 0.35% and 0.83%
+faster than the accepted grouped baseline. Both retain all 15 strict samples
+with zero outliers and the exact one-attention/one-model graph shape. The
+post-gate dead-code/chain-control cleanup passes 15/15 locally and 59/59 on
+the synchronized canonical source; its updated 19-file manifest verifies in
+both locations. Fresh official A2 alignment job `6463085` completed `0:0` with
+top-1/top-10/top-100 all 100% and average/max rank 1.0; exact grouped graph and
+188+188 expert-GEMM counts are preserved. The second fresh exact-30 root is
+`fmha_only_optimized_attention_128k_pareto_grouped_fanin_bounded_publication`.
+Initial heads are `6463783` (t18), `6463786` (t16), `6463793` (t12), and
+`6463800` (t15), exactly four `short` jobs. D's start controller hit the known
+`cpu-short` submit cap after creating `6463800`; recovered dependency
+controller `6463801` and the durable t15 record reuse that head. The first
+durable case, r15/b3 from `6463786`, was structurally valid but
+regressed to 41.520687 ms versus 22.672863 ms prior (+83.13%). All eight
+heads/controllers were canceled immediately; two interrupted claims were
+recovered and the immutable pool is frozen at 1 completed, 29 pending, 0
+claims, 0 failures. Nsight attributes the critical increase to Q/K/V
+publication: 11.251208 ms/replay at A15 versus 2.219528 ms at A2. Although the
+grid covered the total merged payload, each source edge restarted from the
+same logical task zero, serializing useful copy work onto the same
+low-numbered CTAs. The current candidate flattens source-edge task spaces
+within the existing Q/K/V kernel; it retains the same payloads, fences,
+counter, and sole ready publication. Local 15/15 and remote 59/59 tests pass,
+and a fresh SM100 compile plus 8,192-row fabric job `6464689` pass. Standalone
+plan attempt `6464726` failed before claim/model launch because its copied row
+kept non-contiguous `rerun_index=14`; the index-only correction validated on
+both workspaces. Exact r15/b3 job `6464940` then completed `0:0` with all 64
+reports and the exact 564/3,676 attention/model graph shapes. It fails the
+performance gate at 40.392720 ms E2E and 40.489008 ms strict CUDA, 78.15% and
+79.93% slower than the prior optimized-attention fields. Flattening reduces
+Q/K/V publication 17.32%, from 11.251208 to 9.302771 ms/replay, but E2E improves
+only 2.72%. The residual has 240 fenced publication CTAs, 15 serial destination
+ready releases, 33.50--35.01 ms model graphs, and normally 39.98--41.80 ms
+attention graphs. Validation evidence is isolated under
+`fanin_publication_flatten_validation`; never resume the stopped exact-30 pool
+or create a new pool from this candidate. Resume from
+`CODEX_PROJECT_qwen3_ffn_handoff.md`.
+
+The exact 30-point optimized-attention 128K campaign was intentionally stopped
+on 2026-08-22 after four r11 cases exposed invalid model-side scheduling. The
+ratio is A11:F1: one logical FFN worker (EP4 over four ranks) serves eleven
+attention workers. The base added-mode path incorrectly launched a complete
+FFN graph once per attention source, producing eleven serialized ~26.7-ms
+launches per decode step. The candidate now sends one grouped model command per
+FFN DP, combines every assigned attention source within each microbatch, and
+executes exactly N FFN rounds per layer. Focused latency and unchanged official
+alignment now revalidate this schedule. All eight abandoned campaign
+GPU/controller jobs were canceled;
+the pool is clean at 4 diagnostic completions, 26 pending, 0 claims, 0 failed.
+
+The initial apparent 512-token hang was cold per-rank extension compilation
+followed by CUDA `INVALID_HANDLE` during high-fan-in transport setup, not
+inference. Budgets 8192/4096/2048/1024 obscured a cold-node cgroup OOM during
+Ray actor launch. Head `7e4c889` restores the proven 512 contract, shares
+flock-protected builds per node, and
+co-allocates each attention rank's Q/K/V+ready views plus each model rank's
+O+ready views. Thus the single logical FFN worker's r11 ranks import 11 peer
+attention arenas instead of 33 typed mappings; this does not mean there are 11
+FFN workers.
+Job `6454790` then proved every Ray node started before actor launch exhausted
+the cgroup. Head `31d90c4` capped Ray at 16 logical CPUs but incorrectly fixed
+the object store at 8 GiB: job `6454957` showed Pyxis exposes roughly 2 GiB to
+Ray's memory detector, so startup rejected that value before CUDA work. Head
+`4b32eab` keeps the CPU cap and restores cgroup-aware automatic object-store
+sizing. Job `6456127` then exposed the underlying cause: nested submission had
+carried the CPU controller's `SLURM_MEM_PER_NODE=2048` into the exclusive GPU
+bundle, constraining its Pyxis step to 2 GiB despite a 900-GiB/node allocation.
+Head `8088816` added `#SBATCH --mem=0`, which correctly gave the GPU allocation
+920 GiB/node but did not override the stale variable for its inner Pyxis step:
+job `6456229.0` still requested exactly 2 GiB/node and had 30 OOM kills. Head
+`af168f3` passes `--mem=0` directly to that `srun` and pins both allocation and
+step options; the full suite passes 53/53. The failed chain is archived under
+`state/chain-attempts/inner-step-memory-export-6456228-6456230`, the pool is
+clean at 30 pending, and controller `6456321` submitted tray-12 GPU job
+`6456325` plus dependency controller `6456326`. Its `.0` step proved the
+full-memory fix at 11,040 GiB, and all 48 workers passed the coalesced-arena and
+ready gates. However, healthy 100%-utilized 512-token prefill did not reach
+decode before the 30-minute case watchdog. The attempt is archived, the pool
+is clean, and head `94a3f72` makes the chain require/propagate an explicit
+prefill budget. Controller `6456735` submitted tray-12 job `6456738` with
+8,192 tokens plus dependency controller `6456739`. All 48 workers passed the
+transport/ready gates and both role types remained at 100% utilization without
+runtime errors, but the prefill again exceeded the inherited 1,800-second case
+watchdog. That attempt is archived under
+`state/chain-attempts/fmha8192-prefill-watchdog-6456735-6456739`; the pool is
+clean at 30 pending. Head `5d07865` keeps the general 1,800-second default,
+raises the validated ceiling to 3,600 seconds, explicitly propagates the
+campaign timeout through every chain edge, and derives the terminal audit's
+expected job count from the 11 distinct tray groups in the plan instead of the
+incorrect hard-coded 22. Its full pinned suite passes 53/53.
+Controller `6457417` then launched the diagnostic tray-12 run. Four completed
+r11 cases exposed the per-source model-graph serialization described above;
+all GPU and successor jobs were canceled, in-flight claims were recovered, and
+no campaign jobs remain. Details and archived attempts are in the topic memory.
+
+Do not stage locally until the 30-case terminal audit passes. At final cleanup,
+stage and commit only goal-related changes; leave the user's unrelated
+`CODEX_PROJECT_RATIO_EP_SWEEP.md` modification untouched.
+
 ## Hardcoded attention/AG placement optimization (2026-08-17)
 
 Implemented the two-site GB200-only policy from

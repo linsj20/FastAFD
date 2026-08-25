@@ -365,6 +365,25 @@ class LinearOProj(_LinearTPImpl):
             y = self._comm.all_reduce(y)
         return y
 
+    def forward_fp8_prequant(
+        self,
+        input_fp8: torch.Tensor,
+        input_scale: torch.Tensor,
+        *,
+        output_shape_prefix: tuple[int, ...],
+        output_dtype: torch.dtype = torch.bfloat16,
+        skip_allreduce: bool = False,
+    ) -> torch.Tensor:
+        y = super().forward_fp8_prequant(
+            input_fp8,
+            input_scale,
+            output_shape_prefix=output_shape_prefix,
+            output_dtype=output_dtype,
+        )
+        if self._tp_size > 1 and not skip_allreduce:
+            y = self._comm.all_reduce(y)
+        return y
+
 
 class LinearRowParallel(_LinearTPImpl):
     def __init__(

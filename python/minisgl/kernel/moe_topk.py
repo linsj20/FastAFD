@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from tvm_ffi import Module
 
 _EMPTY_VALID_COUNT_BY_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
+_EMPTY_EXPERT_MAP_BY_DEVICE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
 def _empty_valid_count(device: torch.device) -> torch.Tensor:
@@ -17,6 +18,15 @@ def _empty_valid_count(device: torch.device) -> torch.Tensor:
     if tensor is None:
         tensor = torch.empty((0,), dtype=torch.int64, device=device)
         _EMPTY_VALID_COUNT_BY_DEVICE[key] = tensor
+    return tensor
+
+
+def _empty_expert_map(device: torch.device) -> torch.Tensor:
+    key = (device.type, device.index)
+    tensor = _EMPTY_EXPERT_MAP_BY_DEVICE.get(key)
+    if tensor is None:
+        tensor = torch.empty((0,), dtype=torch.int32, device=device)
+        _EMPTY_EXPERT_MAP_BY_DEVICE[key] = tensor
     return tensor
 
 
@@ -93,6 +103,9 @@ def gate_topk(
     top_k: int,
     *,
     renormalize: bool = True,
+    expert_map: torch.Tensor | None = None,
+    num_token_non_padded: int | torch.Tensor | None = None,
+    topk_idx_dtype: torch.dtype = torch.int32,
     quant_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
@@ -107,7 +120,30 @@ def gate_topk(
     assert hidden.is_cuda and hidden.dtype == torch.bfloat16
     assert gate_weight.is_cuda and gate_weight.dtype == torch.bfloat16
     n = hidden.shape[0]
-    ids = torch.empty((n, top_k), dtype=torch.int32, device=hidden.device)
+    if topk_idx_dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(f"gate_topk index dtype must be int32 or int64, got {topk_idx_dtype}")
+    if expert_map is None:
+        expert_map = _empty_expert_map(hidden.device)
+    else:
+        if not expert_map.is_cuda or expert_map.device != hidden.device:
+            raise RuntimeError("gate_topk expert_map must be on the hidden CUDA device")
+        if expert_map.dtype not in (torch.int32, torch.int64):
+            raise RuntimeError(
+                f"gate_topk expert_map must be int32 or int64, got {expert_map.dtype}"
+            )
+        if not expert_map.is_contiguous():
+            expert_map = expert_map.contiguous()
+        if expert_map.numel() != gate_weight.shape[0]:
+            raise RuntimeError(
+                f"gate_topk expert_map length must equal num_experts, "
+                f"got {expert_map.numel()} vs {gate_weight.shape[0]}"
+            )
+    valid_count = _valid_token_count_tensor(
+        num_token_non_padded,
+        device=hidden.device,
+        num_tokens=int(n),
+    )
+    ids = torch.empty((n, top_k), dtype=topk_idx_dtype, device=hidden.device)
     weights = torch.empty((n, top_k), dtype=torch.float32, device=hidden.device)
     if n == 0:
         return ids, weights
@@ -120,6 +156,7 @@ def gate_topk(
         weights, ids,
         hidden.contiguous(), gate_weight.contiguous(),
         partials, counters,
+        expert_map, valid_count,
         bool(renormalize),
         x_q, x_sf, w_stage,
     )

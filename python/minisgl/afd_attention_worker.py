@@ -21,13 +21,16 @@ from minisgl.kvcache import create_kvcache_pool
 from minisgl.utils import div_even, init_logger, nvtx_label, nvtx_range
 
 from .afd_attention_runtime import AfdAttentionRuntime
+from .afd_fmha_protocol import AfdTpSliceTable
 from .afd_protocol import (
     AfdAGStepPlan,
     AfdAGStepReply,
+    AfdEGStepReply,
     AfdFlushStepCmd,
     AfdProfilerCmd,
     AfdRunAGStepCmd,
     AfdStopCmd,
+    build_two_lane_pipeline_actions,
 )
 from .afd_support import AfdRuntimeConfig, log_line
 from .afd_worker_base import BaseAfdWorker, ensure_afd_parallel_info
@@ -89,17 +92,24 @@ class AfdAttentionState:
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
+            storage=self._allocate_kv_storage(config),
         )
         # One attention backend per microbatch because each wrapper owns mutable
-        # decode metadata. The compute stream still serializes actual launches.
+        # decode metadata and workspace. FMHA-only MB2 decode launches these
+        # wrappers concurrently on distinct graph streams.
         num_mb = max(1, int(getattr(config, "afd_num_mb", 1)))
         self.attn_backends: list = [
             create_attention_backend(config.attention_backend, config.model_config)
             for _ in range(num_mb)
         ]
-        # FlashInfer stores pinned plan-copy state per wrapper. Sharing the last
-        # event keeps H2D source lifetimes obvious without changing launch order.
-        if len(self.attn_backends) > 1:
+        # Legacy MB2 launches serialize on one compute stream and may share the
+        # pinned-plan lifetime event. FMHA-only MB2 launches concurrently, so
+        # each wrapper must retain its independently created event.
+        share_plan_event = not (
+            getattr(config, "afd_model_placement", "legacy") == "fmha-only"
+            and num_mb > 1
+        )
+        if len(self.attn_backends) > 1 and share_plan_event:
             first_fi_backend = _flashinfer_backend(self.attn_backends[0])
             if first_fi_backend is not None:
                 shared_event = first_fi_backend.last_event
@@ -108,6 +118,62 @@ class AfdAttentionState:
                     if fi_backend is not None:
                         fi_backend.last_event = shared_event
         self.ctx.attn_backend = self.attn_backends[0]
+
+    def _allocate_kv_storage(self, config: EngineConfig) -> torch.Tensor | None:
+        if getattr(config, "afd_model_placement", "legacy") != "fmha-only":
+            return None
+        from minisgl.kernel.fabric_memory import allocate_fabric_tensors
+
+        local_kv_heads = div_even(
+            config.model_config.num_kv_heads,
+            config.tp_info.size,
+            allow_replicate=True,
+        )
+        table = AfdTpSliceTable.build(
+            attn_tp_size=int(config.afd_attn_tp_size),
+            model_tp_size=int(config.afd_mlp_tp_size),
+            num_qo_heads=int(config.model_config.num_qo_heads),
+            num_kv_heads=int(config.model_config.num_kv_heads),
+        )
+        q_ready_writers = tuple(
+            sorted(
+                {
+                    head_slice.source_tp_rank
+                    for head_slice in (*table.q_slices, *table.kv_slices)
+                    if head_slice.destination_tp_rank == int(config.tp_info.rank)
+                }
+            )
+        )
+        if not q_ready_writers:
+            raise RuntimeError("FMHA attention rank has no Q/K/V transport writers")
+        local_q_heads = div_even(
+            config.model_config.num_qo_heads,
+            config.tp_info.size,
+        )
+        kv_shape = (
+            2,
+            config.model_config.num_layers,
+            self.num_pages + 1,
+            config.page_size,
+            local_kv_heads,
+            config.model_config.head_dim,
+        )
+        q_shape = (
+            2,
+            int(config.afd_max_comm_tokens),
+            local_q_heads,
+            config.model_config.head_dim,
+        )
+        q_ready_shape = (2, len(q_ready_writers))
+        self.fabric_kv, self.fabric_q, self.fabric_q_ready = allocate_fabric_tensors(
+            (
+                (kv_shape, self.dtype),
+                (q_shape, torch.bfloat16),
+                (q_ready_shape, torch.int64),
+            )
+        )
+        self.fabric_q_ready.tensor.zero_()
+        return self.fabric_kv.tensor
 
     def _sync_get_memory(self) -> tuple[int, int]:
         torch.cuda.synchronize(self.device)
@@ -285,10 +351,12 @@ class AfdAgDecodeGraphRunner:
         self.adapters = list(adapters)
         self.adapter = self.adapters[0]
         self.num_mb = max(1, int(num_mb))
-        if self.num_mb > 1 and len(self.adapters) < self.num_mb:
+        required_lanes = min(2, self.num_mb)
+        if len(self.adapters) < required_lanes:
             raise RuntimeError(
-                f"AG decode graph requires >= num_mb DeepEP adapters, "
-                f"got adapters={len(self.adapters)} num_mb={self.num_mb}"
+                "AG decode graph requires one adapter per physical lane: "
+                f"adapters={len(self.adapters)} required={required_lanes} "
+                f"num_mb={self.num_mb}"
             )
         self.comm_stream = comm_stream
         self.lane_comm_streams = (
@@ -426,9 +494,10 @@ class AfdAgDecodeGraphRunner:
     def _warmup_mb(self, bs: int) -> None:
         """Capture the multi-MB AG forward for a decode bucket: per layer, each MB's
         attn/route/quant runs on the compute stream while DeepEP dispatch/combine
-        runs on that MB's communication lane, the whole multi-stream region folded
-        into one graph via overlap_comm=True. Each MB owns its own attention backend
-        (backends[mb]), per-MB fixed metadata buffers, adapter lane, and comm stream.
+        runs on one of two alternating communication lanes, the whole multi-stream
+        region folded into one graph via overlap_comm=True. Each MB owns its own
+        attention backend and fixed metadata, while adapters and streams are reused
+        by parity.
 
         `bs` is the PER-MB bucket (a decode_graph_bs entry). Each MB has `bs` tokens;
         the total padded batch is `bs * num_mb`, which is how the graph is keyed
@@ -808,21 +877,19 @@ def _run_ag_pipeline_body(
         state.dispatches[layer][mb] = None
         state.route_topks[layer][mb] = None
 
-    # AG collective order:
-    #   compute+D(L0, mb0), compute+D(L0, mb1), ...
-    #   C(L, mb) then immediately compute+D(L+1, mb).
-    # This mirrors the EG pipeline body without materializing a schedule list.
-    for mb in range(state.num_mb):
-        packet = launch_compute(0, mb)
-        launch_dispatch(0, mb, packet)
-        if retire_async_objects:
-            retire()
-    for layer in range(num_layers):
-        for mb in range(state.num_mb):
+    # Keep one round live on each physical lane. A lane combines its current
+    # round before dispatching its next one, so arbitrary logical microbatch
+    # counts can safely parity-reuse exactly two adapter workspaces/streams.
+    actions = build_two_lane_pipeline_actions(
+        num_layers=num_layers,
+        num_microbatches=state.num_mb,
+    )
+    for action, layer, mb in actions:
+        if action == "dispatch":
+            packet = launch_compute(layer, mb)
+            launch_dispatch(layer, mb, packet)
+        else:
             launch_combine(layer, mb)
-            if layer + 1 < num_layers:
-                packet = launch_compute(layer + 1, mb)
-                launch_dispatch(layer + 1, mb, packet)
             if retire_async_objects:
                 retire()
     if retire_async_objects:
@@ -843,15 +910,57 @@ class AfdAttentionWorker(BaseAfdWorker):
     # ------------------------------------------------------------------
 
     def _create_runtime(self, config: AfdRuntimeConfig):
-        return AfdAttentionRuntime(config, AfdAttentionState(config))
+        return AfdAttentionRuntime(
+            config,
+            AfdAttentionState(config),
+            owns_model_state=self.model_placement == "legacy",
+        )
 
     def _run_hot_rpc_loop(self) -> None:
         """Drive the hot loop until an AfdStopCmd is received."""
         self._prepare_hot_rpc_runtime()
+        if self.model_placement == "fmha-only":
+            self._fmha_only_loop()
+            return
         if self.disable_overlap:
             self.centralized_normal_loop()
         else:
             self.centralized_overlap_loop()
+
+    def _fmha_only_loop(self) -> None:
+        pending = deque()
+
+        def retire(force: bool = False) -> None:
+            while pending and (force or len(pending) > 2):
+                handle = pending.popleft()
+                handle.done.synchronize()
+                self._send_reply(
+                    AfdEGStepReply(
+                        worker_rank=self.worker_rank,
+                        step_id=handle.step_id,
+                        sent_ns=handle.sent_ns,
+                    )
+                )
+
+        while True:
+            cmd = self._recv_hot_command(blocking=True)
+            if cmd is None:
+                continue
+            if isinstance(cmd, AfdFlushStepCmd):
+                retire(force=True)
+                continue
+            if isinstance(cmd, AfdStopCmd):
+                retire(force=True)
+                return
+            if isinstance(cmd, AfdProfilerCmd):
+                self.handle_profiler_cmd(cmd)
+                continue
+            if not isinstance(cmd, AfdRunAGStepCmd):
+                raise RuntimeError(
+                    f"Unsupported FMHA-only attention command: {type(cmd).__name__}"
+                )
+            pending.append(self._afd_fmha.run_step(cmd.plan, sent_ns=cmd.sent_ns))
+            retire(force=self.disable_overlap)
 
     def centralized_normal_loop(self) -> None:
         """Synchronous AG loop: run a step, wait for its D2H copy, then reply."""

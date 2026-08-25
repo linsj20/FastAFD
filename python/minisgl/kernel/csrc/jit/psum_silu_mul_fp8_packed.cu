@@ -88,10 +88,10 @@ __device__ __forceinline__ uint8_t ceil_to_ue8m0_exp_byte(float scale) {
       ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1u : 0u));
 }
 
-template <int block_count>
 __device__ __forceinline__ void psum_token_bounds(
     int32_t n_tokens,
     int32_t worker_id,
+    int32_t block_count,
     int32_t& lower,
     int32_t& upper) {
   if (n_tokens < block_count && worker_id < n_tokens) {
@@ -128,7 +128,7 @@ __device__ __forceinline__ int32_t psum_find_expert(
   return lo;
 }
 
-template <typename DType, int block_count, int THREADS_PER_GROUP>
+template <typename DType, int THREADS_PER_GROUP>
 __global__ void psum_silu_mul_fp8_packed_compact_all_groups_kernel(
     const DType* __restrict__ x,
     uint8_t* __restrict__ y,
@@ -172,8 +172,9 @@ __global__ void psum_silu_mul_fp8_packed_compact_all_groups_kernel(
   const int32_t total_tokens = compact_offsets[num_experts];
   int32_t lower = 0;
   int32_t upper = 0;
-  psum_token_bounds<block_count>(
-      total_tokens, static_cast<int32_t>(blockIdx.x), lower, upper);
+  psum_token_bounds(
+      total_tokens, static_cast<int32_t>(blockIdx.x),
+      static_cast<int32_t>(gridDim.x), lower, upper);
   if (lower >= upper) {
     return;
   }
@@ -264,6 +265,7 @@ struct PsumSiluMulFp8PackedKernel {
       const tvm::ffi::TensorView psum,                // (num_experts,) int32 cumulative
       const tvm::ffi::TensorView topk_weights,        // (m,) float32 or (1,) when unused
       int64_t alignment,
+      int64_t worker_blocks,
       bool apply_topk) {
     using namespace host;
     auto device_ = SymbolicDevice{};
@@ -317,6 +319,9 @@ struct PsumSiluMulFp8PackedKernel {
     if (m == 0 || h == 0) {
       return;
     }
+    RuntimeCheck(worker_blocks > 0 && worker_blocks <= m,
+                 "worker_blocks must satisfy 0 < worker_blocks <= m, got ",
+                 worker_blocks, " for m=", m);
     const auto device = device_.unwrap();
     RuntimeCheck(groups_per_row > 0 && groups_per_row * 8 <= 1024,
                  "compact_all psum_silu_mul_fp8_packed requires ",
@@ -329,19 +334,18 @@ struct PsumSiluMulFp8PackedKernel {
                    "MINISGL_PSUM_SILU_QUANT_MODE must be auto or compact_all");
     }
 
-    auto launch_compact_all_groups = [&](auto type_tag, auto block_count_tag) {
+    auto launch_compact_all_groups = [&](auto type_tag) {
       using DType = typename decltype(type_tag)::type;
-      constexpr int BLOCK_COUNT = decltype(block_count_tag)::value;
       RuntimeCheck(groups_per_row > 0 && groups_per_row * 8 <= 1024,
                    "invalid compact_all_groups psum_silu_mul_fp8_packed "
                    "block size: ",
                    groups_per_row * 8);
       const size_t shared_mem =
           static_cast<size_t>(2 * num_experts + 1) * sizeof(int32_t);
-      LaunchKernel(dim3(static_cast<unsigned>(BLOCK_COUNT)),
+      LaunchKernel(dim3(static_cast<unsigned>(worker_blocks)),
                    dim3(static_cast<unsigned>(groups_per_row * 8)), device,
                    shared_mem)(
-          psum_silu_mul_fp8_packed_compact_all_groups_kernel<DType, BLOCK_COUNT, 8>,
+          psum_silu_mul_fp8_packed_compact_all_groups_kernel<DType, 8>,
           static_cast<const DType*>(x.data_ptr()),
           static_cast<uint8_t*>(y_u8.data_ptr()),
           reinterpret_cast<uint32_t*>(s_i32.data_ptr()),
@@ -358,10 +362,7 @@ struct PsumSiluMulFp8PackedKernel {
           448.0f);
     };
 
-    auto dispatch = [&](auto type_tag) {
-      launch_compact_all_groups(
-          type_tag, std::integral_constant<int, 132 * 32>{});
-    };
+    auto dispatch = [&](auto type_tag) { launch_compact_all_groups(type_tag); };
 
     if (data_dtype_.unwrap().code == DLDataTypeCode::kDLBfloat) {
       dispatch(TypeTag<__nv_bfloat16>{});
@@ -381,6 +382,7 @@ struct PsumSiluMulFp8PackedKernelManual {
       const tvm::ffi::TensorView psum,
       const tvm::ffi::TensorView topk_weights,
       int64_t alignment,
+      int64_t worker_blocks,
       bool apply_topk,
       int64_t threads_per_group,
       int64_t groups_per_block_x,
@@ -389,7 +391,8 @@ struct PsumSiluMulFp8PackedKernelManual {
     (void)groups_per_block_x;
     (void)rows_per_block;
     PsumSiluMulFp8PackedKernel::run(
-        x, y_u8, s_i32, psum, topk_weights, alignment, apply_topk);
+        x, y_u8, s_i32, psum, topk_weights, alignment, worker_blocks,
+        apply_topk);
   }
 };
 

@@ -8,6 +8,7 @@
 #include "elastic/buffer.hpp"
 #include "jit/api.hpp"
 #include "utils/event.hpp"
+#include "utils/fabric_memory.hpp"
 
 #ifndef TORCH_EXTENSION_NAME
 #define TORCH_EXTENSION_NAME _C
@@ -41,4 +42,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // Register DeepEP V2 elastic buffer APIs.
     deep_ep::elastic::register_apis(m);
+
+    // Role-asymmetric CUDA fabric allocation and peer mapping.
+    deep_ep::fabric_memory::register_apis(m);
 }

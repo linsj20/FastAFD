@@ -28,6 +28,7 @@ from minisgl.message import (
     UserMsg,
 )
 from .afd_protocol import (
+    AfdAGStepPlan,
     AfdModelPlan,
     AfdCommand,
     AfdReply,
@@ -36,8 +37,10 @@ from .afd_protocol import (
     AfdFlushStepCmd,
     AfdAGStepReply,
     AfdEGStepPlan,
+    AfdModelStepPlan,
     AfdRunAGStepCmd,
     AfdRunEGStepCmd,
+    AfdRunModelStepCmd,
     build_afd_ag_plan,
 )
 from minisgl.scheduler.scheduler import (
@@ -141,6 +144,15 @@ class AfdCoordinator:
         self.attn_tp_size = int(server_args.afd_attn_tp_size)
         self.mlp_tp_size = int(server_args.afd_mlp_tp_size)
         self._layout = self._validate_dp_layout()
+        if (
+            self.server_args.afd_model_placement == "fmha-only"
+            and self.attn_dp_size < self.mlp_dp_size
+        ):
+            raise RuntimeError(
+                "FMHA-only placement requires at least as many attention DP lanes "
+                "as model DP lanes: "
+                f"attn_dp={self.attn_dp_size} model_dp={self.mlp_dp_size}"
+            )
         self._requested_attention_backend = str(server_args.attention_backend)
         self._requested_page_size = int(server_args.page_size)
         self._needs_gpu_backend_resolution = (
@@ -330,7 +342,8 @@ class AfdCoordinator:
         # shared GIN slot layout must cover the largest merged MLP microbatch
         # even though each attention DP still schedules only its local
         # max_batched_tokens budget.
-        self.max_comm_tokens *= self._layout.attn_fanin_per_mlp_dp
+        if self.server_args.afd_model_placement != "fmha-only":
+            self.max_comm_tokens *= self._layout.attn_fanin_per_mlp_dp
         self.afd_num_mb = sizing.num_mb
 
     def _validate_dp_layout(self) -> AfdTopology:
@@ -701,6 +714,9 @@ class AfdCoordinator:
                 afd_num_mb=self.afd_num_mb,
                 mlp_fanout=mlp_fanout,
                 eos_token_id=eos_token_id,
+                decode_remainder_to_last=(
+                    self.server_args.afd_model_placement == "fmha-only"
+                ),
             )
             for dp_rank in range(self._layout.attn_dp_size)
         ]
@@ -871,7 +887,7 @@ class AfdCoordinator:
             )
 
     def _send_cmd_to_workers(self, worker_ranks: tuple[int, ...], cmd: AfdCommand) -> None:
-        if isinstance(cmd, (AfdRunAGStepCmd, AfdRunEGStepCmd)):
+        if isinstance(cmd, (AfdRunAGStepCmd, AfdRunEGStepCmd, AfdRunModelStepCmd)):
             kind = type(cmd).__name__
             step_id = int(cmd.plan.step_id)
             cmd.sent_ns = time.time_ns()
@@ -1105,6 +1121,7 @@ class AfdCoordinator:
         )
         use_graph_ns = time.perf_counter_ns() - use_graph_start_ns
         items: list[tuple[int, Batch, tuple[int, ...]]] = []
+        model_source_plans: dict[int, list[AfdAGStepPlan]] = {}
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchAG", step=step_id, phase=phase)):
             ag_loop_start_ns = time.perf_counter_ns()
             for item in dp_batches:
@@ -1130,6 +1147,7 @@ class AfdCoordinator:
                     step_id,
                     item.model_plan,
                     batch,
+                    attn_dp_rank=dp,
                     dispatch_bucket=bucket,
                     free_table_indices=pending_free[dp],
                     use_decode_graph=use_decode_graph,
@@ -1141,6 +1159,9 @@ class AfdCoordinator:
                 ag_send_start_ns = time.perf_counter_ns()
                 self._send_cmd_to_workers(ranks, AfdRunAGStepCmd(plan=ag_plan))
                 ag_send_ns += time.perf_counter_ns() - ag_send_start_ns
+                if self.server_args.afd_model_placement == "fmha-only":
+                    mlp_dp = self._layout.mlp_dp_for_attn_dp(dp)
+                    model_source_plans.setdefault(mlp_dp, []).append(ag_plan)
                 pending_free[dp] = ()
                 if not item.is_dummy:
                     state_updates.append((dp, batch))
@@ -1149,23 +1170,54 @@ class AfdCoordinator:
                 append_ns += time.perf_counter_ns() - append_start_ns
             ag_loop_ns = time.perf_counter_ns() - ag_loop_start_ns
 
+        if self.server_args.afd_model_placement == "fmha-only":
+            model_dispatch_bucket = (
+                int(bucket) * int(self._layout.attn_fanin_per_mlp_dp)
+            )
+            for mlp_dp in range(self._layout.mlp_dp_size):
+                source_plans = tuple(model_source_plans.get(mlp_dp, ()))
+                expected_sources = self._layout.attn_dps_for_mlp_dp(mlp_dp)
+                actual_sources = tuple(int(plan.attn_dp_rank) for plan in source_plans)
+                if actual_sources != expected_sources:
+                    raise RuntimeError(
+                        "FMHA-only model step does not cover its exact attention fan-in: "
+                        f"mlp_dp={mlp_dp} actual={actual_sources} "
+                        f"expected={expected_sources}"
+                    )
+                model_ranks = tuple(
+                    self._layout.mlp_worker_rank(mlp_dp, tp_rank)
+                    for tp_rank in range(self._layout.mlp_tp_size)
+                )
+                model_send_start_ns = time.perf_counter_ns()
+                self._send_cmd_to_workers(
+                    model_ranks,
+                    AfdRunModelStepCmd(
+                        plan=AfdModelStepPlan(
+                            source_plans=source_plans,
+                            dispatch_bucket=model_dispatch_bucket,
+                        )
+                    ),
+                )
+                eg_send_ns += time.perf_counter_ns() - model_send_start_ns
+
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchEG", step=step_id, phase=phase)):
             eg_loop_start_ns = time.perf_counter_ns()
-            eg_build_start_ns = time.perf_counter_ns()
-            eg_plan = AfdEGStepPlan(
-                step_id=step_id,
-                phase=phase,  # type: ignore[arg-type]
-                dispatch_bucket=bucket,
-                num_mb=num_mb,
-                use_decode_graph=use_decode_graph,
-            )
-            eg_build_ns = time.perf_counter_ns() - eg_build_start_ns
-            eg_send_start_ns = time.perf_counter_ns()
-            self._send_cmd_to_workers(
-                self._afd_expert_worker_ranks,
-                AfdRunEGStepCmd(plan=eg_plan),
-            )
-            eg_send_ns = time.perf_counter_ns() - eg_send_start_ns
+            if self.server_args.afd_model_placement != "fmha-only":
+                eg_build_start_ns = time.perf_counter_ns()
+                eg_plan = AfdEGStepPlan(
+                    step_id=step_id,
+                    phase=phase,  # type: ignore[arg-type]
+                    dispatch_bucket=bucket,
+                    num_mb=num_mb,
+                    use_decode_graph=use_decode_graph,
+                )
+                eg_build_ns = time.perf_counter_ns() - eg_build_start_ns
+                eg_send_start_ns = time.perf_counter_ns()
+                self._send_cmd_to_workers(
+                    self._afd_expert_worker_ranks,
+                    AfdRunEGStepCmd(plan=eg_plan),
+                )
+                eg_send_ns = time.perf_counter_ns() - eg_send_start_ns
             eg_loop_ns = time.perf_counter_ns() - eg_loop_start_ns
         if state_updates:
             with nvtx_range(
@@ -1430,7 +1482,10 @@ class AfdCoordinator:
     def _afd_collect_global(self, step_id, active_dps, attn_tp):
         """Collect all AG (active lanes x attn_tp) + EG replies for the global step;
         map each AG reply's tokens to its DP lane (lane = worker_rank // attn_tp)."""
-        expected = len(active_dps) * attn_tp + len(self._afd_expert_worker_ranks)
+        if self.server_args.afd_model_placement == "fmha-only":
+            expected = len(active_dps) * (attn_tp + self._layout.mlp_tp_size)
+        else:
+            expected = len(active_dps) * attn_tp + len(self._afd_expert_worker_ranks)
         seen = self._afd_reply_seen
         store = self._afd_reply_tokens_by_dp
         while seen.get(step_id, 0) < expected:
@@ -1448,7 +1503,11 @@ class AfdCoordinator:
         seen = self._afd_reply_seen
         seen[sid] = seen.get(sid, 0) + 1
         if isinstance(reply, AfdAGStepReply) and reply.next_tokens:
-            lane = int(reply.worker_rank) // int(attn_tp)
+            lane = (
+                int(reply.attn_dp_rank)
+                if reply.attn_dp_rank is not None
+                else int(reply.worker_rank) // int(attn_tp)
+            )
             self._afd_reply_tokens_by_dp.setdefault(sid, {})[lane] = list(
                 reply.next_tokens
             )

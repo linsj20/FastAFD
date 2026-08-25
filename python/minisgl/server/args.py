@@ -48,6 +48,7 @@ class ServerArgs(SchedulerConfig):
     afd_device_comm_num_sms: int = 1
     afd_disable_overlap: bool = False
     afd_num_mb: int = 1
+    afd_model_placement: str = "legacy"
 
     @property
     def share_tokenizer(self) -> bool:
@@ -139,6 +140,8 @@ def _validate_afd_parallel_args(
     attn_tp = int(kwargs["afd_attn_tp_size"])
     mlp_tp = int(kwargs["afd_mlp_tp_size"])
     ep_size = int(kwargs["afd_mlp_ep_size"])
+    num_mb = int(kwargs["afd_num_mb"])
+    batch_size = int(kwargs["afd_batch_size"])
     for name, value in (
         ("--afd-attn-dp-size", attn_dp),
         ("--afd-mlp-dp-size", mlp_dp),
@@ -148,6 +151,12 @@ def _validate_afd_parallel_args(
     ):
         if value < 1:
             parser.error(f"{name} must be >= 1, got {value}")
+
+    if num_mb < 1 or num_mb > batch_size:
+        parser.error(
+            "--afd-num-mb must be between 1 and --afd-batch-size, got "
+            f"num_mb={num_mb} batch_size={batch_size}"
+        )
 
     if not _mutually_divisible(attn_tp, mlp_tp):
         parser.error(
@@ -633,6 +642,17 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help=(
             "Number of micro-batches per AFD decode step for ping-pong pipelining. "
             "1 disables microbatching (default). Decode graph captures the full split step when enabled."
+        ),
+    )
+
+    parser.add_argument(
+        "--afd-model-placement",
+        choices=["legacy", "fmha-only"],
+        default=ServerArgs.afd_model_placement,
+        help=(
+            "AFD model ownership. 'legacy' preserves the dense/router AG and "
+            "expert-only EG runtime. 'fmha-only' keeps only FMHA state on AG "
+            "and places all checkpoint tensors and other model work on EG."
         ),
     )
 

@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import sys
 
 
 METRIC_VERSION = "20260804-attention-cuda-execution-span-v14"
+FMHA_METRIC_VERSION = "20260820-fmha-only-dual-role-cuda-graph-span-v1"
 CASE_ID_PATTERN = re.compile(
     r"(?:i[1-9][0-9]*|r[1-9][0-9]*-[1-9][0-9]*)-"
     r"fep[1-9][0-9]*-r[1-9][0-9]*-atp[1-9][0-9]*-b[1-9][0-9]*"
@@ -128,6 +130,13 @@ def parse_args() -> argparse.Namespace:
     release = subparsers.add_parser("release-failed")
     release.add_argument("--case-id", required=True)
     release.add_argument("--reason", required=True)
+
+    recover_completion = subparsers.add_parser("recover-failed-completion")
+    recover_completion.add_argument("--case-id", required=True)
+    recover_completion.add_argument("--job-id", required=True)
+    recover_completion.add_argument("--metric", type=Path, required=True)
+    recover_completion.add_argument("--result", type=Path, required=True)
+    recover_completion.add_argument("--reason", required=True)
 
     migrate = subparsers.add_parser("migrate-plan")
     migrate.add_argument("--new-plan", type=Path, required=True)
@@ -349,6 +358,60 @@ def archive_record(state_root: Path, case_id: str, source: Path, label: str) -> 
     return destination
 
 
+def fmha_profile_topology_valid(
+    profiled_roles: object,
+    result: dict[str, object],
+    trace_steps: list[int],
+) -> bool:
+    if not isinstance(profiled_roles, dict) or len(profiled_roles) != 2:
+        return False
+    profiles_by_role = {
+        str(profile.get("role")): profile
+        for profile in profiled_roles.values()
+        if isinstance(profile, dict)
+    }
+    if set(profiles_by_role) != {"attention", "model"}:
+        return False
+    placement = result.get("placement")
+    if not isinstance(placement, dict):
+        return False
+    model_dp_nodes = placement.get("mlp_dp_rank_nodes")
+    if not isinstance(model_dp_nodes, list) or not model_dp_nodes:
+        return False
+    attention_dp_size = int(result.get("attention_dp_size", 0))
+    model_dp_size = len(model_dp_nodes)
+    if attention_dp_size < 1 or attention_dp_size % model_dp_size:
+        return False
+    # Fan-in changes the rows serviced by the grouped model graph, never the
+    # number of graph replays. Every attention and model DP launches exactly
+    # one graph for each logical decode step.
+    expected_launches = {"attention": 1, "model": 1}
+    expected_step_keys = set(map(str, trace_steps))
+    for role, launch_count in expected_launches.items():
+        profile = profiles_by_role[role]
+        if int(profile.get("graph_launches_per_trace_step", 0)) != launch_count:
+            return False
+        raw_by_step = profile.get("per_trace_step_cuda_graph_launch_ms")
+        collapsed_by_step = profile.get("per_trace_step_cuda_graph_ms")
+        if not isinstance(raw_by_step, dict) or not isinstance(collapsed_by_step, dict):
+            return False
+        if set(raw_by_step) != expected_step_keys or set(collapsed_by_step) != expected_step_keys:
+            return False
+        for step in expected_step_keys:
+            raw = raw_by_step[step]
+            if not isinstance(raw, list) or len(raw) != launch_count:
+                return False
+            durations = [float(value) for value in raw]
+            collapsed = float(collapsed_by_step[step])
+            if not all(math.isfinite(value) and value > 0 for value in durations):
+                return False
+            if not math.isfinite(collapsed) or not math.isclose(
+                collapsed, sum(durations), rel_tol=1e-9, abs_tol=1e-9
+            ):
+                return False
+    return True
+
+
 def validate_metric(
     metric_path: Path,
     result_path: Path,
@@ -358,16 +421,47 @@ def validate_metric(
     if not metric_path.is_file() or not result_path.is_file():
         raise RuntimeError(f"missing metric/result proof for {case_id}")
     metric = json.loads(metric_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     min_retained = int(case["required_retained_steps_min"])
     max_outliers = int(case["required_max_outliers"])
     range_limit = float(case["required_dominant_range_percent_limit"])
     median_limit = float(case["required_max_median_diff_percent_limit"])
+    required_steps = int(case["required_trace_decode_steps"])
+    required_batch = int(case["required_target_batch_per_attention_dp_lane"])
+    placement = result.get("afd_model_placement")
+    if placement == "fmha-only":
+        decode_steps = [int(step) for step in metric.get("decode_step_ids", [])]
+        warmup_step = int(metric.get("warmup_decode_step_id", -1))
+        trace_steps = [
+            int(step) for step in metric.get("trace_decode_step_ids", [])
+        ]
+        profiled_roles = metric.get("profiled_roles")
+        placement_contract_valid = (
+            metric.get("metric_version") == FMHA_METRIC_VERSION
+            and int(metric.get("target_batch_per_attention_dp_lane", 0))
+            == required_batch
+            and int(metric.get("eligible_target_batch_sample_count", 0))
+            == required_steps
+            and len(decode_steps) == required_steps
+            and decode_steps
+            == list(range(decode_steps[0], decode_steps[0] + required_steps))
+            and warmup_step == decode_steps[0] - 1
+            and trace_steps == [warmup_step, *decode_steps]
+            and fmha_profile_topology_valid(profiled_roles, result, trace_steps)
+            and 1 <= int(metric.get("num_microbatches", 0)) <= required_batch
+        )
+    elif placement == "legacy":
+        placement_contract_valid = (
+            metric.get("metric_version") == METRIC_VERSION
+            and metric.get("target_batch_filter_passed") is True
+            and metric.get("max_median_stability_check_passed") is True
+        )
+    else:
+        placement_contract_valid = False
     if (
         metric.get("case_id") != case_id
-        or metric.get("metric_version") != METRIC_VERSION
+        or not placement_contract_valid
         or metric.get("result_sha256") != sha256(result_path)
-        or metric.get("target_batch_filter_passed") is not True
-        or metric.get("max_median_stability_check_passed") is not True
         or int(metric.get("sample_count", 0)) < min_retained
         or int(metric.get("outlier_count", 99)) > max_outliers
         or float(metric.get("dominant_range_percent", 999)) > range_limit
@@ -612,6 +706,77 @@ def command_release_failed(state_root: Path, case_id: str, reason: str) -> None:
         archived = archive_record(state_root, case_id, temporary, "failed-release")
         failed_path.unlink()
     print(f"released case={case_id} archive={archived}")
+
+
+def command_recover_failed_completion(
+    rows: list[dict[str, str]],
+    state_root: Path,
+    case_id: str,
+    job_id: str,
+    metric_path: Path,
+    result_path: Path,
+    reason: str,
+) -> None:
+    """Promote durable, strictly valid output after bookkeeping-only failure."""
+    validate_job_id(job_id)
+    if not reason.strip():
+        raise RuntimeError("failed-completion recovery requires an audit reason")
+    metric_path = metric_path.resolve()
+    result_path = result_path.resolve()
+    cases = {row["case_id"]: row for row in rows}
+    if case_id not in cases:
+        raise RuntimeError(f"recovered case is absent from plan: {case_id}")
+    metric = validate_metric(metric_path, result_path, cases[case_id])
+    with locked(state_root):
+        failed_path = state_path(state_root, "failed", case_id)
+        if not failed_path.is_file():
+            raise RuntimeError(f"case has no failed state: {case_id}")
+        if state_path(state_root, "claims", case_id).exists() or state_path(
+            state_root, "completed", case_id
+        ).exists():
+            raise RuntimeError(f"case has conflicting pool state: {case_id}")
+        failed = json.loads(failed_path.read_text(encoding="utf-8"))
+        if failed.get("case_id") != case_id or failed.get("job_id") != job_id:
+            raise RuntimeError(
+                f"failed ownership mismatch for {case_id}: "
+                f"{failed.get('job_id')} != {job_id}"
+            )
+        recovered_at = utc_now()
+        failed["completion_recovered_at_utc"] = recovered_at
+        failed["completion_recovery_reason"] = reason.strip()
+        atomic_write_json(failed_path, failed)
+        archived = archive_record(
+            state_root, case_id, failed_path, "failed-completion-recovery"
+        )
+        record = {
+            key: value
+            for key, value in failed.items()
+            if key
+            not in {
+                "failed_at_utc",
+                "exit_code",
+                "reason",
+                "retry_policy",
+            }
+        }
+        record.update(
+            {
+                "completed_at_utc": recovered_at,
+                "metric_path": str(metric_path),
+                "metric_sha256": sha256(metric_path),
+                "result_path": str(result_path),
+                "result_sha256": metric["result_sha256"],
+                "recovered_from_failed_archive": str(archived),
+            }
+        )
+        try:
+            atomic_write_json(state_path(state_root, "completed", case_id), record)
+        except BaseException:
+            archived.rename(failed_path)
+            raise
+    print(
+        f"recovered completion case={case_id} job={job_id} archive={archived}"
+    )
 
 
 def command_migrate_plan(
@@ -878,6 +1043,16 @@ def main() -> None:
     elif args.command == "release-failed":
         command_release_failed(
             state_root, validate_case_id(args.case_id), args.reason
+        )
+    elif args.command == "recover-failed-completion":
+        command_recover_failed_completion(
+            rows,
+            state_root,
+            validate_case_id(args.case_id),
+            args.job_id,
+            args.metric,
+            args.result,
+            args.reason,
         )
     elif args.command == "import-terminal":
         command_import_terminal(

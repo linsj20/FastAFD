@@ -6,7 +6,7 @@
 # In the comprehensive contract, it is an active-GPU ratio:
 # attention_gpus=ratio*FFN_EP. This is identical for EP>=4 and permits EP2 to
 # share a four-GPU tray with attention workers. The batch is the total real
-# input batch per attention-DP lane before the two-way AFD microbatch split.
+# input batch per attention-DP lane before the AFD microbatch split.
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --partition=batch
 #SBATCH --qos=short
@@ -27,11 +27,28 @@ preflight_error() {
 }
 
 MODEL_KEY=${MODEL_KEY:-${1:-qwen3}}
+export AFD_MODEL_PLACEMENT_REQUESTED=${FASTAFD_AFD_MODEL_PLACEMENT:-${AFD_MODEL_PLACEMENT:-legacy}}
+case "$AFD_MODEL_PLACEMENT_REQUESTED" in
+    legacy|fmha-only|qwen3-128k-adaptive) ;;
+    *) echo "AFD_MODEL_PLACEMENT must be legacy, fmha-only, or qwen3-128k-adaptive" >&2; exit 2 ;;
+esac
+export AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT_REQUESTED
+export AFD_MODEL_PLACEMENT_POLICY=explicit
+export AFD_NUM_MB=${FASTAFD_AFD_NUM_MB:-${AFD_NUM_MB:-2}}
+[[ "$AFD_NUM_MB" =~ ^[1-9][0-9]*$ ]] || {
+    echo "AFD_NUM_MB must be a positive integer, got $AFD_NUM_MB" >&2
+    exit 2
+}
 SUBMIT_QOS=${FASTAFD_SUBMIT_QOS:-short}
 case "$SUBMIT_QOS" in
     short|normal) ;;
     *) echo "FASTAFD_SUBMIT_QOS must be short or normal" >&2; exit 2 ;;
 esac
+JOB_TIME_LIMIT=${FASTAFD_JOB_TIME_LIMIT:-02:00:00}
+[[ "$JOB_TIME_LIMIT" =~ ^([0-9]+-)?[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || {
+    echo "FASTAFD_JOB_TIME_LIMIT must use [days-]HH:MM:SS" >&2
+    exit 2
+}
 SWEEP_CONTRACT=${FASTAFD_SWEEP_CONTRACT:-pmap}
 case "$SWEEP_CONTRACT" in
     pmap|comprehensive) ;;
@@ -42,6 +59,7 @@ TASK_ROOT=${FASTAFD_TASK_ROOT:-$PWD}
 CUDA_EXTRACT_SCRIPT=${FASTAFD_CUDA_EXTRACT_SCRIPT:-$CONTROL_DIR/extract_cuda_wall.py}
 CUDA_METRIC_PLAN=${FASTAFD_CUDA_METRIC_PLAN:-$TASK_ROOT/CASES.csv}
 CUDA_SPAN_MODULE=${FASTAFD_CUDA_SPAN_MODULE:-$CONTROL_DIR/cuda_execution_span.py}
+GPU_PROCESS_EXIT_SCRIPT=${FASTAFD_GPU_PROCESS_EXIT_SCRIPT:-$CONTROL_DIR/wait_gpu_processes_exit.py}
 CUDA_METRICS_ROOT=${FASTAFD_CUDA_METRICS_ROOT:-$TASK_ROOT/report/metrics}
 CUDA_EXTRACT_TEMP_ROOT=${FASTAFD_CUDA_EXTRACT_TEMP_ROOT:-$TASK_ROOT/cuda_extract/tmp}
 CONTEXT_SPEC=${CONTEXT_SPEC:-${CONTEXT:-${2:-8k}}}
@@ -75,16 +93,11 @@ AFD_NUM_PAGES=${FASTAFD_AFD_NUM_PAGES:-}
 # The inner capture runner may wait up to 600 seconds to make sample.json
 # durable before entering Ray teardown. Keep the capture-only watchdog longer
 # than that publication window. Once capture, sample, and the coordinator trace
-# are all durable, use a short fail-safe because no metric input can improve by
-# retaining an allocation whose driver is stuck in process-tree shutdown.
+# are all durable, terminate the allocation-scoped driver immediately because
+# no metric input can improve by retaining an allocation after that point.
 POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS=${FASTAFD_POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS:-900}
 [[ "$POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
     echo "FASTAFD_POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS must be positive" >&2
-    exit 2
-}
-POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS=${FASTAFD_POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS:-30}
-[[ "$POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
-    echo "FASTAFD_POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS must be positive" >&2
     exit 2
 }
 POST_SAMPLE_DRIVER_TERM_TIMEOUT_SECONDS=${FASTAFD_POST_SAMPLE_DRIVER_TERM_TIMEOUT_SECONDS:-10}
@@ -139,6 +152,8 @@ RESULTS_ROOT=${FASTAFD_RESULTS_ROOT:-$ROOT}
 SOURCE_REPO=${FASTAFD_SOURCE_REPO:-$HOME/scratch/github/FastAFD}
 EXPECTED_HEAD=${FASTAFD_EXPECTED_HEAD:-$(git -C "$SOURCE_REPO" rev-parse HEAD)}
 EXPECTED_SOURCE_MANIFEST=${FASTAFD_EXPECTED_SOURCE_MANIFEST:-}
+ALLOW_DIRTY_SOURCE=${FASTAFD_ALLOW_DIRTY_SOURCE:-0}
+[[ "$ALLOW_DIRTY_SOURCE" == 0 || "$ALLOW_DIRTY_SOURCE" == 1 ]]
 SOURCE_COORDINATOR_REL=python/minisgl/afd_coordinator.py
 SOURCE_PROFILER_REL=python/minisgl/afd_profiler.py
 SOURCE_PROTOCOL_REL=python/minisgl/afd_protocol.py
@@ -170,6 +185,14 @@ validate_source_repo() {
         SOURCE_VALIDATION_DETAIL="head_mismatch expected=$EXPECTED_HEAD observed=$actual_head"
         return 1
     }
+    if [[ "$ALLOW_DIRTY_SOURCE" == 1 ]]; then
+        [[ -z "$EXPECTED_SOURCE_MANIFEST" ]] || {
+            SOURCE_VALIDATION_DETAIL="dirty_source_with_manifest"
+            return 1
+        }
+        SOURCE_VALIDATION_DETAIL=ok
+        return 0
+    fi
     if [[ -n "$EXPECTED_SOURCE_MANIFEST" ]]; then
         [[ -f "$EXPECTED_SOURCE_MANIFEST" ]] || {
             SOURCE_VALIDATION_DETAIL="missing_manifest path=$EXPECTED_SOURCE_MANIFEST"
@@ -396,6 +419,10 @@ BATCH=${BATCH_ARG:-$CAPACITY_BATCH}
     echo "batch/attention-DP-lane must be a positive integer" >&2
     exit 2
 }
+(( AFD_NUM_MB <= BATCH )) || {
+    echo "AFD_NUM_MB must not exceed batch/attention-DP-lane: $AFD_NUM_MB > $BATCH" >&2
+    exit 2
+}
 if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
     ATTENTION_GPUS=$(( NORMALIZED_AF_RATIO * FFN_EP ))
     FFN_GPUS=$FFN_EP
@@ -444,6 +471,23 @@ ATTENTION_DP_SIZE=$(( ATTENTION_GPUS / ATTENTION_TP ))
 ATTENTION_WORKERS=$ATTENTION_GPUS
 MLP_DP_SIZE=$FFN_EP
 MLP_TP_SIZE=1
+if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
+    ADAPTIVE_CONTRACT="$MODEL_KEY:$CONTEXT:$BATCH:$ATTENTION_TP:$FFN_EP:$AFD_NUM_MB"
+    [[ "$ADAPTIVE_CONTRACT" == qwen3:131072:6:1:4:2 ]] || {
+        echo "qwen3-128k-adaptive requires qwen3, 128K, batch 6, ATP1, FEP4, and MB2; got $ADAPTIVE_CONTRACT" >&2
+        exit 2
+    }
+    if (( NORMALIZED_AF_RATIO >= 8 )); then
+        AFD_MODEL_PLACEMENT=legacy
+    else
+        AFD_MODEL_PLACEMENT=fmha-only
+    fi
+    export AFD_MODEL_PLACEMENT
+    export AFD_MODEL_PLACEMENT_POLICY=qwen3-128k-b6-atp1-fep4-mb2-r8-crossover
+    printf "afd_model_placement requested=%s resolved=%s policy=%s ratio=%s:1\n" \
+        "$AFD_MODEL_PLACEMENT_REQUESTED" "$AFD_MODEL_PLACEMENT" \
+        "$AFD_MODEL_PLACEMENT_POLICY" "$NORMALIZED_AF_RATIO"
+fi
 if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 ]]; then
     echo "irregular prompt-length ranges are supported only for Qwen3" >&2
     exit 2
@@ -540,10 +584,22 @@ fi
 MODEL_PROFILE_SCRIPT=${FASTAFD_MODEL_PROFILE_SCRIPT:-$(dirname "$(realpath "$0")")/prepare_model_profile.py}
 PROMPT_BASE=$SOURCE_REPO/prompts/prompts_512x${PROMPT_SOURCE_CONTEXT}_seed20260527.txt
 NUM_PROMPTS=$(( ATTENTION_DP_SIZE * BATCH ))
-MICROBATCH_UPPER=$(( (BATCH + 1) / 2 ))
-MICROBATCH_LOWER=$(( BATCH / 2 ))
+MICROBATCH_UPPER=$(( (BATCH + AFD_NUM_MB - 1) / AFD_NUM_MB ))
+MICROBATCH_BASE=$(( BATCH / AFD_NUM_MB ))
+MICROBATCH_REMAINDER=$(( BATCH % AFD_NUM_MB ))
+MICROBATCH_REAL_SIZES=""
+MICROBATCH_SEPARATOR=""
+for ((mb_index=0; mb_index<AFD_NUM_MB; mb_index++)); do
+    if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then
+        mb_real_size=$(( MICROBATCH_BASE + (mb_index >= AFD_NUM_MB - MICROBATCH_REMAINDER ? 1 : 0) ))
+    else
+        mb_real_size=$(( MICROBATCH_BASE + (mb_index < MICROBATCH_REMAINDER ? 1 : 0) ))
+    fi
+    MICROBATCH_REAL_SIZES+="${MICROBATCH_SEPARATOR}${mb_real_size}"
+    MICROBATCH_SEPARATOR=+
+done
 GRAPH_BATCH=$MICROBATCH_UPPER
-PADDED_BATCH=$(( GRAPH_BATCH * 2 ))
+PADDED_BATCH=$(( GRAPH_BATCH * AFD_NUM_MB ))
 CASE_ORDINAL=${FASTAFD_CASE_ORDINAL:-single}
 [[ "$CASE_ORDINAL" == single || "$CASE_ORDINAL" =~ ^[1-9][0-9]*$ ]] || {
     echo "FASTAFD_CASE_ORDINAL must be single or a positive integer" >&2
@@ -556,10 +612,10 @@ CASE_PORT_SLOT=${FASTAFD_CASE_PORT_SLOT:-$CASE_ORDINAL}
 }
 
 if [[ "${FASTAFD_DRY_RUN:-0}" == 1 && -z "${SLURM_JOB_ID:-}" ]]; then
-    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s+%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
+    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
         "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
         "$BATCH" "$CAPACITY_MAX_BATCH" "$RAW_KV_MAX_BATCH" "$REQUIRE_CAPACITY_MAX" \
-        "$MICROBATCH_UPPER" "$MICROBATCH_LOWER" "$NODES" "$ALLOCATED_GPUS" \
+        "$MICROBATCH_REAL_SIZES" "$NODES" "$ALLOCATED_GPUS" \
         "$ACTIVE_GPUS" "$SHARED_ROLE_TRAYS" "$NORMALIZED_AF_RATIO" \
         "$ATTENTION_TRAYS" "$FFN_TRAYS" "$ATTENTION_TP" "$FFN_EP" "$ATTENTION_DP_SIZE" \
         "$ATTENTION_GPUS" "$FFN_GPUS" \
@@ -631,7 +687,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     STAMP=$(date +%Y%m%d_%H%M%S)
     RUN_DIR=$RESULTS_ROOT/afd_${MODEL_KEY}_${CONTEXT}_r${NORMALIZED_AF_RATIO}_ag${ATTENTION_GPUS}_fg${FFN_GPUS}_atp${ATTENTION_TP}_fep${FFN_EP}_adp${ATTENTION_DP_SIZE}_b${BATCH}_n${NODES}_${STAMP}_manual_na
     mkdir -p "$RUN_DIR"
-    SBATCH_ARGS=(--parsable --nodes="$NODES" --segment="$NODES" --qos="$SUBMIT_QOS")
+    SBATCH_ARGS=(--parsable --nodes="$NODES" --segment="$NODES" --qos="$SUBMIT_QOS" --time="$JOB_TIME_LIMIT")
     if [[ -n "${FASTAFD_EXCLUDE_NODE:-}" ]]; then
         SBATCH_ARGS+=(--exclude="$FASTAFD_EXCLUDE_NODE")
     fi
@@ -733,27 +789,43 @@ export CUDA_HOME=/usr/local/cuda CUDA_PATH=/usr/local/cuda
 export CUDA_NVCC_EXECUTABLE=/usr/local/cuda/bin/nvcc
 export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
 export MAX_JOBS=32 NVCC_THREADS=4 TORCH_CUDA_ARCH_LIST=10.0
+# Ray is only the control plane for four GPU actors per tray. Advertising all
+# 140 CPUs invites an unnecessary worker pool. Native compiler and kernel
+# threads can still use the complete Slurm CPU allocation independently of
+# Ray logical resources. Let Ray size its object store from the task's actual
+# cgroup rather than assuming the allocation-level memory is visible inside
+# Pyxis.
+RAY_NUM_CPUS_PER_NODE=${FASTAFD_RAY_NUM_CPUS_PER_NODE:-16}
+[[ "$RAY_NUM_CPUS_PER_NODE" =~ ^[1-9][0-9]*$ ]] || \
+    preflight_error ray_num_cpus "$RAY_NUM_CPUS_PER_NODE"
+(( RAY_NUM_CPUS_PER_NODE >= 8 && RAY_NUM_CPUS_PER_NODE <= 32 )) || \
+    preflight_error ray_num_cpus "$RAY_NUM_CPUS_PER_NODE"
 # NCCL RAS is not queried by this sweep.  Disable its default localhost:28028
 # listener so unrelated jobs sharing a tray cannot produce bind warnings.
 export NCCL_RAS_ENABLE=0
 
-CONTROL=$RUN_DIR/control
+CASE_RUN_DIR=$RUN_DIR
+CONTROL=$CASE_RUN_DIR/control
 READY=$CONTROL/ready
 DONE=$CONTROL/snapshot-done
 STOP=$CONTROL/STOP
 SNAPSHOT=$CONTROL/SNAPSHOT
-GPU_PROGRESS=$RUN_DIR/gpu-progress
-mkdir -p "$READY" "$DONE" "$RUN_DIR/gpu-snapshots" "$GPU_PROGRESS" "$RUN_DIR/tmp/rank-$RANK"
-export TMPDIR=$RUN_DIR/tmp/rank-$RANK
+GPU_PROGRESS=$CASE_RUN_DIR/gpu-progress
+mkdir -p "$READY" "$DONE" "$CASE_RUN_DIR/gpu-snapshots" "$GPU_PROGRESS" "$CASE_RUN_DIR/tmp/rank-$RANK"
+export TMPDIR=$CASE_RUN_DIR/tmp/rank-$RANK
 export RAY_TMPDIR=/dev/shm/fastafd-ray-$SLURM_JOB_ID-$RANK-$CASE_ORDINAL
 ray_cli() { "$PYTHON" -m ray.scripts.scripts "$@"; }
 GPU_PROGRESS_PID=""
 cleanup() {
+    local cleanup_status=0
     [[ "$RANK" != 0 ]] || touch "$STOP"
     if [[ -n "$GPU_PROGRESS_PID" ]]; then
         kill "$GPU_PROGRESS_PID" >/dev/null 2>&1 || true
     fi
     ray_cli stop --force >/dev/null 2>&1 || true
+    "$PYTHON" "$GPU_PROCESS_EXIT_SCRIPT" --timeout-seconds 120 \
+        > "$CASE_RUN_DIR/gpu-snapshots/cleanup-rank-$RANK.json" || cleanup_status=$?
+    return "$cleanup_status"
 }
 trap cleanup EXIT TERM INT
 
@@ -763,16 +835,20 @@ validate_source_repo || \
 [[ -f "$MODEL_PATH/model.safetensors.index.json" ]] || \
     preflight_error model_index "$MODEL_PATH/model.safetensors.index.json"
 [[ -f "$PROMPT_BASE" ]] || preflight_error prompt_source "$PROMPT_BASE"
+[[ -f "$GPU_PROCESS_EXIT_SCRIPT" ]] || \
+    preflight_error gpu_process_exit_script "$GPU_PROCESS_EXIT_SCRIPT"
 [[ $(sha256sum "$MODEL_PATH/config.json" | awk '{print $1}') == "$MODEL_CONFIG_SHA256" ]] || \
     preflight_error model_config_sha256 "$MODEL_PATH/config.json"
 [[ "$MODEL_PROFILE_ID" == native || -f "$MODEL_PROFILE_MANIFEST" ]] || \
     preflight_error model_profile_manifest "$MODEL_PROFILE_MANIFEST"
 [[ $(sha256sum "$PROMPT_BASE" | awk '{print $1}') == "$PROMPT_SHA256" ]] || \
     preflight_error prompt_sha256 "$PROMPT_BASE"
-nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
-    --format=csv > "$RUN_DIR/gpu-snapshots/initial-rank-$RANK.csv"
-[[ $(wc -l < "$RUN_DIR/gpu-snapshots/initial-rank-$RANK.csv") -eq 1 ]]
 ray_cli stop --force >/dev/null 2>&1 || true
+"$PYTHON" "$GPU_PROCESS_EXIT_SCRIPT" --timeout-seconds 120 \
+    > "$CASE_RUN_DIR/gpu-snapshots/preflight-cleanup-rank-$RANK.json"
+nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory \
+    --format=csv > "$CASE_RUN_DIR/gpu-snapshots/initial-rank-$RANK.csv"
+[[ $(wc -l < "$CASE_RUN_DIR/gpu-snapshots/initial-rank-$RANK.csv") -eq 1 ]]
 
 # One nvidia-smi sample/tray/minute gives the controller a cheap independent
 # progress signal. It is intentionally outside the profiled worker processes.
@@ -792,7 +868,8 @@ GPU_PROGRESS_PID=$!
 HEAD_ADDRESS=$HEAD_HOST:6379
 if [[ "$RANK" == 0 ]]; then
     printf '%s\n' "$HEAD_ADDRESS" > "$CONTROL/head-address"
-    ray_cli start --head --port=6379 --num-cpus=140 --num-gpus=4 \
+    ray_cli start --head --port=6379 \
+        --num-cpus="$RAY_NUM_CPUS_PER_NODE" --num-gpus=4 \
         --include-dashboard=false --disable-usage-stats --temp-dir="$RAY_TMPDIR" \
         > "$RUN_DIR/ray-start-0.log" 2>&1
 else
@@ -801,7 +878,8 @@ else
         [[ ! -e "$STOP" && $SECONDS -lt $deadline ]]; sleep 1
     done
     HEAD_ADDRESS=$(<"$CONTROL/head-address")
-    ray_cli start --address="$HEAD_ADDRESS" --num-cpus=140 --num-gpus=4 \
+    ray_cli start --address="$HEAD_ADDRESS" \
+        --num-cpus="$RAY_NUM_CPUS_PER_NODE" --num-gpus=4 \
         --disable-usage-stats > "$RUN_DIR/ray-start-$RANK.log" 2>&1
 fi
 touch "$READY/$RANK"
@@ -1195,7 +1273,12 @@ manifest.write_text(json.dumps(case_record, indent=2, sort_keys=True) + "\n")
 print(json.dumps(case_record, indent=2, sort_keys=True))
 PY
 export FASTAFD_SOURCE_REPO=$SOURCE_REPO
-export AFD_TOTAL_NODES=$NODES RUN_VLLM_ALIGNMENT=0 NSYS_CUDA_GRAPH_TRACE
+export AFD_TOTAL_NODES=$NODES \
+    RUN_VLLM_ALIGNMENT=${FASTAFD_RUN_VLLM_ALIGNMENT:-0} \
+    NSYS_CUDA_GRAPH_TRACE
+if [[ "$RUN_VLLM_ALIGNMENT" == 1 ]]; then
+    export CAPTURE_EXIT_AFTER_WINDOW=0
+fi
 export AFD_ATTN_TP_SIZE=$ATTENTION_TP AFD_MLP_EP_SIZE=$FFN_EP
 if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
     export AFD_ATTENTION_GPU_COUNT=$ATTENTION_GPUS
@@ -1205,8 +1288,34 @@ fi
 export AFD_ATTN_DP_SIZE=$ATTENTION_DP_SIZE MLP_DP_SIZE MLP_TP_SIZE
 export PROMPT_LEN=$CONTEXT_MAX PER_ATTN_GPU_BSZ=$BATCH MAX_TOKENS=$OUTPUT_TOKENS
 export MINISGL_MAX_SEQ_LEN=$MAX_SEQ_LEN VLLM_MAX_MODEL_LEN=$MAX_SEQ_LEN
-export AFD_NUM_MB=2 AFD_DECODE_GRAPH_BS=$GRAPH_BATCH
-export AFD_MEMORY_RATIO AFD_MAX_BATCHED_TOKENS=512
+export AFD_DECODE_GRAPH_BS=$GRAPH_BATCH
+export AFD_MEMORY_RATIO
+# Keep the proven sweep prefill contract for both placements. The apparent
+# long-prefill stall was cold per-rank extension compilation followed by a
+# CUDA-fabric mapping-limit failure, not useful 512-token inference work.
+AFD_MAX_BATCHED_TOKENS=${FASTAFD_AFD_MAX_BATCHED_TOKENS:-512}
+[[ "$AFD_MAX_BATCHED_TOKENS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "FASTAFD_AFD_MAX_BATCHED_TOKENS must be a positive integer" >&2
+    exit 2
+}
+(( AFD_MAX_BATCHED_TOKENS <= 8192 )) || {
+    echo "AFD max batched tokens exceeds the supported extend capacity: $AFD_MAX_BATCHED_TOKENS > 8192" >&2
+    exit 2
+}
+export AFD_MAX_BATCHED_TOKENS
+# A prefill scheduler step may carry one decode token for every resident
+# request in addition to the prefill token budget. Reserve that exact combined
+# bound for DeepEP; decode still dispatches with the much smaller graph bucket.
+MINISGL_AFD_MAX_COMM_TOKENS=${FASTAFD_AFD_MAX_COMM_TOKENS:-$((AFD_MAX_BATCHED_TOKENS + BATCH))}
+[[ "$MINISGL_AFD_MAX_COMM_TOKENS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "FASTAFD_AFD_MAX_COMM_TOKENS must be a positive integer" >&2
+    exit 2
+}
+(( MINISGL_AFD_MAX_COMM_TOKENS >= AFD_MAX_BATCHED_TOKENS + BATCH )) || {
+    echo "AFD max communication tokens must cover prefill budget plus lane batch: required=$((AFD_MAX_BATCHED_TOKENS + BATCH)) configured=$MINISGL_AFD_MAX_COMM_TOKENS" >&2
+    exit 2
+}
+export MINISGL_AFD_MAX_COMM_TOKENS
 if [[ -n "$AFD_NUM_PAGES" ]]; then
     export AFD_SERVER_EXTRA_ARGS="--attention-backend trtllm --memory-ratio $AFD_MEMORY_RATIO --num-pages $AFD_NUM_PAGES"
 else
@@ -1219,13 +1328,13 @@ export NSYS_CAPTURE_DECODE_STEPS
 export CAPTURE_WORKER_STOP_TIMEOUT_S
 export MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP=$BATCH
 export MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS
-export FLASHINFER_WORKSPACE_BASE=$ROOT/cache/afd/flashinfer
-export TVM_FFI_CACHE_DIR=$ROOT/cache/afd/tvm_ffi
-export EP_JIT_CACHE_DIR=$ROOT/cache/afd/deepep_jit
-export DG_JIT_CACHE_DIR=$ROOT/cache/afd/deepgemm_jit
-export N2M_M2N_GIN_BUILD_DIR=$ROOT/cache/afd/gin_comm
-export MINISGL_DEEPEP_BUILD_DIR=$ROOT/cache/afd/deepep_moe
-export MINISGL_DEEPGEMM_BUILD_DIR=$ROOT/cache/afd/deepgemm
+export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-$ROOT/cache/afd/flashinfer}
+export TVM_FFI_CACHE_DIR=${TVM_FFI_CACHE_DIR:-$ROOT/cache/afd/tvm_ffi}
+export EP_JIT_CACHE_DIR=${EP_JIT_CACHE_DIR:-$ROOT/cache/afd/deepep_jit}
+export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-$ROOT/cache/afd/deepgemm_jit}
+export N2M_M2N_GIN_BUILD_DIR=${N2M_M2N_GIN_BUILD_DIR:-$ROOT/cache/afd/gin_comm}
+export MINISGL_DEEPEP_BUILD_DIR=${MINISGL_DEEPEP_BUILD_DIR:-$ROOT/cache/afd/deepep_moe}
+export MINISGL_DEEPGEMM_BUILD_DIR=${MINISGL_DEEPGEMM_BUILD_DIR:-$ROOT/cache/afd/deepgemm}
 EXPERIMENT=$RUN_DIR/experiment
 export RUN_DIR=$EXPERIMENT
 mkdir -p "$RUN_DIR"
@@ -1250,7 +1359,6 @@ WORKER_FAILURE_MARKER=$RUN_DIR/worker-hot-loop-failure.txt
 POST_CAPTURE_DRIVER_TERMINATION_MARKER=$RUN_DIR/post-capture-driver-termination.txt
 (
     capture_exit_deadline=0
-    sample_exit_deadline=0
     while kill -0 "$DRIVER_PID" 2>/dev/null; do
         if grep -q -m1 "zmq.error.ZMQError: Address already in use" \
             "$RUN_DIR/afd.log" 2>/dev/null; then
@@ -1279,13 +1387,9 @@ POST_CAPTURE_DRIVER_TERMINATION_MARKER=$RUN_DIR/post-capture-driver-termination.
             if (( capture_exit_deadline == 0 )); then
                 capture_exit_deadline=$((SECONDS + POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS))
             fi
-            if [[ -s "$RUN_DIR/sample.json" && -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]] && \
-                (( sample_exit_deadline == 0 )); then
-                sample_exit_deadline=$((SECONDS + POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS))
-            fi
-            if (( sample_exit_deadline > 0 && SECONDS >= sample_exit_deadline )); then
-                printf 'terminating allocation-scoped driver after durable sample failed to exit within %s seconds; pid=%s detected_at=%s\n' \
-                    "$POST_SAMPLE_DRIVER_EXIT_TIMEOUT_SECONDS" "$DRIVER_PID" \
+            if [[ -s "$RUN_DIR/sample.json" && -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]]; then
+                printf 'terminating allocation-scoped driver immediately after capture, sample, and coordinator trace became durable; pid=%s detected_at=%s\n' \
+                    "$DRIVER_PID" \
                     "$(date --iso-8601=seconds)" \
                     > "$POST_CAPTURE_DRIVER_TERMINATION_MARKER"
                 kill -TERM "$DRIVER_PID" 2>/dev/null || true
@@ -1438,6 +1542,9 @@ fi
 }
 
 RUN_DIR=$RUN_DIR SWEEP_CONTRACT=$SWEEP_CONTRACT NUM_PROMPTS=$NUM_PROMPTS BATCH=$BATCH \
+AFD_MODEL_PLACEMENT_REQUESTED=$AFD_MODEL_PLACEMENT_REQUESTED \
+AFD_MODEL_PLACEMENT_POLICY=$AFD_MODEL_PLACEMENT_POLICY \
+AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT AFD_NUM_MB=$AFD_NUM_MB \
 ATTENTION_WORKERS=$ATTENTION_WORKERS ATTENTION_DP_SIZE=$ATTENTION_DP_SIZE \
 ATTENTION_TP=$ATTENTION_TP FFN_EP=$FFN_EP NORMALIZED_AF_RATIO=$NORMALIZED_AF_RATIO \
 NODES=$NODES REFERENCE_TPS=$REFERENCE_TPS \
@@ -1490,6 +1597,21 @@ running_reservation = int(os.environ["SCHEDULER_RUNNING_RESERVATION_TOKENS"])
 require_capacity_max = bool(int(os.environ["REQUIRE_CAPACITY_MAX"]))
 output_tokens = int(os.environ["OUTPUT_TOKENS"])
 trace_warmup_steps = int(os.environ["TRACE_WARMUP_DECODE_STEPS"])
+model_placement = os.environ["AFD_MODEL_PLACEMENT"]
+model_placement_requested = os.environ["AFD_MODEL_PLACEMENT_REQUESTED"]
+model_placement_policy = os.environ["AFD_MODEL_PLACEMENT_POLICY"]
+num_mb = int(os.environ["AFD_NUM_MB"])
+mb_base, mb_remainder = divmod(batch, num_mb)
+if model_placement == "fmha-only":
+    microbatch_real_sizes = [
+        mb_base + (1 if mb >= num_mb - mb_remainder else 0)
+        for mb in range(num_mb)
+    ]
+else:
+    microbatch_real_sizes = [
+        mb_base + (1 if mb < mb_remainder else 0)
+        for mb in range(num_mb)
+    ]
 attention_trays = int(os.environ["ATTENTION_TRAYS"])
 ffn_trays = int(os.environ["FFN_TRAYS"])
 attention_gpus = int(os.environ["ATTENTION_GPUS"])
@@ -1558,20 +1680,42 @@ samples = json.loads((run / "sample.json").read_text()).get("samples", [])
 lengths = [len(x.get("generated_token_ids", [])) for x in samples]
 if len(samples) != count or set(lengths) != {output_tokens}:
     raise RuntimeError((len(samples), sorted(set(lengths))))
-attention_log_pattern = (
-    "attention_dp*_rank*.log" if attention_dp > 1 else "attention_rank*.log"
-)
-logs = sorted((run / "ray_logs").glob(attention_log_pattern))
-if len(logs) != workers:
-    raise RuntimeError((len(logs), workers))
-pattern = re.compile(r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)")
-worker_steps = []
-for path in logs:
-    captured = [
-        int(s) for s, b, mb in pattern.findall(path.read_text(errors="replace"))
-        if int(b) == padded_batch and int(mb) == 2
-    ]
-    worker_steps.append(captured)
+if model_placement == "fmha-only":
+    attention_trace_pattern = (
+        "attention_dp*_rank*_nvtx_cpu.json"
+        if attention_dp > 1
+        else "attention_rank*_nvtx_cpu.json"
+    )
+    attention_traces = sorted((run / "ray_logs").glob(attention_trace_pattern))
+    if len(attention_traces) != workers:
+        raise RuntimeError(("attention CPU traces", len(attention_traces), workers))
+    worker_steps = []
+    for path in attention_traces:
+        events = json.loads(path.read_text()).get("events", [])
+        worker_steps.append([
+            int(event["step_id"])
+            for event in events
+            if str(event.get("name", "")).startswith("AFD_AG_Materialize")
+            and isinstance(event.get("step_id"), int)
+        ])
+else:
+    attention_log_pattern = (
+        "attention_dp*_rank*.log" if attention_dp > 1 else "attention_rank*.log"
+    )
+    logs = sorted((run / "ray_logs").glob(attention_log_pattern))
+    if len(logs) != workers:
+        raise RuntimeError((len(logs), workers))
+    pattern = re.compile(
+        r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)"
+    )
+    worker_steps = []
+    for path in logs:
+        captured = [
+            int(s)
+            for s, b, marker in pattern.findall(path.read_text(errors="replace"))
+            if int(b) == padded_batch and int(marker) == num_mb
+        ]
+        worker_steps.append(captured)
 coordinator_log = run / "ray_logs/afd_coordinator.log"
 if not coordinator_log.is_file():
     raise RuntimeError("missing AFD coordinator log")
@@ -1602,9 +1746,23 @@ if (
 if len(steps) != 15 or steps != list(range(steps[0], steps[0] + 15)):
     raise RuntimeError(("target decode steps are not exactly consecutive", steps))
 trace_steps = [warmup_step, *steps]
-if steps[0] != warmup_step + 1 or any(captured != trace_steps for captured in worker_steps):
+if model_placement == "fmha-only":
+    trace_step_set = set(trace_steps)
+    worker_trace_steps = [
+        [step for step in captured if step in trace_step_set]
+        for captured in worker_steps
+    ]
+else:
+    worker_trace_steps = worker_steps
+if steps[0] != warmup_step + 1 or any(
+    captured != trace_steps for captured in worker_trace_steps
+):
     raise RuntimeError(
-        ("attention worker trace differs from warmup+target window", worker_steps, trace_steps)
+        (
+            "attention worker trace differs from warmup+target window",
+            worker_trace_steps,
+            trace_steps,
+        )
     )
 full_windows = [steps]
 partial_windows = []
@@ -1621,6 +1779,9 @@ tps = count * 1000 / (active_gpus * median_ms)
 allocated_tps = count * 1000 / (allocated_gpus * median_ms)
 result = {
     "sweep_contract": os.environ["SWEEP_CONTRACT"],
+    "afd_model_placement": model_placement,
+    "afd_model_placement_requested": model_placement_requested,
+    "afd_model_placement_policy": model_placement_policy,
     "model_key": os.environ.get("MODEL_KEY"),
     "prompt_mode": os.environ["PROMPT_MODE"],
     "context_tokens": context,
@@ -1657,9 +1818,9 @@ result = {
     "scheduler_admission_required_tokens_per_attention_gpu": admission_required,
     "scheduler_admission_unused_tokens_per_attention_gpu": admission_unused,
     "scheduler_admission_method": f"largest B satisfying (B-1)*(ceil(prompt/64)*64 + ({output_tokens - 1}+63)) + (prompt+{output_tokens}) <= measured KV capacity",
-    "microbatch_real_sizes_per_attention_dp_lane": [(batch + 1) // 2, batch // 2],
+    "microbatch_real_sizes_per_attention_dp_lane": microbatch_real_sizes,
     "graph_padded_batch_per_attention_dp_lane": padded_batch,
-    "microbatch_real_sizes_per_attention_gpu": [(batch + 1) // 2, batch // 2],
+    "microbatch_real_sizes_per_attention_gpu": microbatch_real_sizes,
     "graph_padded_batch_per_attention_gpu": padded_batch,
     "attention_workers": workers,
     "attention_dp_size": attention_dp,
@@ -1697,21 +1858,35 @@ result = {
     "placement": placement,
     "cuda_graph": {
         "enabled": True,
-        "num_microbatches": 2,
-        "configured_batch_per_microbatch": (batch + 1) // 2,
+        "num_microbatches": num_mb,
+        "configured_batch_per_microbatch": (batch + num_mb - 1) // num_mb,
         "observed_padded_batch_per_attention_gpu": padded_batch,
         "nsys_cuda_graph_trace": os.environ["NSYS_CUDA_GRAPH_TRACE"],
         "nsys_target_batch_per_attention_dp_lane": int(os.environ["NSYS_TARGET_BATCH_PER_ATTN_DP"]),
         "nsys_capture_decode_steps": int(os.environ["NSYS_CAPTURE_DECODE_STEPS"]),
         "nsys_trace_warmup_decode_steps": trace_warmup_steps,
         "nsys_trace_decode_launches": len(trace_steps),
-        "proof": "the coordinator emitted one exact warmup-plus-target_decode_window marker and every attention-worker log contains the first full-resident warmup followed by exactly the same 15 measured afd_ag_decode_graph:replay steps",
+        "proof": "the coordinator emitted one exact warmup-plus-target_decode_window marker and every attention-worker log contains the first full-resident warmup followed by exactly the same 15 measured decode-graph replay steps",
     },
-    "measurement": "coordinator completion interval diagnostic only; final latency and TPS/GPU use the v14 arithmetic mean of the dominant range among the 15 target-batch post-warmup critical CUDA spans, with its median also reported; retain at least 10 spans and require their full max-minus-min range to be <=10% of their median",
+    "measurement": (
+        "coordinator completion interval diagnostic only; final latency and "
+        "TPS/GPU use the arithmetic mean of the dominant range among the 15 "
+        "target-batch post-warmup critical CUDA spans, with its median also "
+        "reported; FMHA-only placement takes the maximum complete graph span "
+        "across one attention and one model representative"
+    ),
     "primary_performance_metric": {
         "status": "pending_postprocess",
-        "metric_version": "20260804-attention-cuda-execution-span-v14",
-        "latency_basis": "afd_attention_cuda_execution_critical_target_batch_dominant_range_mean",
+        "metric_version": (
+            "20260820-fmha-only-dual-role-cuda-graph-span-v1"
+            if model_placement == "fmha-only"
+            else "20260804-attention-cuda-execution-span-v14"
+        ),
+        "latency_basis": (
+            "max_complete_cuda_graph_span_across_profiled_attention_and_model_roles"
+            if model_placement == "fmha-only"
+            else "afd_attention_cuda_execution_critical_target_batch_dominant_range_mean"
+        ),
         "required_target_batch_selected_steps": 15,
         "minimum_retained_latency_sample_count": 10,
         "maximum_outlier_count": 5,

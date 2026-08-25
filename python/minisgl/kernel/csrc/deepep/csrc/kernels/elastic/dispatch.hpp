@@ -257,11 +257,17 @@ static void launch_dispatch(void* x, void* sf,
 
     // Maximize shared memory utilization
     if (num_scaleout_ranks == 1) {
-        // Too many warps may cause performance degrade, so we limit the total warps into 512
+        // One warp owns one token channel.  Decode buckets can contain fewer
+        // tokens than the fixed 24-CTA coexistence grid, so launching the
+        // shared-memory maximum (22 data warps/CTA on GB200) only adds idle
+        // threads.  Retain the original 512-token ceiling while also bounding
+        // the width by the declared per-rank bucket.
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
         num_dispatch_warps = std::min<int>(std::min<int>(
             (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps),
-            math::ceil_div(512, num_sms));
+            std::min<int>(
+                math::ceil_div(512, num_sms),
+                std::max(1, math::ceil_div(num_max_tokens_per_rank, num_sms))));
         num_threads = (num_notify_warps + num_dispatch_warps) * 32;
     } else {
         // Hybrid kernels
@@ -299,8 +305,13 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        // NOTES: make cluster dim 2 to overlap with clustered computation kernels
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
+        // FMHA-only selects one to three complete 8-CTA communication CGAs
+        // and gives DeepGEMM the complementary device-width launch budget.
+        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 8, true)};
+    EP_HOST_ASSERT((num_sms == 8 or num_sms == 16 or num_sms == 24) and
+                   "overlapped DeepEP dispatch requires 8, 16, or 24 SMs");
+    EP_HOST_ASSERT(num_sms % args.launch_args.cluster_dim == 0 and
+                   "DeepEP dispatch SM count must form complete 8-CTA CGAs");
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);
@@ -382,10 +393,19 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
+    // One warp copies one received token.  Size the decode launch from the
+    // declared receive capacity instead of starting a full-device grid whose
+    // remaining CTAs and warps immediately exit.
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
-    const auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    const auto max_recv_tokens = num_max_tokens_per_rank * num_scaleout_ranks * num_scaleup_ranks;
+    const auto epilogue_num_sms = std::min(num_sms, std::max(1, max_recv_tokens));
+    const auto useful_warps = math::ceil_div(max_recv_tokens, epilogue_num_sms);
+    const auto num_warps = std::min<int>(
+        num_smem_bytes / token_layout.get_num_bytes<true>(),
+        std::min(useful_warps, 32));
     const auto num_threads = num_warps * 32;
+    const auto epilogue_smem_bytes = static_cast<int>(
+        layout::BufferLayout<true>(token_layout, num_warps, 1).get_num_bytes());
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
@@ -405,7 +425,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
-        .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
+        .launch_args = jit::LaunchArgs(epilogue_num_sms, num_threads, epilogue_smem_bytes, 1, false, true)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);
     DispatchCopyEpilogueRuntime::launch(runtime, args, stream);

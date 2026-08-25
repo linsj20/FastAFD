@@ -31,9 +31,18 @@ class AfdAttentionRuntime:
     for eager/graph execution.
     """
 
-    def __init__(self, config: SchedulerConfig, state: Any):
+    def __init__(
+        self,
+        config: SchedulerConfig,
+        state: Any,
+        *,
+        owns_model_state: bool = True,
+        prepare_attention_metadata: bool = True,
+    ):
         self.config = config
         self.state = state
+        self.owns_model_state = bool(owns_model_state)
+        self.prepare_attention_metadata = bool(prepare_attention_metadata)
         self.stream = torch.cuda.Stream(device=self.state.device)
         self._free_pages = list(
             range(
@@ -64,9 +73,13 @@ class AfdAttentionRuntime:
         # is a SYNCHRONOUS h2d -> a per-decode-step host stall = part of the AG/EG
         # replay gap). The 3-deep ring guards reuse under one-step-ahead overlap.
         _smb = int(self.config.max_running_req) + 1
-        self._samp_stages = tuple(
-            tuple(torch.empty(_smb, dtype=torch.int64, pin_memory=True) for _ in range(4))
-            for _ in range(3)
+        self._samp_stages = (
+            tuple(
+                tuple(torch.empty(_smb, dtype=torch.int64, pin_memory=True) for _ in range(4))
+                for _ in range(3)
+            )
+            if self.owns_model_state
+            else ()
         )
         self._samp_stage_events = [torch.cuda.Event() for _ in self._samp_stages]
         self._samp_stage_recorded = [False] * len(self._samp_stages)
@@ -83,18 +96,62 @@ class AfdAttentionRuntime:
         # this attention-DP lane only.  Table indices are local to each AG DP,
         # so this must be sized by the local max_running_req, not by global
         # batch or attn_dp_size.
-        self.token_pool = torch.zeros(
-            (int(config.max_running_req) + 1, int(config.max_seq_len)),
-            dtype=torch.int32,
-            device=self.state.device,
+        self.token_pool = (
+            torch.zeros(
+                (int(config.max_running_req) + 1, int(config.max_seq_len)),
+                dtype=torch.int32,
+                device=self.state.device,
+            )
+            if self.owns_model_state
+            else None
         )
 
         logger.info("AfdAttentionRuntime initialized (rank=%d)", config.tp_info.rank)
+
+    def configure_num_pages(self, num_pages: int) -> None:
+        """Install the common AG/EG logical page capacity before serving.
+
+        FMHA-only placement mirrors the page allocator on AG and EG so EG can
+        publish K/V directly to the AG-owned cache.  Physical AG allocations
+        can differ slightly across GPUs, so the launcher selects their minimum
+        and calls this hook on every worker before model initialization.
+        """
+        num_pages = int(num_pages)
+        if num_pages <= 1:
+            raise ValueError(f"AFD logical num_pages must be > 1, got {num_pages}")
+        if self._table_reqs or self._table_pages:
+            raise RuntimeError("Cannot reconfigure AFD pages after requests were materialized")
+
+        max_seq_len = min(
+            int(self.config.max_seq_len),
+            num_pages * int(self.config.page_size),
+        )
+        aligned_max_seq_len = ((max_seq_len + 31) // 32) * 32
+        page_table = torch.zeros(
+            (int(self.config.max_running_req) + 1, aligned_max_seq_len),
+            dtype=torch.int32,
+            device=self.state.device,
+        )
+        self.state.num_pages = num_pages
+        self.state.max_seq_len = max_seq_len
+        self.state.page_table = page_table
+        self.state.ctx.page_table = page_table
+        self._free_pages = list(
+            range(0, num_pages * int(self.config.page_size), int(self.config.page_size))
+        )
+        if self._dummy_req is None:
+            raise RuntimeError("AFD dummy request is missing during page configuration")
+        page_table[int(self._dummy_req.table_idx)].fill_(
+            num_pages * int(self.config.page_size)
+        )
+        self._page_configuration_pending = False
 
     # ----- AG-side materialize: KV metadata + token ids + sampling -----
 
     def _write_token_blocks_ag(self, token_blocks) -> None:
         """Write prompt/generated token ids into the AG-owned token_pool."""
+        if self.token_pool is None:
+            raise RuntimeError("AFD runtime does not own model token state")
         for block in token_blocks:
             tokens = block.tokens
             if int(tokens.numel()) == 0:
@@ -209,26 +266,57 @@ class AfdAttentionRuntime:
         batch.out_loc = torch.empty((0,), dtype=torch.int32)
         return batch
 
-    def materialize_ag_plan(self, plan: AfdAGStepPlan) -> Batch:
+    def materialize_ag_plan(
+        self,
+        plan: AfdAGStepPlan,
+        *,
+        attach_sampling: bool = True,
+    ) -> Batch:
         """AG-side materialize: KV metadata (reused) + token_pool input_ids + sampling.
 
         Applies the coordinator plan to local token_pool/page-table state, then
         builds the Batch fields consumed by attention, lm_head, and writeback.
         """
+        if bool(getattr(self, "_page_configuration_pending", False)):
+            raise RuntimeError("AFD page capacity was not configured before serving")
         with nvtx_range(nvtx_label("AFD_AG_Materialize", step=plan.step_id)):
             with torch.cuda.stream(self.stream):
-                self._free_tables(plan.free_table_indices)
-                self._write_token_blocks_ag(plan.token_blocks)
-                real_reqs, padded_reqs = self._materialize_reqs(plan)
-                batch = Batch(reqs=real_reqs, phase=plan.phase)
-                batch.padded_reqs = padded_reqs
-                batch.afd_microbatch_offsets = plan.microbatch_offsets
-                batch.afd_microbatch_token_offsets = plan.microbatch_token_offsets
+                batch = self._materialize_ag_plan_state(plan)
                 stage_index, table_indices, pos_i64 = self._attach_input_mapping(batch, plan)
-                batch.input_ids = self.token_pool[table_indices, pos_i64]
+                if self.token_pool is None:
+                    batch.input_ids = torch.empty(
+                        (0,), dtype=torch.int32, device=self.state.device
+                    )
+                else:
+                    batch.input_ids = self.token_pool[table_indices, pos_i64]
                 self._attach_attention_metadata(batch, plan)
                 self._record_input_mapping_stage(stage_index)
-                self._attach_sampling_metadata(batch, plan)
+                if self.owns_model_state and attach_sampling:
+                    self._attach_sampling_metadata(batch, plan)
+        return batch
+
+    def materialize_ag_plan_state_only(self, plan: AfdAGStepPlan) -> Batch:
+        """Apply one plan without staging its per-token GPU input mapping.
+
+        A grouped FMHA model worker calls this once per attention source, then
+        stages the merged fan-in mapping exactly once. The returned Batch is
+        intentionally incomplete and must not be passed to model execution.
+        """
+        if bool(getattr(self, "_page_configuration_pending", False)):
+            raise RuntimeError("AFD page capacity was not configured before serving")
+        with nvtx_range(nvtx_label("AFD_AG_MaterializeState", step=plan.step_id)):
+            with torch.cuda.stream(self.stream):
+                return self._materialize_ag_plan_state(plan)
+
+    def _materialize_ag_plan_state(self, plan: AfdAGStepPlan) -> Batch:
+        self._free_tables(plan.free_table_indices)
+        if self.owns_model_state:
+            self._write_token_blocks_ag(plan.token_blocks)
+        real_reqs, padded_reqs = self._materialize_reqs(plan)
+        batch = Batch(reqs=real_reqs, phase=plan.phase)
+        batch.padded_reqs = padded_reqs
+        batch.afd_microbatch_offsets = plan.microbatch_offsets
+        batch.afd_microbatch_token_offsets = plan.microbatch_token_offsets
         return batch
 
     def _materialize_reqs(self, plan: AfdAGStepPlan) -> tuple[list[Req], list[Req]]:
@@ -283,7 +371,9 @@ class AfdAttentionRuntime:
             sb.positions = batch.positions[ts:te]
             sb.input_ids = batch.input_ids[ts:te]
             sb.out_loc = batch.out_loc[ts:te]
-            sb.attn_metadata = batch.attn_metadata_mbs[mb]
+            metadata = batch.attn_metadata_mbs[mb]
+            if metadata is not None:
+                sb.attn_metadata = metadata
             subs.append(sb)
         return subs
 
@@ -296,6 +386,8 @@ class AfdAttentionRuntime:
 
     def writeback_tokens_ag(self, batch: Batch, next_tokens: torch.Tensor) -> None:
         """Write sampled tokens back into the AG token_pool for the next step."""
+        if self.token_pool is None:
+            raise RuntimeError("AFD runtime does not own model token state")
         wb = batch.afd_writeback
         if wb is None or int(wb["batch_indices"].numel()) == 0:
             return
@@ -533,6 +625,9 @@ class AfdAttentionRuntime:
     ) -> None:
         """Build one attention metadata object per microbatch slot."""
 
+        if not self.prepare_attention_metadata:
+            batch.attn_metadata_mbs = [None] * num_mb
+            return
         backends = self.state.attn_backends
         orig_padded_reqs = batch.padded_reqs
         orig_req_table_indices_gpu = getattr(batch, "afd_req_table_indices_gpu", None)

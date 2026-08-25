@@ -278,6 +278,7 @@ def psum_silu_mul_fp8_quant_cuda(
     psum_tokens_per_expert: torch.Tensor,
     *,
     alignment: int,
+    worker_blocks: int,
     topk_weights: torch.Tensor | None = None,
     group_size: int = 128,
     manual_config: tuple[int, int, int] | None = None,
@@ -304,6 +305,12 @@ def psum_silu_mul_fp8_quant_cuda(
         raise RuntimeError(f"only group_size=128 supported, got {group_size}")
     if h % group_size != 0:
         raise RuntimeError(f"hidden={h} must be divisible by group_size={group_size}")
+    worker_blocks = int(worker_blocks)
+    if worker_blocks <= 0 or worker_blocks > m:
+        raise RuntimeError(
+            f"worker_blocks must satisfy 0 < worker_blocks <= rows, "
+            f"got worker_blocks={worker_blocks} rows={m}"
+        )
     packed_groups = _ceil_div(h // group_size, 4)
     if m == 0:
         return (
@@ -342,12 +349,13 @@ def psum_silu_mul_fp8_quant_cuda(
         tpg, kx, ry = manual_config
         module.launch_manual(
             x, y.view(torch.uint8), scales, psum, weights,
-            int(alignment), bool(apply_topk), int(tpg), int(kx), int(ry),
+            int(alignment), worker_blocks, bool(apply_topk),
+            int(tpg), int(kx), int(ry),
         )
     else:
         module.launch(
             x, y.view(torch.uint8), scales, psum, weights,
-            int(alignment), bool(apply_topk),
+            int(alignment), worker_blocks, bool(apply_topk),
         )
     return y, scales
 

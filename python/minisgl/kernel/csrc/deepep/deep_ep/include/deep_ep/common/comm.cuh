@@ -85,7 +85,8 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     }
 }
 
-template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
+template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles,
+          int kTag = kDeviceBarrierTag, bool kRelease = true>
 __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
     const layout::WorkspaceLayout& workspace,
@@ -94,38 +95,29 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     if (kNumSMs > 1 and sm_idx > 0)
         return;
 
-    // Read the current barrier phase first
-    const int status = static_cast<int>((*workspace.get_nvl_barrier_counter_ptr()) & 3);
-    const int phase = status & 1, sign = status >> 1;
-
-    EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
-    if (thread_idx < kNumRanks) {
-        const auto dst_ptr =
-            gin.get_sym_ptr<ncclTeamTagLsa>(workspace.get_nvl_barrier_signal_ptr(phase), thread_idx);
-        ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1);
+    // NCCL owns the persistent graph-safe epoch. With LSA multimem enabled,
+    // arrive is one multicast reduction instead of one release atomic per
+    // peer; acquire-release ordering preserves the old barrier contract.
+    static_cast<void>(workspace);
+    const auto coop = ncclCoopCta();
+    ncclLsaBarrierSession<ncclCoopCta> barrier{
+        coop, gin.nccl_dev_comm, ncclTeamTagLsa{}, kTag, true};
+    // Match NCCL's device-API collective pattern: the entry barrier acquires
+    // peer readiness, while the exit barrier releases completed LSA stores.
+    // acq_rel on both phases adds a fence that the phase cannot use.
+    const auto result = [&]() {
+        if constexpr (kRelease)
+            return barrier.sync(
+                coop, cuda::memory_order_release, kNumTimeoutCycles);
+        else
+            return barrier.sync(
+                coop, cuda::memory_order_acquire, kNumTimeoutCycles);
+    }();
+    if (thread_idx == 0 and result != ncclSuccess) {
+        printf("DeepEP NCCL LSA barrier timeout, tag: %d, nvl: %d, result: %d\n",
+               kTag, rank_idx, static_cast<int>(result));
+        ptx::trap();
     }
-    __syncthreads();
-
-    // NOTES: we need `2^64 / 1e6 / 3600 / 24 / 365 = 571000` years to make the counter overflow (1 barrier per us)
-    // Add the phase counter
-    if (thread_idx == 0)
-        atomicAdd(workspace.get_nvl_barrier_counter_ptr(), 1);
-
-    // Check timeout
-    const auto target = sign ? 0 : kNumRanks;
-    timeout_while<kNumTimeoutCycles>(thread_idx == 0, [=](const bool& is_last_check) {
-        const auto signal = ptx::ld_acquire_sys<int>(workspace.get_nvl_barrier_signal_ptr(phase));
-        if (signal == target)
-            return true;
-
-        if (is_last_check) {
-            printf("DeepEP NVLink barrier timeout, tag: %d, nvl: %d, thread: %d, "
-                   "status: %d, signal: %d, phase: %d, target: %d, counter: %llu\n",
-                   kTag, rank_idx, thread_idx, status, signal, phase, target,
-                   *workspace.get_nvl_barrier_counter_ptr());
-        }
-        return false;
-    });
 }
 
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,
@@ -187,7 +179,7 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
     const layout::WorkspaceLayout& workspace,
     const int& rank_idx, const int& sm_idx, const int& thread_idx) {
     if constexpr (kIsScaleupNVLink) {
-        nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag>(
+        nvlink_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumTimeoutCycles, kTag, kFlushStores>(
             gin, workspace, rank_idx, sm_idx, thread_idx);
     } else {
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(

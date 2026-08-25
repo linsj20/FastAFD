@@ -28,6 +28,14 @@ _NODE_SCOPED_CACHE_ENV_KEYS = (
     "MINISGL_DEEPGEMM_BUILD_DIR",
 )
 
+# These extension builders hold an inter-process flock and publish their .so
+# atomically. Keep one build per node instead of launching the same high-memory
+# nvcc work independently from every GPU actor on that node.
+_LOCKED_BUILD_CACHE_ENV_KEYS = (
+    "MINISGL_DEEPEP_BUILD_DIR",
+    "MINISGL_DEEPGEMM_BUILD_DIR",
+)
+
 _RUNTIME_ENV_KEYS = (
     "CONDA_PREFIX",
     "CONDA_DEFAULT_ENV",
@@ -94,7 +102,7 @@ def _scope_cache_env(
         base_dir = env_vars.get(key)
         if base_dir:
             scoped = os.path.join(base_dir, f"ray-node-{tag}")
-            if rank_tag:
+            if rank_tag and key not in _LOCKED_BUILD_CACHE_ENV_KEYS:
                 scoped = os.path.join(scoped, rank_tag)
             env_vars[key] = scoped
 
@@ -139,6 +147,8 @@ class AfdRuntimeConfig(SchedulerConfig):
     afd_mlp_tp_size: int = 1
     afd_moe_a2a_backend: str = "none"
     afd_moe_runner_backend: str = "auto"
+    afd_model_placement: str = "legacy"
+    afd_max_comm_tokens: int = 1
 
     @property
     def distributed_addr(self) -> str:

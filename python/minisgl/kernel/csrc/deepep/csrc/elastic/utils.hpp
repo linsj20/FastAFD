@@ -15,6 +15,8 @@ static at::cuda::CUDAStream get_global_comm_stream() {
 }
 
 static at::cuda::CUDAStream get_elastic_comm_stream() {
+    if (deep_ep::get_env<int>("MINISGL_DEEPEP_USE_CURRENT_STREAM", 0) != 0)
+        return at::cuda::getCurrentCUDAStream();
     if (deep_ep::get_env<int>("MINISGL_DEEPEP_PER_BUFFER_COMM_STREAM", 0) != 0)
         return at::cuda::getStreamFromPool(true);
     return get_global_comm_stream();

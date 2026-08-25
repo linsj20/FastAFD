@@ -39,13 +39,24 @@ hybrid_combine_impl(nv_bfloat16* x,
                     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
-                    int num_reduced_tokens) {
+                    int num_reduced_tokens,
+                    int64_t* release_turn,
+                    int64_t release_value) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
     constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
+
+    if (release_turn != nullptr and thread_idx == 0) {
+        auto* counter = reinterpret_cast<unsigned long long*>(release_turn + 1);
+        const auto arrived = atomicAdd(counter, 1ull);
+        if (arrived == static_cast<unsigned long long>(kNumSMs - 1)) {
+            atomicExch(counter, 0ull);
+            ptx::st_release_gpu(release_turn, release_value);
+        }
+    }
 
     // Combine vector type selection
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;

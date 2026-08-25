@@ -157,6 +157,24 @@ def _compute_microbatch_offsets(
     return tuple(req_offsets), tuple(token_offsets)
 
 
+def _balanced_microbatch_counts(
+    size: int,
+    num_mb: int,
+    *,
+    remainder_to_last: bool = False,
+) -> tuple[int, ...]:
+    """Split a real request count evenly, with an explicit odd-lane bias."""
+    size = max(0, int(size))
+    num_mb = max(1, int(num_mb))
+    base, remainder = divmod(size, num_mb)
+    if remainder_to_last:
+        first_extra = num_mb - remainder
+        return tuple(
+            base + (1 if mb >= first_extra else 0) for mb in range(num_mb)
+        )
+    return tuple(base + (1 if mb < remainder else 0) for mb in range(num_mb))
+
+
 class CentralizedAfdDpScheduler:
     """One coordinator-owned CPU scheduler state for one attention DP."""
 
@@ -174,6 +192,7 @@ class CentralizedAfdDpScheduler:
         afd_num_mb: int,
         mlp_fanout: int,
         eos_token_id: int,
+        decode_remainder_to_last: bool = False,
     ):
         self.max_running_req = int(max_running_req)
         self.max_seq_len = int(max_seq_len)
@@ -184,6 +203,7 @@ class CentralizedAfdDpScheduler:
         self.afd_num_mb = max(1, int(afd_num_mb))
         self.mlp_fanout = max(1, int(mlp_fanout))
         self.eos_token_id = int(eos_token_id)
+        self.decode_remainder_to_last = bool(decode_remainder_to_last)
         aligned_max_seq_len = ((self.max_seq_len + 31) // 32) * 32
         self.page_table = torch.zeros(
             (self.max_running_req + 1, aligned_max_seq_len),
@@ -431,9 +451,11 @@ class CentralizedAfdDpScheduler:
         base = padded_size // m
         rem = padded_size % m
         slot_sizes = [base + (1 if mb < rem else 0) for mb in range(m)]
-        real_base = real_size // m
-        real_rem = real_size % m
-        real_counts = [real_base + (1 if mb < real_rem else 0) for mb in range(m)]
+        real_counts = _balanced_microbatch_counts(
+            real_size,
+            m,
+            remainder_to_last=self.decode_remainder_to_last,
+        )
         if any(real_counts[mb] > slot_sizes[mb] for mb in range(m)):
             return None
         cursor = 0
