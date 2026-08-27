@@ -47,6 +47,8 @@ REPRO_ROOT=${FASTAFD_REPRO_ROOT:-$HOME/scratch/fastafd_reproduce}
 SOURCE_MANIFEST=${FASTAFD_EXPECTED_SOURCE_MANIFEST:-}
 ALLOW_DIRTY_SOURCE=${FASTAFD_ALLOW_DIRTY_SOURCE:-0}
 EP_VENV_DIR=${FASTAFD_EP_VENV_DIR:-$REPRO_ROOT/envs/minisgl-3c716194-cuda130-vllm-ep.artifact-5179989}
+EXPECTED_HEAD=${FASTAFD_EXPECTED_HEAD:-}
+MOE_BACKEND=${MINISGL_AFD_MOE_BACKEND:-}
 
 [[ "$NODES" =~ ^([1-9]|1[0-8])$ ]]
 [[ "$SUBMIT_QOS" == short || "$SUBMIT_QOS" == normal ]]
@@ -59,6 +61,8 @@ EP_VENV_DIR=${FASTAFD_EP_VENV_DIR:-$REPRO_ROOT/envs/minisgl-3c716194-cuda130-vll
 [[ "$POOL_SELECTION_MODE" == auto || "$POOL_SELECTION_MODE" == isl-desc ]]
 [[ "$AUTO_RELEASE_FAILED" == 0 || "$AUTO_RELEASE_FAILED" == 1 ]]
 [[ "$ALLOW_DIRTY_SOURCE" == 0 || "$ALLOW_DIRTY_SOURCE" == 1 ]]
+[[ -z "$EXPECTED_HEAD" || "$EXPECTED_HEAD" =~ ^[0-9a-f]{40}$ ]]
+[[ -z "$MOE_BACKEND" || "$MOE_BACKEND" == deepep || "$MOE_BACKEND" == megamoe || "$MOE_BACKEND" == megamoe_m2n ]]
 [[ "$TEST_MODE" == 0 || "$TEST_MODE" == 1 ]]
 [[ -x "$CASE_RUNNER" && -f "$POOL_TOOL" && -f "$PLAN" ]]
 if [[ -n "$FOLLOWUP_PLAN" || -n "$FOLLOWUP_POOL" ]]; then
@@ -125,6 +129,7 @@ if [[ "$TEST_MODE" == 0 && "${FASTAFD_BUNDLE_INSIDE:-0}" != 1 ]]; then
         FASTAFD_JOB_DEADLINE_EPOCH="$JOB_DEADLINE_EPOCH" \
         FASTAFD_REPRO_ROOT="$REPRO_ROOT" \
         FASTAFD_SOURCE_REPO="$SOURCE_REPO" \
+        FASTAFD_EXPECTED_HEAD="$EXPECTED_HEAD" \
         FASTAFD_EXPECTED_SOURCE_MANIFEST="$SOURCE_MANIFEST" \
         FASTAFD_ALLOW_DIRTY_SOURCE="$ALLOW_DIRTY_SOURCE" \
         FASTAFD_EP_VENV_DIR="$EP_VENV_DIR" \
@@ -133,6 +138,7 @@ if [[ "$TEST_MODE" == 0 && "${FASTAFD_BUNDLE_INSIDE:-0}" != 1 ]]; then
         FASTAFD_CASE_TIMEOUT_SECONDS="$CASE_TIMEOUT_SECONDS" \
         FASTAFD_AFD_MODEL_PLACEMENT="$MODEL_PLACEMENT" \
         FASTAFD_AFD_NUM_MB="$MAX_NUM_MB" \
+        MINISGL_AFD_MOE_BACKEND="$MOE_BACKEND" \
         FASTAFD_POOL_SELECTION_MODE="$POOL_SELECTION_MODE" \
         FASTAFD_AUTO_RELEASE_FAILED="$AUTO_RELEASE_FAILED" \
         bash "$CONTROL_DIR/run_afd_bundle.sh"
@@ -281,7 +287,7 @@ PY
         continue
     fi
 
-    IFS=$'\t' read -r case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays < <(
+    IFS=$'\t' read -r case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays case_memory_ratio case_num_pages case_kv_capacity case_require_capacity_max case_expert_weight_dtype < <(
         python3 - "$action" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -289,10 +295,33 @@ r = c["case"]
 expected = f"qwen3 {r['context_spec']} {r['batch_per_attention_dp_lane']} {r['normalized_af_ratio']}:1 {r['attention_tp']} {r['ffn_ep']}"
 if r["run_afd_argv"] != expected:
     raise SystemExit("run_afd_argv drift")
-print("\t".join([c["case_id"], r["context_spec"], r["batch_per_attention_dp_lane"], r["normalized_af_ratio"], r["attention_tp"], r["ffn_ep"], r["prompt_mode"], r["allocated_trays"]]))
+memory = [
+    r.get("afd_memory_ratio", ""), r.get("afd_num_pages", ""),
+    r.get("afd_kv_capacity_tokens", ""), r.get("require_capacity_max", ""),
+]
+if not all(memory):
+    raise SystemExit("per-case AFD memory contract is incomplete")
+precision = r.get("megamoe_expert_weight_dtype", "")
+if precision not in {"fp8", "fp4"}:
+    raise SystemExit("per-case MegaMoE expert weight dtype must be fp8 or fp4")
+if not c["case_id"].endswith(f"-{precision}"):
+    raise SystemExit("case_id must end with its MegaMoE expert weight dtype")
+print("\t".join([
+    c["case_id"], r["context_spec"], r["batch_per_attention_dp_lane"],
+    r["normalized_af_ratio"], r["attention_tp"], r["ffn_ep"],
+    r["prompt_mode"], r["allocated_trays"], *memory, precision,
+]))
 PY
     )
     [[ "$claimed_trays" == "$NODES" ]]
+    [[ "$case_memory_ratio" =~ ^0\.[0-9]*[1-9][0-9]*$|^1(\.0+)?$ ]]
+    [[ "$case_num_pages" == none || "$case_num_pages" =~ ^[1-9][0-9]*$ ]]
+    [[ "$case_kv_capacity" =~ ^[1-9][0-9]*$ ]]
+    [[ "$case_require_capacity_max" == 0 || "$case_require_capacity_max" == 1 ]]
+    [[ "$case_expert_weight_dtype" == fp8 || "$case_expert_weight_dtype" == fp4 ]]
+    if [[ "$case_num_pages" == none ]]; then
+        case_num_pages=""
+    fi
     case_num_mb=$MAX_NUM_MB
     if (( case_num_mb > batch )); then
         case_num_mb=$batch
@@ -321,14 +350,22 @@ PY
         FASTAFD_REPRO_ROOT="$REPRO_ROOT" \
         FASTAFD_RESULTS_ROOT="$TASK_ROOT/results" \
         FASTAFD_SOURCE_REPO="$SOURCE_REPO" \
+        FASTAFD_EXPECTED_HEAD="$EXPECTED_HEAD" \
         FASTAFD_EXPECTED_SOURCE_MANIFEST="$SOURCE_MANIFEST" \
         FASTAFD_ALLOW_DIRTY_SOURCE="$ALLOW_DIRTY_SOURCE" \
         FASTAFD_CUDA_METRIC_PLAN="$PLAN" FASTAFD_CUDA_METRICS_ROOT="$TASK_ROOT/report/metrics" \
         FASTAFD_CUDA_EXTRACT_TEMP_ROOT="$TASK_ROOT/cuda_extract/tmp" \
         FASTAFD_CASE_ORDINAL="$ordinal" FASTAFD_CASE_PORT_SLOT="$ordinal" \
-        FASTAFD_MAX_TOTAL_TRAYS=18 FASTAFD_REQUIRE_CAPACITY_MAX=0 \
+        FASTAFD_CASE_ID="$case_id" \
+        FASTAFD_MAX_TOTAL_TRAYS=18 \
+        FASTAFD_REQUIRE_CAPACITY_MAX="$case_require_capacity_max" \
+        FASTAFD_AFD_MEMORY_RATIO="$case_memory_ratio" \
+        FASTAFD_AFD_NUM_PAGES="$case_num_pages" \
+        FASTAFD_AFD_KV_CAPACITY_TOKENS="$case_kv_capacity" \
         FASTAFD_AFD_MODEL_PLACEMENT="$MODEL_PLACEMENT" \
         FASTAFD_AFD_NUM_MB="$case_num_mb" \
+        MINISGL_AFD_MOE_BACKEND="$MOE_BACKEND" \
+        MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$case_expert_weight_dtype" \
         PROMPT_MODE="$prompt_mode" \
         RUN_DIR="$run_dir" JOB_SCRIPT="$CASE_RUNNER" \
         bash "$CASE_RUNNER" qwen3 "$context" "$batch" "$ratio:1" "$attention_tp" "$ffn_ep"

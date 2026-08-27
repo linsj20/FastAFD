@@ -19,7 +19,6 @@ from minisgl.distributed import (
     try_get_ep_info,
     try_get_tp_info,
 )
-from minisgl.env import afd_env
 from minisgl.message import BaseTokenizerMsg
 from minisgl.utils import (
     ZmqPullQueue,
@@ -39,7 +38,12 @@ from .afd_protocol import (
     AfdTopology,
     AfdWorkerReadyReply,
 )
-from .afd_support import AfdRuntimeConfig, flush_log_lines, log_line
+from .afd_support import (
+    AfdRuntimeConfig,
+    flush_log_lines,
+    log_line,
+    resolve_afd_moe_backend,
+)
 
 __all__ = ["BaseAfdWorker"]
 
@@ -160,12 +164,16 @@ class BaseAfdWorker:
             self.log_path = str(Path(log_dir) / f"{role}_rank{tp_rank}.log")
         ray_gpu_ids = tuple(ray.get_gpu_ids())
         initial_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-        use_megamoe_device_binding = afd_env("MOE_BACKEND", "deepep") == "megamoe_m2n"
+        moe_backend = resolve_afd_moe_backend(model_placement)
+        use_megamoe_device_binding = (
+            moe_backend == "megamoe_m2n"
+            or (moe_backend == "megamoe" and role == "mlp")
+        )
         device_index = 0
         if use_megamoe_device_binding:
             if torch.cuda.is_initialized():
                 raise RuntimeError(
-                    "megamoe_m2n requires CUDA_VISIBLE_DEVICES to be cleared before "
+                    f"{moe_backend} requires CUDA_VISIBLE_DEVICES to be cleared before "
                     "CUDA is initialized"
                 )
             if ray_gpu_ids:
@@ -182,7 +190,7 @@ class BaseAfdWorker:
         log_line(
             self.log_path,
             f"[{self.role} rank={self.tp_rank}] cuda_binding "
-            f"backend={afd_env('MOE_BACKEND', 'deepep')} "
+            f"backend={moe_backend} "
             f"initial_cvd={initial_cvd!r} effective_cvd={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
             f"ray_gpu_ids={ray_gpu_ids} device={self.device}",
             flush=True,
@@ -496,7 +504,7 @@ class BaseAfdWorker:
         adapter_lanes = min(2, int(self.afd_num_mb))
         arch0 = getattr(mc, "architectures", [""])[0]
         model_extra = getattr(mc, "model_extra", {})
-        self._afd_moe_backend = afd_env("MOE_BACKEND", "deepep")
+        self._afd_moe_backend = resolve_afd_moe_backend(self.model_placement)
         if self._afd_moe_backend == "megamoe_m2n":
             os.environ.setdefault("MINISGL_MEGAMOE_AG_SMS", "24")
             n_shared_experts = int(model_extra.get("n_shared_experts", 0) or 0)

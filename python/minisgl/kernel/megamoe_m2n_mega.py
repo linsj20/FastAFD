@@ -336,6 +336,59 @@ def requant_qwen_fp8_weights_per32(
     return w_new, sf_packed
 
 
+def requant_qwen_fp8_weights_to_fp4(
+    w_fp8: torch.Tensor,
+    block_scales: torch.Tensor,
+    *,
+    block: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Qwen block-scaled FP8 weights -> packed per-32 MXFP4 weights."""
+    if w_fp8.dtype != torch.float8_e4m3fn or w_fp8.dim() != 3:
+        raise RuntimeError(
+            "MegaMoE FP4 conversion expects [E,N,K] FP8 weights, "
+            f"got shape={tuple(w_fp8.shape)} dtype={w_fp8.dtype}"
+        )
+    experts, n, k = map(int, w_fp8.shape)
+    if k % 32 != 0:
+        raise RuntimeError(
+            "MegaMoE FP4 conversion requires K divisible by 32, "
+            f"got shape={tuple(w_fp8.shape)}"
+        )
+    expected_scale_shape = (
+        experts,
+        align(n, block) // block,
+        align(k, block) // block,
+    )
+    if tuple(block_scales.shape) != expected_scale_shape:
+        raise RuntimeError(
+            "MegaMoE FP4 conversion requires 128x128 source scales: "
+            f"weight={tuple(w_fp8.shape)} scale={tuple(block_scales.shape)} "
+            f"expected_scale={expected_scale_shape}"
+        )
+
+    packed = torch.empty(
+        (experts, n, k // 2), dtype=torch.int8, device=w_fp8.device
+    )
+    scales = torch.empty(
+        (experts, n, k // 32), dtype=torch.float32, device=w_fp8.device
+    )
+    for expert in range(experts):
+        source_scale = block_scales[expert].float()
+        expanded = torch.repeat_interleave(source_scale, block, dim=0)[:n]
+        expanded = torch.repeat_interleave(expanded, block, dim=1)[:, :k]
+        dequantized = w_fp8[expert].float() * expanded
+        packed_expert, scale_expert = per_token_cast_to_fp4(
+            dequantized, use_ue8m0=True, gran_k=32
+        )
+        packed[expert].copy_(packed_expert)
+        scales[expert].copy_(scale_expert)
+        del expanded, dequantized, packed_expert, scale_expert
+    transformed_scales = _dg.transform_sf_into_required_layout(
+        scales, n, k, (1, 32), experts
+    )
+    return packed, transformed_scales
+
+
 def dequant_fp8_per32(w_fp8: torch.Tensor, sf32: torch.Tensor) -> torch.Tensor:
     """Dequantize [N, K] fp8 with per-32 float scales [N, K/32] (reference)."""
     return w_fp8.float() * torch.repeat_interleave(sf32.float(), 32, dim=1)
@@ -393,5 +446,6 @@ __all__ = [
     "mega_moe_m2n_eg",
     "per_token_cast_to_fp4",
     "requant_qwen_fp8_weights_per32",
+    "requant_qwen_fp8_weights_to_fp4",
     "transform_weights_for_mega_moe",
 ]

@@ -168,6 +168,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--case-id", required=True)
     parser.add_argument("--nsys", type=Path, required=True)
     parser.add_argument(
         "--cuda-span-module", "--cuda-module", dest="cuda_span_module",
@@ -198,7 +199,7 @@ def load_cuda_span_module(path: Path):
 
 
 def load_matching_plan(
-    path: Path, data: dict[str, object]
+    path: Path, data: dict[str, object], case_id: str
 ) -> dict[str, str]:
     ratio = int(str(data["normalized_attention_to_ffn_active_gpu_ratio"]).split(":")[0])
     ffn_ep = int(data["ffn_ep_size"])
@@ -210,7 +211,10 @@ def load_matching_plan(
         shape = f"r{int(context_range['min'])}-{int(context_range['max'])}"
     else:
         shape = f"i{int(data['context_tokens'])}"
-    case_id = f"{shape}-fep{ffn_ep}-r{ratio}-atp1-b{batch}"
+    default_case_id = f"{shape}-fep{ffn_ep}-r{ratio}-atp1-b{batch}"
+    precision = str(data.get("megamoe_expert_weight_dtype", ""))
+    if case_id not in {default_case_id, f"{default_case_id}-{precision}"}:
+        raise RuntimeError(f"case ID does not match result: {case_id}")
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         if reader.fieldnames and "rerun_index" in reader.fieldnames:
@@ -546,7 +550,7 @@ def main() -> None:
 
     span_module = load_cuda_span_module(args.cuda_span_module)
     data = json.loads(args.result.read_text())
-    plan = load_matching_plan(args.plan, data)
+    plan = load_matching_plan(args.plan, data, args.case_id)
     max_outlier_count = int(
         plan.get("required_max_outliers", MAX_OUTLIER_COUNT)
     )

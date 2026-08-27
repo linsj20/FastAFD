@@ -1,5 +1,210 @@
 # Project Memory
 
+## Surgical pre-FFN restoration with FP8 validation (2026-08-27 PDT)
+
+“Pre-FFN optimization” is a component boundary, not a whole-commit boundary.
+The authoritative FFN target remains historical commit `24b90c0`: A7:F1/EP4
+job `6522967` measured 29.358190933 ms / 178.825733 TPS per active GPU, and
+the same compute tree's A1 output passed unchanged alignment job `6520958` at
+408/408 top-1 tokens. The initial whole-range reconstruction `d0a7eaf` was
+therefore superseded; its queued smoke `6575467` was canceled at zero elapsed
+time and used no GPU.
+
+Remote branch `codex/fmha-megamoe-fp4-preopt-ffn-20260826`, worktree
+`worktrees/fmha_megamoe_fp4_preopt_ffn_20260826`, starts from current
+FP8xFP4/per-case-memory head `a61e5d4`. Clean commit `1b7038e` surgically
+restores only the MegaMoE FFN kernel, routing, and FFN instrumentation surface.
+The core C++ API/JIT/heuristics/CUDA/TMA/layout/PTX/top-k files are byte-exact
+to `24b90c0`; the runtime/wrapper/adoption files are byte-exact to minimal
+FP8xFP4 commit `47a0672`; and the memory contract test is byte-exact to
+`54055a4`. Unrelated current launch validation, DeepGEMM build-dir override,
+final-snapshot cleanup, bundle execution, and exact per-case batch-7 memory
+propagation remain from `a61e5d4`. Route-stat, fused-router, concurrent-lane,
+and A7 scheduler-tuning plumbing are absent.
+
+Focused contracts pass 20/20, launcher syntax and `git diff --check` pass.
+Initial validation mistakenly selected optional FP8xFP4. Its smoke `6576460`
+passed, while one preflight and bootstrap attempt failed closed before model
+execution due missing derived venv and image paths. FP4 A7 job `6577407`
+completed at 25.8833942 ms / 202.832749 TPS per active GPU, but the user
+clarified that it is not comparable to the target because validation must use
+the same FP8xFP8 MegaMoE kernel as `6522967`. Its 32 Nsight reports are retained
+locally under `scratch/qwen3_ffn_overheads_20260820/`
+`fmha_megamoe_fp4_preopt_ffn_20260826/a7_ep4_b6_gate_1b7038e/trace/nsys/`
+(33,627,949 bytes, checksum parity). The active FP4 A1 job `6579084` was
+canceled at 8:35 before producing a sample.
+
+FP8xFP4 remains available in the code, but all acceptance runs now explicitly
+set `MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp8`. Corrected A7 dry and full
+non-submitting validation select FP8xFP8, EP4, MB2 3+3, ratio 0.82, 839,424 KV
+tokens, exact batch 6, eight trays/32 GPUs, and one warmup plus 15 measured
+steps. Corrected short-QoS job `6579568` completed `0:0` in 21:52. Its strict
+metric is 28.738912667-ms mean / 28.676994-ms median, 15/15 samples, zero
+outliers, and 182.679145 TPS per active GPU. This is 0.619278266 ms / 2.1094%
+faster than historical pre-FFN job `6522967`, so the low-cost proxy passes.
+All 32 Nsight reports are copied locally under the matching task directory
+(33,045,638 bytes). Two-tray FP8 A1 alignment-source job `6581273` completed
+`0:0` in 19:15 and produced 24 prompts / 408 generated tokens with explicit
+FP8xFP8 provenance. Its eight Nsight reports are copied locally (10,286,425
+bytes). Unchanged one-node alignment job `6582345` completed `0:0` in 12:51:
+24 prompts / 408 tokens, top-1/top-10/top-100 all 1.0, and average/maximum rank
+both 1.0. The corrected FP8 gates therefore pass.
+
+The A7 EP4 FP8 result is a low-cost non-regression proxy, not an exact-value
+reproduction gate. Recovery of A7 EP8 and A8 EP8 FP8 performance is the final
+goal, but do not submit those large, slow-to-queue allocations directly;
+establish the smaller proxy and alignment evidence first.
+
+The final measurement contract is exactly eight EP8 results from exactly two
+jobs: one 16-tray A7 bundle and one 18-tray A8 bundle, each running batch 6/7
+with both MegaMoE FP8xFP8 and FP8xFP4. Clean remote matrix commit `7c1491e`
+adds only per-case precision, precision-qualified case IDs, and fail-fast
+per-case memory validation to `1b7038e`. All 21 focused tests, shell syntax,
+and diff checks pass. All eight clean-head dry runs and full non-GPU preflights
+pass. Batch 6 is 0.82 / no page override / 839,424 tokens / MB2 3+3; batch 7
+is 0.90 / 14,344 pages / 918,016 tokens / MB2 3+4 with 64 tokens headroom.
+Both pools contain exactly four untouched rows. Short QoS permits two hours,
+64 nodes, and two concurrent jobs, so each final bundle will use a two-hour
+allocation with a 30-minute watchdog per case. Exactly two final jobs are now
+submitted: `6583163` requests 16 trays for the four A7 rows and `6583164`
+requests 18 trays for the four A8 rows. A7 started at 01:19:29 PDT on one
+contiguous NVL72 block and first claimed b7 FP8xFP8 with the correct 0.90 /
+14,344-page / 918,016-token contract. A8 remains pending for resources with a
+current scheduler estimate near 03:05 PDT. No additional EP8 job exists.
+
+A7 b7 FP8xFP8 completed first with a valid strict metric: 28.373346933-ms
+mean, 28.301796-ms median, 29.368612-ms maximum, 15/15 samples, zero outliers,
+and 215.871607 TPS/active GPU. This is 0.0065032 ms / 0.0229% faster than
+historical `24b90c0` job `6531588`, so the intended EP8 FP8 performance is
+recovered. Its 64 Nsight reports are copied locally (65,118,185 bytes). A7
+then completed b7 FP8xFP4 at 27.499724800-ms mean, 27.437888-ms median,
+28.423936-ms maximum, 15/15 samples, zero outliers, and 222.729502 TPS/active
+GPU. Its 64 Nsight reports are copied locally with checksum parity (66,373,359
+bytes). A7 b6 FP8xFP8 then completed at 25.354510667-ms mean, 25.303519-ms
+median, 26.139264-ms maximum, 15/15 samples, zero outliers, and 207.063748
+TPS/active GPU. It is 0.106900333 ms / 0.419852% faster than historical
+`24b90c0` job `6531588`; its 64 Nsight reports are copied locally with checksum
+parity (63,811,452 bytes). The allocation finally claimed b6 FP8xFP4 with the
+correct 0.82 / no-page-override / 839,424-token contract and completed at
+24.037447667-ms mean, 23.977343-ms median, 24.846303-ms maximum, 15/15 samples,
+zero outliers, and 218.409212 TPS/active GPU. Its 64 Nsight reports are copied
+locally with checksum parity (62,343,765 bytes). A7 job `6583163` completed
+`0:0` in 1:22:47 with all four cases and zero failures. The complete A7 trace
+set is 256 reports / 257,646,761 bytes. A8 job `6583164` started at 03:25:47
+PDT on contiguous block `nvl72110-T[01-18]` and first claimed b7 FP8xFP8 with
+the corrected 0.90 / 14,344-page / 918,016-token contract. It completed at
+28.744260067-ms mean, 28.676160-ms median, 29.787231-ms maximum, 15/15 samples,
+zero outliers, and 216.468339 TPS/active GPU: 0.014036933 ms / 0.048810% faster
+than historical `24b90c0` job `6531587`. Its 72 Nsight reports are copied
+locally with checksum parity (71,862,352 bytes). A8 next claimed b7 FP8xFP4
+with the same corrected memory contract and completed at 27.950053667-ms mean,
+27.868192-ms median, 29.048536-ms maximum, 15/15 samples, zero outliers, and
+222.619330 TPS/active GPU. Its 72 Nsight reports are copied locally with
+checksum parity (73,696,333 bytes). A8 then claimed b6 FP8xFP8 with the correct
+0.82 / no-page-override / 839,424-token contract and completed at 25.694954600-
+ms mean, 25.635168-ms median, 26.638844-ms maximum, 15/15 samples, zero
+outliers, and 207.563446 TPS/active GPU. It is 0.000613400 ms / 0.002387%
+faster than historical `24b90c0` job `6531587`; its 72 Nsight reports are
+copied locally with checksum parity (72,910,726 bytes). The eighth and final
+case, A8 b6 FP8xFP4, completed with the same corrected batch-6 contract at
+24.316745067-ms mean, 24.250368-ms median, 25.236064-ms maximum, 15/15 samples,
+zero outliers, and 219.327600 TPS/active GPU. Its 72 Nsight reports are copied
+locally with checksum parity (73,813,231 bytes). A8 job `6583164` completed
+`0:0` in 1:27:06 with all four cases and zero failures. The complete final
+campaign therefore used exactly jobs `6583163` and `6583164`, produced all
+eight required EP8 results, and copied all 544 Nsight reports / 549,929,403
+bytes locally with checksum parity; all eight metric JSON files also match the
+remote copies. A second consolidated copy is under
+`scratch/qwen3_ffn_overheads_20260820/final_ep8_8case_nsys_20260827/`, with
+one readable config-named directory per case (for example,
+`A7_F1_EP8_B6_MegaMoE_FP8xFP8`) and no job-ID directory names. Remote checksum
+verification passes for all 544 reports / 549,929,403 bytes.
+
+The `fmha_only` handoff is one linear commit atop `linsj20/fmha_only` commit
+`393bc98`, with no merge commit and no inherited OCI experimental history.
+Its source, scripts, and tests are byte-identical to validated commit
+`7c1491e` (tree `022e3994867f6eabd3692d7dbdaeea06207b7958`), which produced
+jobs `6583163` and `6583164`; only project-memory Markdown differs. The commit
+records the surgical FFN restoration, mixed FP8xFP8/FP8xFP4 bundle support,
+correct batch-7 memory contract, all eight results, and consolidated Nsight
+trace provenance. None of the older mixed-worktree code is retained.
+
+## FP8xFP4 pre-tuning baseline rerun (2026-08-26 PDT)
+
+The user rejected the later K256/128-SM/single-wave tuning for the A7/A8 EP8
+study. Pending 18-tray A8 job `6562900` was canceled before allocation. Remote
+branch `codex/fmha-megamoe-fp4-ep8-baseline-20260826` now starts from clean
+pre-tuning checkpoint `24b90c0` and adds only FP4 precision plumbing,
+production-weight smoke coverage, exact per-case bundle memory, and FP4-only
+two-lane launch budgeting; FP8 retains the old 150-SM launch. Clean head is
+`bfda796`. Contracts pass 20/20. Four-GPU smoke `6572843` caught a host
+function-pointer signature mismatch during fresh compilation and was canceled
+at 3:11; fix `bfda796` then passed smoke `6572969` in 2:29 with empty stderr,
+cosine 0.975472, and finite exact-Qwen EP4 outputs at 3 and 64 rows.
+
+A7:F1/EP4/128K/b6 gate `6573176` completed `0:0` in 22:35 on `short`, eight
+trays, and a 30-minute cap. Its valid 15/15 strict metric is 33.968444467 ms
+and 154.555208 TPS/active GPU, 4.610253533 ms / 15.70% slower than clean
+pre-tuning FP8xFP8 job `6522967` at 29.358190933 ms / 178.825733 TPS/GPU.
+The FP4-only two-lane safety contract divides 128 runtime SMs into 64 SMs per
+lane; the captured A7 graph serializes those lanes, so this reproduces the
+previously rejected lane-sharing regression instead of useful overlap. The
+gate therefore failed and both EP8 submissions remain withheld. Fresh A7/A8
+EP8 plans are under
+`fmha_megamoe_fp4_ep8_baseline_20260826/a7_a8_ep8_b6_b7_bundle_bfda796/`.
+Both pools initialize with two pending rows. All four dry runs pass: b6 is
+0.82 / 839,424 KV tokens / MB2 3+3; b7 is 0.90 / 14,344 pages / 918,016 KV
+tokens / MB2 3+4 with exact-max-batch enforcement. No EP8 job is submitted.
+
+## Accepted same-rank MegaMoE FP8xFP4 precision (2026-08-26 PDT)
+
+See `CODEX_PROJECT_qwen3_ffn_overheads.md` for the authoritative record.
+Remote executable commit `6c210cf` adds an explicit FP8-activation/MXFP4-
+weight option while retaining FP8xFP8 as the default. Exact
+A1:F1/EP4/128K/b6/MB2 job `6561851` completed on `short` within its 30-minute
+limit. Unchanged strict extraction job `6562231` retained 15/15 steps with no
+outliers and measured 22.689653667 ms, 0.701194333 ms / 2.997729% faster than
+accepted FP8xFP8 job `6520395` at 23.3908480 ms. Unchanged alignment job
+`6562471` passed all 408 tokens with top-1/top-10/top-100 agreement and
+average/maximum rank all 1.0. All eight raw job-`6561851` Nsight reports are
+copied locally with verified SHA-256 parity under
+`scratch/qwen3_ffn_overheads_20260820/fmha_megamoe_fp4_20260826/`
+`exact_a1_6c210cf_lanes2/trace/nsys/`. The FP8xFP4 goal is complete.
+
+The active FP8xFP4 EP8 scaling follow-up uses clean remote commit `a61e5d4`,
+which restores explicit per-case memory propagation in the reusable bundle.
+All four dry runs pass: batch 6 uses 0.82 / 839,424 tokens / MB2 3+3; batch 7
+uses 0.90 / 14,344 pages / 918,016 tokens / MB2 3+4. Short-QoS jobs `6562899`
+(A7:F1, 16 trays) and `6562900` (A8:F1, 18 trays) each run batch 7 then batch
+6 with a one-hour allocation cap and 30-minute per-case watchdog. Both select
+FMHA-only MegaMoE FP8xFP4. Results root is
+`fmha_megamoe_fp4_20260826/a7_a8_ep8_b6_b7_bundle_a61e5d4/`.
+Job `6562899` completed `0:0` in 46:11, but only A7/EP8 batch 7 produced a
+valid metric: 28.942748933 ms strict CUDA mean, 28.890207-ms median, 15/15
+samples, zero outliers, and 211.624681 TPS/active GPU. This is 1.983445%
+slower than historical FP8xFP8 job `6531588`. Batch 6 received the correct
+0.82 / 839,424-token contract but failed during first eager prefill with an
+asynchronous CUDA launch failure, so it has no performance result. A8 job
+`6562900` remains pending for resources.
+
+## Active remote latency optimization (2026-08-24 PDT)
+
+The user reopened optimization and requires ordinary remote Git commits for every rollback point; local Git remains untouched. Work is on branch codex/qwen3-ffn-latency-20260824. Commit 0a6a4a3 snapshots aligned job 6474505, whose accepted A1:F1 result remains 25.7321745 ms E2E, 25.6797822 ms strict CUDA, and perfect alignment in job 6474804. Trace export 6480445 completed; accepted-versus-fused analysis localizes the fused-turn regression to slower fused add-RMSNorm/FP8 work and added attention/model readiness delay, so that exact-two-stream path remains rejected.
+
+The first new isolated candidate, commit 0ae36e8, fused steady-state input RMSNorm with QKV FP8 quantization while preserving the accepted CUDA-event and DeepEP cadence. Remote CPU contracts passed 60/60. Exact short-queue one-hour job 6481196 completed 15/15 with zero outliers but regressed to 26.1607085 ms E2E and 26.1054416 ms strict CUDA, respectively +0.428534 ms/+1.665% and +0.4256594 ms/+1.658% versus job 6474505. It is rejected without alignment and was restored by remote revert commit 487bddd. The second isolated candidate, commit 6d4b686, amortized each system fence across eight grid-stride 64-bit publication tasks. Remote CPU contracts passed 60/60. Exact job 6481517 completed 15/15 with zero outliers but regressed to 26.56672 ms E2E and 26.4969301 ms strict CUDA, +0.8345455 ms/+3.243% and +0.8171479 ms/+3.182% versus job 6474505. Reduced publication parallelism is rejected, the 16-tray A15 run was intentionally skipped, and remote revert commit c1c7e7a restores baseline. A CPU-only trace export was not submitted because short QoS rejected it with QOSMinGRES; no GPU was wasted on post-processing. The third isolated candidate, commit cd78af5, reduces DeepEP from three 8-CTA clusters to one and raises the complementary DeepGEMM budget from 128 to 144 SMs without changing collective protocol. Remote CPU contracts passed 60/60. Exact A1 job 6481772 completed 15/15 with zero outliers but regressed to 26.139278 ms E2E and 26.0721142 ms strict CUDA, +0.4071035 ms/+1.582% and +0.392332 ms/+1.528% versus job 6474505. Eight communication SMs are therefore rejected as a universal A1 policy. Exact A15:F1/b6 high-fan-in job 6481976 completed 15/15 with zero outliers at 33.261404 ms E2E and 33.286293333 ms strict CUDA, with a 6.945% strict dominant-range spread and 5.882% max/median separation. Against exact no-mode job 6263396 at 30.9095675 ms E2E and 30.752484 ms strict CUDA, the gaps are +2.3518365 ms/+7.609% and +2.533809333 ms/+8.239%; this candidate is not competitive and alignment is withheld. The eight-SM result is retained only as high-fan-in evidence. The production-shape four-GPU 8/16/24 DeepEP-SM sweep is complete. Jobs 6483946-6483948 failed before container start because the first submission used an incorrect image path. Retry jobs 6484042 and 6484043 then exposed a singular 45-row deterministic smoke input, and pending job 6484044 was canceled before allocation; commit 41ff981 makes that input full rank and passes 60/60 CPU contracts, with independent 16/24-SM cherry-picks 38bc6d8 and 824e295. Valid short-QoS one-hour jobs 6484104/6484105/6484106 all passed identical BF16, FP8, and fused-router correctness bounds. Their production fused-router staged means are respectively 0.337639/0.327233/0.318441 ms for 24/16/8 communication SMs, so eight SMs is 2.687% faster than sixteen and 5.686% faster than twenty-four for the exact 45-row A15 MoE shape. This isolates eight SMs as the best high-fan-in split in this family, while exact A1 job 6481772 still requires retaining the accepted 24-SM policy for low fan-in. Adaptive commit a8eb982 selects 8/144 communication/compute SMs at fan-in >=8 and 24/128 below it, supports only complete 8-CTA cluster counts, and passes 60/60 CPU contracts. Short one-hour smokes 6484308 and 6484309 pass the 45-row 8/144 and 3-row 24/128 branches with all BF16, FP8, and fused-router correctness checks. Exact A1 job 6484425 then selected 24/128 on all four model ranks and produced a durable 24-prompt/408-token sample with 25.9834295 ms raw E2E median, +0.251255 ms/+0.976% versus accepted job 6474505. Its strict post-processing alone failed because the supplied Pareto plan contains EP2 rather than this EP4 A1 row; all eight raw reports remain durable and strict recovery will be piggybacked on the next required GPU validation, so no A1 acceptance decision is made from the raw median alone. The standard /home fastafd_reproduce symlink was restored to the existing Lustre workspace so the pinned model-profile manifest resolves without bypassing validation.
+
+
+The one-wave publication attempt is rejected as a production no-op. Wrapper job 6485116 failed before srun because sbatch --wrap used POSIX sh with pipefail; retry 6485203 reached fresh extension compilation and caught the out-of-scope CUDA_CHECK use before any workload. Fix commit 9be35c4 then passed combined short/one-hour job 6485226: the 8,192-row four-GPU transport smoke completed and recovered adaptive A1 strict metric 25.915859667 ms with 15/15 samples and zero outliers, +0.919% on the unchanged low-fan-in path. Exact A15:F1/b6 job 6485295 completed in 33:53 at 31.714345 ms E2E and 31.688765867 ms strict CUDA, 15/15 and zero outliers. Although this is 4.651%/4.799% faster than run 6481976, it remains 2.604%/3.045% behind no-mode job 6263396. Fresh rank-61 SQLite proves both 6481976 and 6485295 launched all 3,008 QKV publications as publish_qkv_kernel<128,false,true> with the same 360x256 geometry: ready_edges was one, so the multi-ready-only cap never executed and the observed difference is run/node variance, not a causal win. Reverts 78f6ec8 and 5b30bbe restore the adaptive baseline; the direct remote CPU contract passes 60/60 and Git is clean. Comparative SQLite is under analysis/a15_old_vs_twoline outside the source worktree.
+
+
+Corrected commit 386e5af passed decode intent explicitly into QKV publication so graph decode alone used one device wave while eager prefill kept the proven 1,024-CTA bound and A1 remained naturally below the cap. The remote CPU contract passed 60/60; fresh production-shape four-GPU job 6486271 passed rows=45, nine iterations, and qkv_decode=1 on short with a one-hour limit. Exact A15:F1/b6 job 6486377 completed in 32:30 at 32.520627 ms E2E and 32.2289626 ms strict CUDA, 15/15 and zero outliers. Fresh rank-61 SQLite proves the intended causal signature: all 3,008 publish_qkv_kernel<128,false,true> launches changed from 360x256 to 152x256. However, versus the recent unchanged-path job 6485295, E2E regressed 0.806282 ms/2.542%, strict regressed 0.540197 ms/1.705%, and QKV kernel mean increased from 20.923 to 21.952 us/4.918%. The candidate remains 5.212%/4.801% behind no-mode job 6263396 and is rejected; revert baf1cdf restores the adaptive baseline and passes 60/60. Publication parallelism should not be reduced further.
+
+
+System-atomic completion candidate 51b07a0 used an explicit high-fan-in decode-only specialization while preserving the accepted low-fan-in and eager-prefill paths. Four-GPU production-shape smoke job 6487241 passed 100 exact iterations at rows=45, sources=15, decode=1. Exact short-QoS one-hour A15:F1/b6 job 6487343 completed 15/15 with zero outliers at 33.4261575 ms E2E and 33.360445733 ms strict CUDA. Rank-61 SQLite confirms all 3,008 launches used publish_qkv_kernel<128,false,true,true> at the unchanged 360x256 geometry. QKV kernel total was 69.303433 ms, 10.116% slower than recent unchanged-path job 6485295; strict latency regressed 1.671679867 ms/5.275% versus that control, 2.607961733 ms/8.480% versus exact no-mode job 6263396, and 0.0741524 ms/0.223% versus earlier 8-SM job 6481976. The candidate is rejected; remote revert commit 1130048 restores the adaptive baseline and the direct remote suite passes 60/60. The QKV publication-parallelism and completion-atomic family is closed.
+
+
+Placement-crossover job 6488053 pinned remote commit 5ee5ea9 and completed the missing exact A8:F1/ATP1/FEP4/b6 FMHA-only point on short with a one-hour limit. It completed 0:0 in 26:02 with 31.2774395 ms E2E, 31.238424333 ms strict CUDA, 15/15 samples, zero outliers, 3.971% dominant-range spread, and 170.729909 strict TPS/GPU. Optimized legacy A8 control job 6265476 is 30.897381 ms E2E and 30.7433556 ms strict CUDA, so FMHA-only loses 0.3800585 ms/1.230% E2E and 0.495068733 ms/1.610% strict. Together with the accepted A1 FMHA-only win and the A15 legacy win, this establishes A8 as the measured placement crossover. Remote commit 2c5df33 adds the explicit qwen3-128k-adaptive runner policy for exactly Qwen3 128K/b6/ATP1/FEP4/MB2: ratios below eight resolve to fmha-only and ratios at or above eight resolve to legacy; all other workload contracts fail fast. Results record requested placement, resolved placement, and policy. A1/A8 dry runs selected the intended modes, a batch-5 dry run failed before submission, bash syntax and diff checks pass, and the full remote suite passes 60/60.
+
 ## Current stop state (2026-08-24 PDT)
 
 The user ended the exact-two-FFN-stream follow-up and selected the staged
@@ -13,11 +218,23 @@ evidence as 25.7321745 ms E2E, 25.6797822 ms strict CUDA, 116.585561 TPS/GPU,
 the event-created segments; this topology limitation is accepted for the stop
 state. Do not resume the two-stream experiments unless the user reopens them.
 
-Newer work has reopened the general FFN/communication optimization path.  The
-authoritative current checkpoint and active validation state are in
-`CODEX_PROJECT_qwen3_ffn_overheads.md`; its aligned NCCL plus minimal
-DeepGEMM-teardown job `6502925` at remote commit `bc9ab7f` supersedes this
-historical two-stream stop state.
+Newer work completed the FMHA-only same-rank MegaMoE FFN optimization path on
+2026-08-26.  The authoritative checkpoint and final validation record are in
+`CODEX_PROJECT_qwen3_ffn_overheads.md`.  The retained A7 exact result is
+27.6082989333 ms strict CUDA in current-code job `6553739`, versus
+28.1574149333 ms at pre-final-FFN commit `04fb32b` and 29.3581909333 ms at the
+earlier baseline.  The current result retains 15/15 samples, zero outliers,
+190.160213 strict TPS/GPU, and attention as the critical role on all 15 steps;
+mean model span improves 28.0479202 -> 27.4905426 ms versus `04fb32b`.  The
+final isolated M32 target routes reach 80.446--80.477 us.  Official A1
+alignment job `6552212` scored 24 prompts / 408 tokens with top-1/top-10/
+top-100 and average/maximum rank all 1.0.  Remote clean head `202694a` contains
+the winning policy, launcher cleanup, and final history.  The user-defined
+terminal A1 gate passes, so this goal remains closed unless explicitly
+reopened.  All 32 raw job-`6539640` Nsight reports are copied locally under
+`scratch/qwen3_ffn_overheads_20260820/best_a7_job6539640_04fb32b/nsys/`, and
+all 32 final job-`6553739` reports are under
+`scratch/qwen3_ffn_overheads_20260820/latest_a7_job6553739_202694a/nsys/`.
 
 ## Active Qwen3 FMHA-only placement work
 

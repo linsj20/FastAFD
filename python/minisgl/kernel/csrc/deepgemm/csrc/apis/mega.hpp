@@ -130,7 +130,7 @@ get_symm_buffer_size_for_mega_moe(
     return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
 }
 
-static void fp8_fp4_mega_moe(
+static void fp8_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -142,7 +142,8 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_fp8_weights
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -162,10 +163,25 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = device_runtime->get_arch_major();
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] =
-        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] =
-        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    int num_experts_per_rank, intermediate_hidden_2, hidden;
+    int num_experts_per_rank_, hidden_, intermediate_hidden;
+    if (use_fp8_weights) {
+        DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        const auto l1_shape = get_shape<3>(l1_weights);
+        const auto l2_shape = get_shape<3>(l2_weights);
+        num_experts_per_rank = static_cast<int>(std::get<0>(l1_shape));
+        intermediate_hidden_2 = static_cast<int>(std::get<1>(l1_shape));
+        hidden = static_cast<int>(std::get<2>(l1_shape));
+        num_experts_per_rank_ = static_cast<int>(std::get<0>(l2_shape));
+        hidden_ = static_cast<int>(std::get<1>(l2_shape));
+        intermediate_hidden = static_cast<int>(std::get<2>(l2_shape));
+    } else {
+        std::tie(num_experts_per_rank, intermediate_hidden_2, hidden) =
+            check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+        std::tie(num_experts_per_rank_, hidden_, intermediate_hidden) =
+            check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    }
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
@@ -202,7 +218,10 @@ static void fp8_fp4_mega_moe(
 
     // Dispatch into different architectures
     if (arch_major == 10) {
-        sm100_fp8_fp4_mega_moe(y,
+        auto launch = use_fp8_weights
+            ? sm100_fp8_fp8_mega_moe
+            : sm100_fp8_fp4_mega_moe;
+        launch(y,
                                l1_acts, l1_acts_sf,
                                l2_acts, l2_acts_sf,
                                l1_weights, l2_weights,
@@ -224,11 +243,54 @@ static void fp8_fp4_mega_moe(
         sym_buffer.zero_();
 }
 
+static void fp8_fp4_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp,
+    const bool& fast_math) {
+    fp8_mega_moe(y, l1_weights, l2_weights,
+                 cumulative_local_expert_recv_stats,
+                 sym_buffer, sym_buffer_ptrs, rank_idx,
+                 num_max_tokens_per_rank, num_experts, num_topk,
+                 recipe, activation, activation_clamp, fast_math,
+                 /* use_fp8_weights */ false);
+}
+
+static void fp8_fp8_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp,
+    const bool& fast_math) {
+    fp8_mega_moe(y, l1_weights, l2_weights,
+                 cumulative_local_expert_recv_stats,
+                 sym_buffer, sym_buffer_ptrs, rank_idx,
+                 num_max_tokens_per_rank, num_experts, num_topk,
+                 recipe, activation, activation_clamp, fast_math,
+                 /* use_fp8_weights */ true);
+}
+
 static void register_apis(pybind11::module_& m) {
 #if DG_TENSORMAP_COMPATIBLE
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
 #endif
 }
 

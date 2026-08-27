@@ -31,12 +31,47 @@ case "$SLURM_QOS_REQUEST" in
     normal|short) ;;
     *) echo "FASTAFD_SLURM_QOS must be normal or short" >&2; exit 2 ;;
 esac
+JOB_TIME_LIMIT=${FASTAFD_JOB_TIME_LIMIT:-01:00:00}
+[[ "$JOB_TIME_LIMIT" =~ ^([0-9]+-)?[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] || {
+    echo "FASTAFD_JOB_TIME_LIMIT must use [days-]HH:MM:SS" >&2
+    exit 2
+}
+AFD_MODEL_PLACEMENT=${FASTAFD_AFD_MODEL_PLACEMENT:-${AFD_MODEL_PLACEMENT:-legacy}}
+case "$AFD_MODEL_PLACEMENT" in
+    legacy) DEFAULT_AFD_MOE_BACKEND=megamoe_m2n ;;
+    fmha-only) DEFAULT_AFD_MOE_BACKEND=megamoe ;;
+    *) echo "FASTAFD_AFD_MODEL_PLACEMENT must be legacy or fmha-only" >&2; exit 2 ;;
+esac
+MINISGL_AFD_MOE_BACKEND=${MINISGL_AFD_MOE_BACKEND:-$DEFAULT_AFD_MOE_BACKEND}
+case "$MINISGL_AFD_MOE_BACKEND" in
+    deepep|megamoe|megamoe_m2n) ;;
+    *) echo "MINISGL_AFD_MOE_BACKEND must be deepep, megamoe, or megamoe_m2n" >&2; exit 2 ;;
+esac
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$AFD_MODEL_PLACEMENT" != fmha-only ]]; then
+    echo "MINISGL_AFD_MOE_BACKEND=megamoe requires fmha-only placement" >&2
+    exit 2
+fi
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != legacy ]]; then
+    echo "MINISGL_AFD_MOE_BACKEND=megamoe_m2n requires legacy placement" >&2
+    exit 2
+fi
+MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=${MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE:-fp8}
+case "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" in
+    fp8|fp4) ;;
+    *) echo "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE must be fp8 or fp4" >&2; exit 2 ;;
+esac
+export AFD_MODEL_PLACEMENT MINISGL_AFD_MOE_BACKEND
+export MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
 NSYS_CUDA_GRAPH_TRACE=${NSYS_CUDA_GRAPH_TRACE:-node}
 case "$NSYS_CUDA_GRAPH_TRACE" in
     node|none) ;;
     *) echo "NSYS_CUDA_GRAPH_TRACE must be node or none" >&2; exit 2 ;;
 esac
 NSYS_CAPTURE_DECODE_STEPS=15
+TRACE_WARMUP_DECODE_STEPS=1
+# Prefill produces the first sampled token.  Keep one full-batch decode warmup
+# plus the complete measured window available afterward.
+OUTPUT_TOKENS=$((1 + TRACE_WARMUP_DECODE_STEPS + NSYS_CAPTURE_DECODE_STEPS))
 case "$CONTEXT_SPEC" in
     1k|1024) CONTEXT_MIN=1024; CONTEXT_MAX=1024 ;;
     2k|2048) CONTEXT_MIN=2048; CONTEXT_MAX=2048 ;;
@@ -225,8 +260,8 @@ if (( ! IRREGULAR )); then
     TOKENS_PER_SEQUENCE=$(( ((CONTEXT + 64 + 63) / 64) * 64 ))
     RAW_KV_MAX_BATCH=$(( AFD_KV_CAPACITY_TOKENS / TOKENS_PER_SEQUENCE ))
     RESIDENT_PROMPT_TOKENS=$(( ((CONTEXT + 63) / 64) * 64 ))
-    FRESH_REQUEST_ESTIMATED_TOKENS=$(( CONTEXT + 16 ))
-    SCHEDULER_RUNNING_RESERVATION_TOKENS=$(( 15 + 63 ))
+    FRESH_REQUEST_ESTIMATED_TOKENS=$(( CONTEXT + OUTPUT_TOKENS ))
+    SCHEDULER_RUNNING_RESERVATION_TOKENS=$(( OUTPUT_TOKENS - 1 + 63 ))
     CAPACITY_MAX_BATCH=$((
         (AFD_KV_CAPACITY_TOKENS - FRESH_REQUEST_ESTIMATED_TOKENS) /
         (RESIDENT_PROMPT_TOKENS + SCHEDULER_RUNNING_RESERVATION_TOKENS) + 1
@@ -288,8 +323,9 @@ GRAPH_BATCH=$MICROBATCH_UPPER
 PADDED_BATCH=$(( GRAPH_BATCH * 2 ))
 
 if [[ "${FASTAFD_DRY_RUN:-0}" == 1 && -z "${SLURM_JOB_ID:-}" ]]; then
-    printf 'mode=afd model=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_gpu=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s+%s nodes=%s attention_trays=%s ffn_trays=%s attention_workers=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_gpu=%s known_kv_capacity_tokens_per_attention_gpu=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_gpu=%s nsys_capture_decode_steps=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
-        "$MODEL_KEY" "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
+    printf 'mode=afd model=%s afd_model_placement=%s afd_moe_backend=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_gpu=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s+%s nodes=%s attention_trays=%s ffn_trays=%s attention_workers=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_gpu=%s known_kv_capacity_tokens_per_attention_gpu=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_gpu=%s nsys_capture_decode_steps=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
+        "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$MINISGL_AFD_MOE_BACKEND" \
+        "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
         "$BATCH" "$CAPACITY_MAX_BATCH" "$RAW_KV_MAX_BATCH" "$REQUIRE_CAPACITY_MAX" \
         "$MICROBATCH_UPPER" "$MICROBATCH_LOWER" "$NODES" "$ATTENTION_TRAYS" "$FFN_TRAYS" "$ATTENTION_WORKERS" \
         "$NUM_PROMPTS" "$PROMPT_LENGTHS_CSV" "$PROMPT_LENGTH_SUM" \
@@ -338,14 +374,14 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         RUN_DIR=$RESULTS_ROOT/afd_${MODEL_KEY}_${CONTEXT}_a${ATTENTION_TRAYS}_f${FFN_TRAYS}_b${BATCH}_n${NODES}_${STAMP}_manual_na
     fi
     mkdir -p "$RUN_DIR"
-    SBATCH_ARGS=(--parsable --nodes="$NODES" --segment="$NODES" --qos="$SLURM_QOS_REQUEST")
+    SBATCH_ARGS=(--parsable --nodes="$NODES" --segment="$NODES" --qos="$SLURM_QOS_REQUEST" --time="$JOB_TIME_LIMIT")
     if [[ -n "${FASTAFD_EXCLUDE_NODE:-}" ]]; then
         SBATCH_ARGS+=(--exclude="$FASTAFD_EXCLUDE_NODE")
     fi
     JOB=$(sbatch "${SBATCH_ARGS[@]}" \
         --job-name="$JOB_NAME" \
         --output="$RUN_DIR/slurm-%j.out" --error="$RUN_DIR/slurm-%j.err" \
-        --export="ALL,FASTAFD_SLURM_QOS=$SLURM_QOS_REQUEST,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_WORKERS=$ATTENTION_WORKERS,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
+        --export="ALL,FASTAFD_SLURM_QOS=$SLURM_QOS_REQUEST,AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT,MINISGL_AFD_MOE_BACKEND=$MINISGL_AFD_MOE_BACKEND,MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_WORKERS=$ATTENTION_WORKERS,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
         "$(realpath "$0")")
     printf 'submitted job=%s model=%s context_min=%s context_max=%s batch=%s nodes=%s run_dir=%s\n' \
         "$JOB" "$MODEL_KEY" "$CONTEXT_MIN" "$CONTEXT_MAX" "$BATCH" "$NODES" "$RUN_DIR"
@@ -378,6 +414,9 @@ if [[ "${FASTAFD_IN_CONTAINER:-0}" != 1 ]]; then
         ALLOW_OBSERVED_CAPACITY_PROBE="$ALLOW_OBSERVED_CAPACITY_PROBE" \
         MAX_SEQ_LEN="$MAX_SEQ_LEN" NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE" \
         NSYS_CAPTURE_DECODE_STEPS="$NSYS_CAPTURE_DECODE_STEPS" \
+        AFD_MODEL_PLACEMENT="$AFD_MODEL_PLACEMENT" \
+        MINISGL_AFD_MOE_BACKEND="$MINISGL_AFD_MOE_BACKEND" \
+        MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" \
         MODEL_PATH="$MODEL_PATH" \
         MODEL_SOURCE_PATH="$MODEL_SOURCE_PATH" MODEL_CONFIG_SHA256="$MODEL_CONFIG_SHA256" \
         MODEL_SOURCE_CONFIG_SHA256="$MODEL_SOURCE_CONFIG_SHA256" \
@@ -691,9 +730,11 @@ manifest.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 print(json.dumps(record, indent=2, sort_keys=True))
 PY
 export AFD_TOTAL_NODES=$NODES RUN_VLLM_ALIGNMENT=0 NSYS_CUDA_GRAPH_TRACE
-export PROMPT_LEN=$CONTEXT_MAX PER_ATTN_GPU_BSZ=$BATCH MAX_TOKENS=16
+export PROMPT_LEN=$CONTEXT_MAX PER_ATTN_GPU_BSZ=$BATCH MAX_TOKENS=$OUTPUT_TOKENS
 export MINISGL_MAX_SEQ_LEN=$MAX_SEQ_LEN VLLM_MAX_MODEL_LEN=$MAX_SEQ_LEN
 export AFD_NUM_MB=2 AFD_DECODE_GRAPH_BS=$GRAPH_BATCH
+printf 'afd_model_placement=%s afd_moe_backend=%s\n' \
+    "$AFD_MODEL_PLACEMENT" "$MINISGL_AFD_MOE_BACKEND"
 export AFD_MEMORY_RATIO=0.82 AFD_MAX_BATCHED_TOKENS=512
 export MINISGL_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S=${FASTAFD_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S:-300}
 export MINISGL_AFD_WORKER_SHUTDOWN_TIMEOUT_S=${FASTAFD_AFD_WORKER_SHUTDOWN_TIMEOUT_S:-120}
@@ -707,7 +748,7 @@ export EP_JIT_CACHE_DIR=$ROOT/cache/afd/deepep_jit
 export DG_JIT_CACHE_DIR=$ROOT/cache/afd/deepgemm_jit
 export N2M_M2N_GIN_BUILD_DIR=$ROOT/cache/afd/gin_comm
 export MINISGL_DEEPEP_BUILD_DIR=$ROOT/cache/afd/deepep_moe
-export MINISGL_DEEPGEMM_BUILD_DIR=$ROOT/cache/afd/deepgemm
+export MINISGL_DEEPGEMM_BUILD_DIR=${MINISGL_DEEPGEMM_BUILD_DIR:-$ROOT/cache/afd/deepgemm}
 EXPERIMENT=$RUN_DIR/experiment
 export RUN_DIR=$EXPERIMENT
 mkdir -p "$RUN_DIR"
@@ -753,15 +794,15 @@ if (( ! IRREGULAR && REQUIRE_CAPACITY_MAX )); then
         sleep 2
     done
     capacity_line=$("$PYTHON" - "$RUN_DIR/afd.log" "$RUN_DIR/capacity-preflight.json" \
-        "$ATTENTION_WORKERS" "$CONTEXT" "$BATCH" <<'PY'
+        "$ATTENTION_WORKERS" "$CONTEXT" "$BATCH" "$OUTPUT_TOKENS" <<'PY'
 import json
 import re
 import sys
 from pathlib import Path
 
 log_path, output_path = Path(sys.argv[1]), Path(sys.argv[2])
-workers, context, requested = map(int, sys.argv[3:])
-page_size, output_tokens = 64, 16
+workers, context, requested, output_tokens = map(int, sys.argv[3:])
+page_size = 64
 pages = [
     int(value)
     for value in re.findall(
@@ -833,6 +874,7 @@ ATTENTION_WORKERS=$ATTENTION_WORKERS NODES=$NODES REFERENCE_TPS=$REFERENCE_TPS \
 CONTEXT=$CONTEXT CONTEXT_MIN=$CONTEXT_MIN CONTEXT_MAX=$CONTEXT_MAX \
 IRREGULAR=$IRREGULAR PROMPT_LENGTHS_CSV=$PROMPT_LENGTHS_CSV \
 PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS \
+OUTPUT_TOKENS=$OUTPUT_TOKENS \
 AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS \
 NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS \
 CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH \
@@ -844,6 +886,9 @@ SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS \
 REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX ATTENTION_TRAYS=$ATTENTION_TRAYS \
 FFN_TRAYS=$FFN_TRAYS \
 PADDED_BATCH=$PADDED_BATCH PROMPT_MANIFEST=$PROMPT_MANIFEST \
+AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT \
+MINISGL_AFD_MOE_BACKEND=$MINISGL_AFD_MOE_BACKEND \
+MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE \
 "$PYTHON" - <<'PY'
 import json, os, re, statistics
 from pathlib import Path
@@ -853,6 +898,7 @@ padded_batch = int(os.environ["PADDED_BATCH"])
 workers, nodes = int(os.environ["ATTENTION_WORKERS"]), int(os.environ["NODES"])
 reference = float(os.environ["REFERENCE_TPS"])
 context = int(os.environ["CONTEXT"])
+output_tokens = int(os.environ["OUTPUT_TOKENS"])
 context_min, context_max = int(os.environ["CONTEXT_MIN"]), int(os.environ["CONTEXT_MAX"])
 irregular = bool(int(os.environ["IRREGULAR"]))
 prompt_lengths = [int(value) for value in os.environ["PROMPT_LENGTHS_CSV"].split(",")]
@@ -882,9 +928,10 @@ if len(observed_pages) != workers:
     raise RuntimeError(("attention page-count evidence", len(observed_pages), workers))
 observed_min_capacity = min(observed_pages) * 64
 resident_prompt = ((context + 63) // 64) * 64
-fresh_request = context + 16
+fresh_request = context + output_tokens
 observed_max_batch = (
-    (observed_min_capacity - fresh_request) // (resident_prompt + 15 + 63)
+    (observed_min_capacity - fresh_request)
+    // (resident_prompt + output_tokens - 1 + 63)
 ) + 1
 if prompt_contract["per_attention_gpu_prompt_lengths"] != prompt_lengths:
     raise RuntimeError("prompt manifest distribution mismatch")
@@ -898,44 +945,55 @@ if require_capacity_max and observed_max_batch != batch:
     raise RuntimeError(("not observed scheduler-admissible max batch", batch, observed_max_batch))
 samples = json.loads((run / "sample.json").read_text()).get("samples", [])
 lengths = [len(x.get("generated_token_ids", [])) for x in samples]
-if len(samples) != count or set(lengths) != {16}:
+if len(samples) != count or set(lengths) != {output_tokens}:
     raise RuntimeError((len(samples), sorted(set(lengths))))
-logs = sorted((run / "ray_logs").glob("attention_dp*_rank*.log"))
-if len(logs) != workers:
-    raise RuntimeError((len(logs), workers))
-pattern = re.compile(r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)")
-worker_steps = []
-for path in logs:
-    steps = sorted(int(s) for s, b, mb in pattern.findall(path.read_text(errors="replace"))
-                   if int(b) == padded_batch and int(mb) == 2)
-    worker_steps.append(steps)
-if len({tuple(x) for x in worker_steps}) != 1:
-    raise RuntimeError("attention worker decode windows differ")
-all_steps = worker_steps[0]
-replay_windows = []
-for step in all_steps:
-    if not replay_windows or step != replay_windows[-1][-1] + 1:
-        replay_windows.append([step])
-    else:
-        replay_windows[-1].append(step)
+attention_logs = sorted((run / "ray_logs").glob("attention_dp*_rank*.log"))
+model_logs = sorted((run / "ray_logs").glob("mlp_dp*_rank*.log"))
+if len(attention_logs) != workers or len(attention_logs) + len(model_logs) != nodes * 4:
+    raise RuntimeError((len(attention_logs), len(model_logs), workers, nodes * 4))
+for path in attention_logs + model_logs:
+    worker_log = path.read_text(errors="replace")
+    if worker_log.count("nsys profiler:start sync=1") != 1:
+        raise RuntimeError(("invalid profiler start evidence", path))
+    if worker_log.count("nsys profiler:stop sync=1") != 1:
+        raise RuntimeError(("invalid profiler stop evidence", path))
 coordinator_log = (run / "ray_logs/afd_coordinator.log").read_text(errors="replace")
 capture_matches = re.findall(
     r"nsys profiler:target_decode_window "
-    r"target_batch_per_dp=(\d+) step_ids=([0-9,]+) count=(\d+)",
+    r"target_batch_per_dp=(\d+) warmup_step_id=(\d+) "
+    r"step_ids=([0-9,]+) count=(\d+) trace_count=(\d+)",
     coordinator_log,
 )
 if len(capture_matches) != 1:
     raise RuntimeError(("expected one exact target-decode capture", capture_matches))
-captured_target, captured_csv, captured_count = capture_matches[0]
+captured_target, captured_warmup, captured_csv, captured_count, trace_count = (
+    capture_matches[0]
+)
 steps = [int(value) for value in captured_csv.split(",")]
-if int(captured_target) != batch or int(captured_count) != 15 or len(steps) != 15:
+if (
+    int(captured_target) != batch
+    or int(captured_count) != 15
+    or len(steps) != 15
+    or int(trace_count) != 16
+    or int(captured_warmup) != steps[0] - 1
+):
     raise RuntimeError(("invalid target-decode capture", capture_matches[0], batch))
 if any(right != left + 1 for left, right in zip(steps, steps[1:])):
     raise RuntimeError(("non-consecutive target-decode capture", steps))
-if any(not set(steps).issubset(set(worker)) for worker in worker_steps):
-    raise RuntimeError("a captured target-decode step is absent from an attention-worker replay log")
+capture = json.loads((run / "capture-complete.json").read_text())
+expected_trace_steps = [int(captured_warmup), *steps]
+if (
+    int(capture.get("target_batch_per_attention_dp", -1)) != batch
+    or int(capture.get("capture_decode_steps", -1)) != 15
+    or capture.get("decode_step_ids") != steps
+    or int(capture.get("warmup_decode_step_id", -1)) != int(captured_warmup)
+    or int(capture.get("trace_decode_launches", -1)) != 16
+    or capture.get("trace_decode_step_ids") != expected_trace_steps
+    or int(capture.get("gpu_worker_profiler_stop_logs", -1)) != nodes * 4
+):
+    raise RuntimeError(("invalid capture-complete evidence", capture))
 full_windows = [steps]
-partial_windows = [window for window in replay_windows if window != steps]
+partial_windows = []
 trace = json.loads((run / "ray_logs/coordinator_nvtx_cpu.json").read_text())
 complete = {
     e["step_id"]: e["end_perf_ns"] for e in trace["events"]
@@ -948,6 +1006,9 @@ median_ms, mean_ms = statistics.median(intervals), statistics.fmean(intervals)
 tps = count * 1000 / (nodes * 4 * median_ms)
 result = {
     "model_key": os.environ.get("MODEL_KEY"),
+    "afd_model_placement": os.environ["AFD_MODEL_PLACEMENT"],
+    "afd_moe_backend": os.environ["MINISGL_AFD_MOE_BACKEND"],
+    "megamoe_expert_weight_dtype": os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"],
     "prompt_mode": os.environ["PROMPT_MODE"],
     "context_tokens": context,
     "context_range_tokens": {"min": context_min, "max": context_max},
@@ -955,7 +1016,7 @@ result = {
     "prompt_length_distribution": "inclusive_uniform_symmetric_integer_linspace",
     "prompt_lengths_per_attention_gpu": prompt_lengths,
     "prompt_length_sum_per_attention_gpu": prompt_length_sum,
-    "samples": count, "tokens_per_sample": 16,
+    "samples": count, "tokens_per_sample": output_tokens,
     "batch_per_attention_gpu": batch,
     "input_batch_per_attention_gpu": batch,
     "batch_selection": (
@@ -974,7 +1035,11 @@ result = {
     "scheduler_running_reservation_tokens_per_request": running_reservation,
     "scheduler_admission_required_tokens_per_attention_gpu": admission_required,
     "scheduler_admission_unused_tokens_per_attention_gpu": admission_unused,
-    "scheduler_admission_method": "largest B satisfying (B-1)*(ceil(prompt/64)*64 + (15+63)) + (prompt+16) <= measured KV capacity",
+    "scheduler_admission_method": (
+        "largest B satisfying (B-1)*(ceil(prompt/64)*64 + "
+        f"({output_tokens - 1}+63)) + (prompt+{output_tokens}) "
+        "<= measured KV capacity"
+    ),
     "microbatch_real_sizes_per_attention_gpu": [(batch + 1) // 2, batch // 2],
     "graph_padded_batch_per_attention_gpu": padded_batch,
     "attention_workers": workers, "total_gpus": nodes * 4,
@@ -1000,7 +1065,7 @@ result = {
         "nsys_cuda_graph_trace": os.environ["NSYS_CUDA_GRAPH_TRACE"],
         "nsys_target_batch_per_attention_gpu": int(os.environ["MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP"]),
         "nsys_capture_decode_steps": int(os.environ["MINISGL_RAY_NSYS_CAPTURE_DECODE_STEPS"]),
-        "proof": "coordinator queued profiler start immediately before the first full-real-batch decode command and stop immediately after the fifteenth; every attention-worker log contains all 15 step IDs",
+        "proof": "capture-complete records one warmup plus 15 consecutive measured full-real-batch steps; every GPU-worker log records one synchronous profiler start and stop; strict extraction verifies exactly the declared graph launches in representative attention and model reports",
     },
     "measurement": "median of all 14 consecutive coordinator completion intervals in the first 15-step full-real-batch decode window selected by observed scheduler state; no prefill-step prediction",
 }
@@ -1020,6 +1085,10 @@ until [[ $(find "$DONE" -maxdepth 1 -type f | wc -l) -eq "$NODES" ]]; do
     [[ $SECONDS -lt $deadline ]]; sleep 2
 done
 for ((rank=0; rank<NODES; rank++)); do
-    [[ $(wc -l < "$EXPERIMENT/../gpu-snapshots/final-rank-$rank.csv") -eq 1 ]]
+    # This snapshot is taken before the allocation-scoped EXIT trap stops Ray,
+    # so surviving worker rows are cleanup diagnostics, not a run failure. A
+    # subsequent allocation's initial snapshot remains the fail-fast proof
+    # that cleanup completed.
+    [[ -s "$EXPERIMENT/../gpu-snapshots/final-rank-$rank.csv" ]]
 done
 printf 'FASTAFD_AFD_SUCCESS result=%s\n' "$EXPERIMENT/afd-result.json" | tee "$EXPERIMENT/SUCCESS"

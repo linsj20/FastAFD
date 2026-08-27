@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
 
@@ -34,6 +35,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseFP8Weights = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -158,10 +160,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         l2_sf_buffer.get_end_ptr()
     );
 
-    // Data types
-    // NOTES: activations are FP8 (e4m3), weights are FP4 (e2m1)
+    // Match the split AG/EG MegaMoE compute path when kUseFP8Weights is set.
+    // Packed FP4 and FP8 weights both occupy one byte per shared-memory value;
+    // only the global-memory transaction size and MMA operand type differ.
     using a_dtype_t = cutlass::float_e4m3_t;
-    using b_dtype_t = cutlass::detail::float_e2m1_unpacksmem_t;
+    using b_dtype_t = std::conditional_t<kUseFP8Weights,
+                                         cutlass::float_e4m3_t,
+                                         cutlass::detail::float_e2m1_unpacksmem_t>;
 
     // MMA configs
     // NOTES: always swap A/B, 2-CTA MMA, and matrices are K-major
@@ -762,7 +767,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     tma::copy<BLOCK_N, 1, 0>(
                         tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
-                        full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_B_SIZE_PER_STAGE + BLOCK_N * sizeof(uint32_t) * 2);
+                        constexpr uint32_t kBArrivalBytes =
+                            kUseFP8Weights ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE;
+                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                            kBArrivalBytes + BLOCK_N * sizeof(uint32_t) * 2);
                     } else {
                         full_barriers[stage_idx]->arrive(0u);
                     }

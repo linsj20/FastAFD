@@ -16,6 +16,48 @@ including rejected attempts.
 - Raw results stay under the remote task root. Do not delete or compress them
   without explicit user approval.
 
+## 2026-08-25 FMHA-only MegaMoE EP8 follow-up
+
+This is a separate current-code observation, not an additional point in the
+historical 176-case matrix below.  Comprehensive normalized A4:F1/EP8 maps to
+32 attention plus eight FFN GPUs on ten GB200 trays.  Exact 128K batch-6 MB2
+job `6530508` used clean production head
+`24b90c0683a6bdb3820ae2b7f35a360d30951826`, FMHA-only placement, MegaMoE,
+192 real prompts, and one warmup plus 15 measured graph launches.  The GPU
+workload and capture completed; the job's final `1:0` was solely a
+post-capture plan-status mismatch.  After correcting that metadata, CPU-only
+recovery job `6531018` completed `0:0` and extracted all 15 steps with zero
+outliers: 24.9519134667 ms strict CUDA mean, 24.919811 ms median,
+2.066019-percent dominant range, and 192.370016 tokens/s/active GPU.  This is
+4.406277467 ms / 15.008682 percent faster than clean A7:F1/EP4 and only
+1.561065467 ms / 6.673830 percent slower than clean A1:F1/EP4.  Attention rank
+1 averaged 24.951913467 ms while model rank 33 averaged 24.860606733 ms, so
+EP8 reduces the FFN path enough that attention becomes the E2E limiter.  The
+remote and local result root is
+`fmha_megamoe_fp8_20260825/a4_f1_ep8_128k_b6_default_24b90c0/`; all 40 raw
+Nsight reports are preserved locally.
+
+The follow-on clean EP8 ratio/batch comparison submits two bundles from the
+same production head.  Job `6531588` holds 16 trays for A7:F1 batch 7 then 6;
+job `6531587` holds the complete 18-tray NVL72 for A8:F1 batch 7 then 6.  A7
+maps to 56 attention plus eight FFN GPUs and A8 to 64 plus eight.  Batch 6 uses
+the exact 0.82/839,424-token capacity and MB2 3+3; batch 7 uses the validated
+0.90/14,344-page/918,016-token capacity and MB2 3+4.  Four dry runs passed,
+and both two-hour `short` jobs were pending for resources after submission.
+Their shared local/remote task root is
+`fmha_megamoe_fp8_20260825/a7_a8_ep8_b6_b7_bundle_24b90c0/`.
+
+A7 bundle `6531588` completed both cases successfully on
+`nvl72072-T[01-16]` in 50:05.  The strict batch-7 result is 28.3798501333 ms,
+35.236268 tokens/s/user, and 215.822140 tokens/s/active GPU; its exact capacity
+gate observed 14,396 pages / 921,344 tokens on all 56 attention ranks.  The
+strict batch-6 result is 25.4614114 ms, 39.275120 tokens/s/user, and
+206.194382 tokens/s/active GPU; all ranks observed 13,116 pages / 839,424
+tokens.  Both metrics use 15/15 eligible samples with zero outliers.  All 64
+Nsight reports for each case plus compact metrics and run metadata are copied
+under the shared local root, and local/remote report counts match.  A8 bundle
+`6531587` is still pending at zero elapsed time under `QOSGrpNodeLimit`.
+
 ## Current status (live; updated 2026-07-21 22:14 PDT)
 
 - Baseline EP sweep: 40/40 accepted and complete; do not rerun it.
@@ -849,3 +891,195 @@ pass `node --check`. The original July 22 CSV (`075d5563...`), July 24 CSV
 (`833caeff...`), July 24 fragment (`3a422926...`), July 24 standalone HTML
 (`c1624da0...`), and original diagram fragment (`9c03adcc...`) remain
 byte-identical.
+
+## 2026-08-22: FMHA-only rerun of the canonical 128K frontier
+
+The active FMHA-only task now has a user-required final sweep over the exact
+eight AFD points in `pareto_nsys/PARETO_CASES.tsv` at ISL 131072. This is a
+rerun with the added placement mode, not a recomputation of the historical
+frontier. The immutable case set is A15:F1/FEP4/b6, A3:F1/FEP2/b6,
+A2:F1/FEP2/b6, and A1:F1/FEP2 at b6/b4/b3/b2/b1. Comprehensive topology groups
+them into one 16-tray job, one 2-tray job, and one 1-tray job respectively.
+
+The validated campaign plan is
+`scratch/qwen3_ffn_overheads_20260820/fmha_only_128k_pareto/CASES.csv`, mirrored
+remotely under
+`/home/shengjiel/scratch/qwen3_ffn_overheads_20260820/fmha_only_128k_pareto`.
+The remote pool currently has 8 pending and zero claimed/completed/failed. The
+FMHA-only source now supports attention-DP fan-in so the historical A2/A3/A15
+ratios retain their original active-GPU and tray counts. Submit exactly one
+same-tray bundle for 1, 2, and 16 trays only after final added-mode alignment;
+do not substitute newer optimized-attention overlay points for this canonical
+precomputed frontier.
+
+Remote head `59d437a` also removes the runner's fixed 30-second hold after
+durable capture artifacts and makes FMHA trace auditing consume per-attention
+worker CPU step traces. This prevents valid FMHA cases from wasting allocation
+time and then being misclassified because their concise logs omit replay lines.
+Head `91649cf` additionally permits every valid N in the strict CUDA extractor,
+including the required b1/N1 frontier case.
+Dry resolution of all eight rows at that head confirms the prior sweep's exact
+16/2/1-tray grouping and the intended N2-for-batch>1, N1-for-batch1 schedule.
+
+The final gate is now an automated dependency chain rather than a manual
+monitoring interval. Boundary job `6440388` gates alignment job `6440500`; its
+successful official 100%-top-10 and trace-audit exit gates exactly three
+campaign allocations: `6440503` for all five one-tray rows, `6440504` for both
+two-tray rows, and `6440505` for the one sixteen-tray row. Each dependent uses
+`afterok` plus invalid-dependency cancellation, so a failed correctness gate
+cannot consume campaign GPUs and a passed gate has no human handoff delay.
+
+Boundary `6440388` failed at the same step 512 on attention DPs 2 and 5; its
+alignment and campaign dependencies cancelled before allocation as intended.
+The causal trace changed from the earlier TMA construction error to an illegal
+access surfacing at the next readiness wait, proving model-source retirement
+alone was insufficient. Later fan-in sources can queue a new eager plan while
+their prior plan is still waiting for shared-model QKV, reusing mutable FMHA
+metadata. Remote head `5bc6b1a` adds fan-in-only attention-plan retirement;
+equal-DP and each plan's two-stream/two-slot schedule are unchanged. The pinned
+suite remains 33/33. Supersede the cancelled job IDs with a new boundary,
+alignment, and three-job tray chain.
+
+The replacement chain is boundary `6440754`, alignment `6440763`, then
+same-tray bundles `6440768` (one tray), `6440769` (two trays), and `6440770`
+(sixteen trays). The boundary started immediately on two trays; the campaign
+pool is still exactly eight pending, zero claimed/completed/failed. Boundary
+startup is healthy: all eight workers initialized and its API became ready at
+`01:34:25`, with no error before the long 128K prefill began. It remained clean
+through `01:46:12`, beyond the prior replacement's deterministic step-512
+failure time relative to API readiness.
+
+Pre-campaign audit found and fixed a bookkeeping-only schema mismatch: the
+pool required the legacy v14 metric fields even for FMHA-only dual-role
+metrics. Harness head `1f4f92d` now validates either strict schema according to
+the result placement, requires the immediately preceding warmup and exactly
+one representative per profiled role, and has 38/38 pinned tests. Boundary
+runtime remains `5bc6b1a`; the dependency-chained campaign will consume the
+corrected harness.
+
+Boundary `6440754` subsequently completed the exact A3:F1 runtime and all
+durable artifacts, then exited only because it was passed a plan with no A3
+row. CPU-only extraction avoids repeating the valid two-tray work. That audit
+also proved each shared model DP has three ordered graph launches per global
+decode step. Extractor head `fdf412f` strictly collapses the placement-derived
+fan-in and passes 42/42 tests; CPU job `6441259` passed with 88.716386 ms /
+50.723437 TPS per active GPU. Current alignment `6441262` gates campaign jobs
+`6441270` (one tray), `6441271` (two trays), and `6441272` (sixteen trays).
+Pool head `c7ecd65` independently enforces the placement-derived raw/collapsed
+fan-in relation before terminal case completion; the full pinned suite is
+43/43. Alignment `6441262` is currently running the unchanged scorer on one
+tray while all three campaign allocations remain dependency-pending.
+Alignment `6441262` then completed `0:0` in 14:26 with perfect top-1/top-10/
+top-100 agreement and expected rank-1/rank-7 trace topology. Exact tray-group
+jobs `6441270`, `6441271`, and `6441272` are now scheduler-eligible; the shared
+pool remains eight pending until they actually start.
+
+The initial two-tray allocation `6441271` failed in 21 seconds before any pool
+claim or model work because Slurm's copied outer script derived its control
+directory from the spool path. The pending one- and sixteen-tray copies
+`6441270` and `6441272` were cancelled before allocation. Harness head
+`2c831cb` resolves controls from the submitted source repository and passes the
+expanded 44/44 suite. Each replacement also exports the control directory
+explicitly: `6441603` runs all five one-tray cases, `6441604` both two-tray
+cases, and `6441605` the one sixteen-tray case. The pool was still exactly
+eight pending with no claims/completions/failures when `6441604` began; no
+manual monitoring wait or sleep is used. CPU-partition terminal summary job
+`6441701` runs `afterany` all three allocation jobs and requests no GPU TRES.
+CPU-only job `6441803` is the corresponding strict terminal audit: it reopens
+all completion records and proofs, validates exact topology/work/report counts
+and one job ID per tray group, and emits the eight new-vs-prior measurements.
+
+The first campaign point is complete. Two-tray job `6441604` recorded
+A3:F1/FEP2/b6 at 89.070510 ms / 50.521772 TPS per active GPU with exact
+36-prompt / 612-token work, N2 split 3+3, all eight reports, matching proof
+hashes, and `SUCCESS`; it claimed A2:F1/FEP2/b6 91 ms later in the same
+allocation. The pool is 1 completed, 1 claimed, 6 pending, 0 failed.
+The same job completed A2:F1/FEP2/b6 at 58.289801 ms / 68.622640 TPS per
+active GPU with exact 24-prompt / 408-token work, N2 split 3+3, six reports,
+two intentional idle GPUs, and matching terminal proofs. Job `6441604`
+finished its 2/2 bundle `0:0` in 1:04:22 and released both trays; the pool is
+2 completed, 0 claimed, 6 pending, 0 failed.
+The partial terminal auditor passes both completed rows. It labels their
+new/prior deltas as raw diagnostics and records `metric_basis_comparable=false`
+because the historical HTML latency is an attention-only median while the
+strict FMHA-only campaign latency is the maximum complete attention/model graph
+span.
+The still-pending one- and sixteen-tray jobs were conservatively submitted for
+four hours. Their limits were tightened in place to three hours after backfill
+estimates showed the larger reservations constraining placement; QoS, job
+identity, tray grouping, and case ownership are unchanged, and the new limits
+retain the measured-runtime safety margins.
+The shorter backfill shape admitted one-tray job `6441603` within one minute;
+it passed preflight and claimed A1:F1/FEP2/b6 at
+`16:26:28.821691+00:00`. The pool is 2 completed, 1 claimed, 5 pending, 0
+failed, while the sixteen-tray job remains resource-free and pending.
+One-tray A1:F1/FEP2/b6 completed in 17:17 at 27.150601 ms / 110.494794 TPS per
+active GPU with exact 12-prompt / 204-token work, N2 split 3+3, four reports,
+matching proofs, and `SUCCESS`; the same job claimed b4 87 ms later. Pool state
+is 3 completed, 1 claimed, 4 pending, 0 failed.
+A1:F1/FEP2/b4 then completed in 10:08 at 23.847872 ms / 83.864927 TPS per
+active GPU with exact 8-prompt / 136-token work, N2 split 2+2, four reports,
+matching proofs, and `SUCCESS`; b3 was claimed 85 ms later. Pool state is 4
+completed, 1 claimed, 3 pending, 0 failed.
+A1:F1/FEP2/b3 completed in 8:31 at 24.159529 ms / 62.087303 TPS per active
+GPU with exact 6-prompt / 102-token work and the required uneven N2 split 1+2;
+b2 was claimed 103 ms later. Pool state is 5 completed, 1 claimed, 2 pending,
+0 failed.
+A1:F1/FEP2/b2 passed at 20.226003 ms / 49.441305 TPS per active GPU with exact
+4-prompt / 68-token work and N2 split 1+1. B1 then failed only its clean-GPU
+preflight because one b2 expert PID lingered after Ray cleanup; no b1 model work
+began. Head `9aed859` adds a no-sleep pidfd exit-event barrier and passes 46/46.
+After the failed attempt was archived/released, first focused job `6448831`
+exposed a sub-hour Slurm `MM:SS` parser gap before claiming. Head `48e850d`
+fixes all supported duration forms and passes 47/47. Replacement `6448873`
+claimed b1 with a clean pidfd barrier and completed the strict N1 point at
+19.376279 ms / 25.804748 TPS per active GPU over 2 prompts / 34 generated
+tokens, one microbatch of size 1, all 15 samples, four reports, and `SUCCESS`.
+Its EXIT cleanup snapshot alone followed a retargeted `RUN_DIR`; remote head
+`21b6f59` fixes that path and adds an ownership-checked, strictly revalidated
+failed-completion promotion. The 49/49 suite and seven-row partial campaign
+audit pass without repeating GPU work. Pool state is 7 completed, 0 claimed,
+0 failed, and only the resource-free sixteen-tray A15 point pending.
+At explicit user direction, pending A15 job `6441605` was changed in place to
+short QoS with a two-hour limit. It was admitted immediately, but its immutable
+submission environment still expected normal QoS, so the runner failed its QoS
+self-check in 28 seconds before claiming A15 or launching model work. This
+released pre-existing `cpu-normal` terminal jobs `6441701`/`6441803`; they
+recorded the expected 7/8 summary and missing-A15 audit failure before they
+could be changed. Pool state stayed clean. Sole A15 replacement `6449326` now
+requests 16 trays with `short` in both Slurm and `FASTAFD_SUBMIT_QOS`, limited
+to two hours. Replacement summary `6449327` and strict audit `6449328` are held
+on its completion under `cpu-short`; the audit maps the sixteen-tray group to
+`6449326`. Use only `short`/`cpu-short` for every remaining or future job in
+this goal. Job `6449326` started on `nvl72098-T[01-08,10-17]` and claimed the
+sole canonical A15:F1/FEP4/128K/b6 row at `17:47:51.087599+00:00`, binding the
+claim to its 16 trays/64 GPUs and batch 6. The pool is 7 completed, 1 claimed,
+0 pending, and 0 failed.
+
+The user subsequently corrected the source: the required campaign is the
+optimized-attention 128K frontier embedded in
+`scratch/afd_baseline_pareto_2d_20260803/afd-baseline-user-tps-vs-tps-gpu-pareto.html`,
+not the archived `pareto_nsys/PARETO_CASES.tsv`. Job `6449326` was canceled at
+6:06; `cpu-short` dependents `6449327`/`6449328` were canceled before
+allocation. The seven completed archived rows remain diagnostics only. The
+HTML contains 60 optimized-attention 128K measurements and its exact skyline
+rule selects 30 points across every tray count 8--18. The validated corrected
+plan, manifest, and empty 30-case pool are under
+`scratch/qwen3_ffn_overheads_20260820/fmha_only_optimized_attention_128k_pareto`.
+Run one `short` allocation for every tray group and compare prior/current E2E
+step latency through the same `afd-result.json:median_interval_ms` field.
+The user capped the corrected run at four GPU `short` jobs. Dependency-driven
+chains `18->11->10`, `16->13->9`, `12->17->8`, and `15->14` maintain that cap
+without monitoring sleeps; only a strict `cpu-short` completion validator may
+submit a successor. Initial GPU jobs are `6449925`, `6449928`, `6449930`, and
+`6449932`, with dependency controllers `6449926`, `6449929`, `6449931`, and
+`6449933`.
+That first launch exposed a required Slurm topology contract: tray-15
+`6449932` and tray-12 `6449930` were scattered across multiple NVL72 base
+systems, and CUDA fabric handles are valid only within one base block. Tray 15
+failed its first handle import before sampling; tray 12 and pending 16/18 were
+stopped to avoid repeating known-invalid work. All claims/failures were
+archived and released. Head `8377952` adds `--segment=<trays>` plus a fail-fast
+single-block preflight and passes 51/51 tests. Clean replacements are
+`6450310`, `6450317`, `6450323`, and `6450327` for trays 18/16/12/15, with
+`cpu-short` controllers `6450312`, `6450318`, `6450325`, and `6450328`.

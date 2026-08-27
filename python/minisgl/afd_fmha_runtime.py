@@ -29,7 +29,7 @@ from minisgl.kernel.fabric_memory import (
 )
 from minisgl.utils import div_ceil, torch_dtype
 
-from .afd_support import log_line
+from .afd_support import log_line, resolve_afd_moe_backend
 from .afd_protocol import AfdModelStepPlan
 
 
@@ -206,6 +206,8 @@ class AfdFmhaRuntime:
         self.timeout_ms = int(float(self.config.distributed_timeout) * 1000)
         self._imports: dict[tuple[str, str, int, int], FabricTensor] = {}
         self._imported_allocations: dict[bytes, Any] = {}
+        self._moe_backend = resolve_afd_moe_backend(worker.model_placement)
+        self._mega_moe: Any | None = None
         self._moe_buffers: tuple[Any, ...] = ()
         self._tp_lane_communicators: tuple[Any, ...] = ()
         self._tp_distributed_plugin: Any | None = None
@@ -241,6 +243,7 @@ class AfdFmhaRuntime:
             f"max_rows={self.max_rows} "
             f"mapped_attn_dps={self._mapped_attn_dp_ranks} "
             f"decode_lane_streams={len(self._decode_lane_streams)} "
+            f"moe_backend={self._moe_backend} "
             f"moe_buffers={len(self._moe_buffers)} "
             f"tp_lane_communicators={len(self._tp_lane_communicators)}",
             flush=True,
@@ -1025,16 +1028,17 @@ class AfdFmhaRuntime:
         ctx.moe_deepep_dispatch_max_tokens_per_rank = merged_per_mb_bs
         try:
             with torch.no_grad(), torch.cuda.stream(stream):
-                for layer in layers:
-                    runner = layer.mlp.experts.runner
-                    prepare_layer = getattr(runner, "prepare_layer", None)
-                    if not callable(prepare_layer):
-                        raise RuntimeError(
-                            "FMHA-only DeepGEMM runner cannot pre-materialize "
-                            "model weights"
-                        )
-                    prepare_layer(layer.mlp.experts)
-                    layer.mlp.experts.dispatcher.prepare_for_capture(self.device)
+                if getattr(self, "_mega_moe", None) is None:
+                    for layer in layers:
+                        runner = layer.mlp.experts.runner
+                        prepare_layer = getattr(runner, "prepare_layer", None)
+                        if not callable(prepare_layer):
+                            raise RuntimeError(
+                                "FMHA-only DeepGEMM runner cannot pre-materialize "
+                                "model weights"
+                            )
+                        prepare_layer(layer.mlp.experts)
+                        layer.mlp.experts.dispatcher.prepare_for_capture(self.device)
 
                 with self._tp_lane_context(0), ctx.forward_batch(sub):
                     hidden = self.model.embed_input_ids(sub.input_ids)
@@ -1054,8 +1058,7 @@ class AfdFmhaRuntime:
                     hidden, _residual = layers[0].post_attention_layernorm.forward(
                         hidden, residual
                     )
-                    prepared_moe = layers[0].mlp.prepare_deepep(hidden)
-                    layers[0].mlp.finish_deepep(prepared_moe)
+                    self._run_model_moe(0, layers[0], hidden, lane=0)
                     # The fused router removes the model path's former cuBLAS
                     # gate GEMM. Materialize the remaining cuBLAS handle and
                     # exact-batch LM-head plan before CUDA graph capture.
@@ -1135,11 +1138,21 @@ class AfdFmhaRuntime:
         if int(self.worker.mlp_ep_size) <= 1:
             if self.config.afd_moe_a2a_backend != "none":
                 raise RuntimeError("EP1 FMHA-only placement requires MoE A2A backend 'none'")
+            if self._moe_backend != "deepep":
+                raise RuntimeError("FMHA-only MegaMoE currently requires EP > 1")
             return
         if self.config.afd_moe_a2a_backend != "deepep":
             raise RuntimeError("FMHA-only EP requires --afd-moe-a2a-backend deepep")
         if self.config.afd_moe_runner_backend != "deep_gemm":
             raise RuntimeError("FMHA-only EP requires --afd-moe-runner-backend deep_gemm")
+        if self._moe_backend == "megamoe":
+            self._create_megamoe()
+            return
+        if self._moe_backend != "deepep":
+            raise RuntimeError(
+                "FMHA-only MoE backend must be 'deepep' or same-rank 'megamoe', "
+                f"got {self._moe_backend!r}"
+            )
         from minisgl.kernel.deepep_moe import DeepEPMoeElasticBuffer
 
         # Low fan-in retains the aligned 24-SM DeepEP grid. Once at least
@@ -1222,6 +1235,95 @@ class AfdFmhaRuntime:
             f"{'microbatch_main' if self.num_mb > 1 else 'default'}",
             flush=True,
         )
+
+    def _create_megamoe(self) -> None:
+        """Transform FP8 experts and allocate one symmetric buffer per lane."""
+        from minisgl.kernel import deepgemm as deep_gemm
+        from minisgl.moe.megamoe_afd import MegaMoEAfdAdapter
+
+        assert self.moe_group is not None
+        layers = list(self.model.model.layers.op_list)
+        if not layers:
+            raise RuntimeError("FMHA-only MegaMoE requires transformer layers")
+        experts0 = layers[0].mlp.experts
+        adapter = MegaMoEAfdAdapter(
+            group=self.moe_group,
+            num_experts=int(self.model_config.num_experts),
+            num_local_experts=int(experts0.local_num_experts),
+            hidden_size=int(self.model_config.hidden_size),
+            intermediate_size=int(self.model_config.moe_intermediate_size),
+            top_k=int(self.model_config.num_experts_per_tok),
+            num_max_tokens_per_rank=self.max_rows,
+            num_lanes=self.num_lanes,
+            tp_size=int(experts0.tp_size),
+            tp_rank=int(self.worker.tp_rank),
+            gate_renormalize=bool(self.model_config.norm_topk_prob),
+        )
+        for layer_id, layer in enumerate(layers):
+            experts = layer.mlp.experts
+            adapter.register_layer_weights(layer_id, experts)
+            experts.gate_up_proj = None
+            experts.gate_up_proj_scale = None
+            experts.down_proj = None
+            experts.down_proj_scale = None
+            if layer_id % 4 == 3:
+                torch.cuda.empty_cache()
+        adapter.allocate_buffers()
+        self._mega_moe = adapter
+
+        total_sms = int(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
+        # MegaMoE launches 2-CTA clusters.  The peer lane's one-CTA O-ready
+        # waiter is intentionally resident during compute, so leave one whole
+        # cluster available rather than stranding the final MegaMoE cluster.
+        reserved_sms = 2
+        compute_sms = total_sms - reserved_sms
+        if compute_sms <= 0 or compute_sms % 2:
+            raise RuntimeError(
+                "MegaMoE requires a positive even SM grid after reserving one "
+                f"2-CTA cluster: device_sms={total_sms} reserved_sms={reserved_sms}"
+            )
+        deep_gemm.set_num_sms(compute_sms)
+        if int(deep_gemm.get_num_sms()) != compute_sms:
+            raise RuntimeError(
+                "DeepGEMM rejected the MegaMoE compute-SM budget: "
+                f"requested={compute_sms} actual={int(deep_gemm.get_num_sms())}"
+            )
+        torch.cuda.empty_cache()
+        log_line(
+            self.worker.log_path,
+            f"[{self.role} rank={self.worker.tp_rank}] fmha_megamoe_buffers "
+            f"precision={adapter.precision} lanes={len(adapter.buffers)} "
+            f"group_ranks={adapter.group_size} group_experts={adapter.num_experts} "
+            f"compute_sms={compute_sms} reserved_sms={reserved_sms}",
+            flush=True,
+        )
+
+    def _run_model_moe(
+        self,
+        layer_id: int,
+        layer: Any,
+        hidden: torch.Tensor,
+        *,
+        lane: int,
+    ) -> torch.Tensor:
+        mega_moe = getattr(self, "_mega_moe", None)
+        if mega_moe is None:
+            prepared = layer.mlp.prepare_deepep(hidden)
+            return layer.mlp.finish_deepep(prepared)
+        output = mega_moe.forward(
+            layer_id,
+            hidden,
+            layer.mlp.gate.weight,
+            lane=lane,
+            num_token_non_padded=self.state.ctx.moe_num_token_non_padded,
+        )
+        if int(layer.mlp.experts.tp_size) > 1:
+            output = layer.mlp.experts._comm.all_reduce(output)
+        return output
 
     def warmup_decode_graphs(self, bs_list: tuple[int, ...]) -> list[int]:
         if not self.worker.enable_decode_graph:
@@ -1650,7 +1752,13 @@ class AfdFmhaRuntime:
                             hidden[mb], residual[mb]
                         )
                     )
-                    hidden[mb] = layer.mlp.forward(hidden[mb])
+                    hidden[mb] = (
+                        self._run_model_moe(
+                            layer_id, layer, hidden[mb], lane=mb % self.num_lanes
+                        )
+                        if getattr(self, "_mega_moe", None) is not None
+                        else layer.mlp.forward(hidden[mb])
+                    )
                 next_round = round_index + window
                 if next_round < total_rounds:
                     next_layer_id, next_mb = divmod(next_round, self.num_mb)
@@ -1779,10 +1887,9 @@ class AfdFmhaRuntime:
                         hidden[mb], residual[mb]
                     )
                 )
-                prepared_moe = layer.mlp.prepare_deepep(hidden[mb])
-                dispatched_moe = layer.mlp.dispatch_deepep(prepared_moe)
-                expert_output = layer.mlp.run_deepep_experts(dispatched_moe)
-                hidden[mb] = layer.mlp.combine_deepep(expert_output)
+                hidden[mb] = self._run_model_moe(
+                    layer_id, layer, hidden[mb], lane=lane
+                )
 
             next_round = round_index + window
             if next_round < total_rounds:

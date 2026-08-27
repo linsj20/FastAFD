@@ -22,6 +22,7 @@ FMHA_METRIC_VERSION = "20260820-fmha-only-dual-role-cuda-graph-span-v1"
 CASE_ID_PATTERN = re.compile(
     r"(?:i[1-9][0-9]*|r[1-9][0-9]*-[1-9][0-9]*)-"
     r"fep[1-9][0-9]*-r[1-9][0-9]*-atp[1-9][0-9]*-b[1-9][0-9]*"
+    r"(?:-(?:fp8|fp4))?"
 )
 STATE_KINDS = ("claims", "completed", "failed")
 CASE_EXECUTION_FIELDS = (
@@ -47,6 +48,11 @@ CASE_EXECUTION_FIELDS = (
     "required_max_outliers",
     "required_dominant_range_percent_limit",
     "required_max_median_diff_percent_limit",
+    "afd_memory_ratio",
+    "afd_num_pages",
+    "afd_kv_capacity_tokens",
+    "require_capacity_max",
+    "megamoe_expert_weight_dtype",
 )
 LEGACY_SELECTION_POLICY = (
     "atomically claim the lowest rerun_index matching allocated_trays; "
@@ -194,6 +200,11 @@ def read_plan(path: Path) -> list[dict[str, str]]:
         "legacy_isl_mode",
         "isl_tokens",
         "normalized_af_ratio",
+        "afd_memory_ratio",
+        "afd_num_pages",
+        "afd_kv_capacity_tokens",
+        "require_capacity_max",
+        "megamoe_expert_weight_dtype",
     }
     if not rows or not required.issubset(rows[0]):
         raise RuntimeError(f"online plan schema mismatch: {path}")
@@ -227,6 +238,15 @@ def validate_plan_rows(rows: list[dict[str, str]], source: str) -> None:
             or row["legacy_isl_mode"] not in {"uniform", "irregular"}
             or (row["legacy_isl_mode"] == "uniform") != bool(row["isl_tokens"])
             or int(row["normalized_af_ratio"]) < 1
+            or row["megamoe_expert_weight_dtype"] not in {"fp8", "fp4"}
+            or not case_id.endswith(f"-{row['megamoe_expert_weight_dtype']}")
+            or not 0 < float(row["afd_memory_ratio"]) <= 1
+            or (
+                row["afd_num_pages"] != "none"
+                and int(row["afd_num_pages"]) < 1
+            )
+            or int(row["afd_kv_capacity_tokens"]) < 1
+            or row["require_capacity_max"] not in {"0", "1"}
         ):
             raise RuntimeError(f"invalid corrected contract for {case_id} in {source}")
 

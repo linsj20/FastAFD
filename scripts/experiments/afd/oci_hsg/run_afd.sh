@@ -488,6 +488,30 @@ if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
         "$AFD_MODEL_PLACEMENT_REQUESTED" "$AFD_MODEL_PLACEMENT" \
         "$AFD_MODEL_PLACEMENT_POLICY" "$NORMALIZED_AF_RATIO"
 fi
+if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then
+    DEFAULT_AFD_MOE_BACKEND=megamoe
+else
+    DEFAULT_AFD_MOE_BACKEND=deepep
+fi
+MINISGL_AFD_MOE_BACKEND=${MINISGL_AFD_MOE_BACKEND:-$DEFAULT_AFD_MOE_BACKEND}
+case "$MINISGL_AFD_MOE_BACKEND" in
+    deepep|megamoe|megamoe_m2n) ;;
+    *) echo "MINISGL_AFD_MOE_BACKEND must be deepep, megamoe, or megamoe_m2n" >&2; exit 2 ;;
+esac
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$AFD_MODEL_PLACEMENT" != fmha-only ]]; then
+    echo "MINISGL_AFD_MOE_BACKEND=megamoe requires fmha-only placement" >&2
+    exit 2
+fi
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != legacy ]]; then
+    echo "MINISGL_AFD_MOE_BACKEND=megamoe_m2n requires legacy placement" >&2
+    exit 2
+fi
+MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=${MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE:-fp8}
+case "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" in
+    fp8|fp4) ;;
+    *) echo "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE must be fp8 or fp4" >&2; exit 2 ;;
+esac
+export MINISGL_AFD_MOE_BACKEND MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
 if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 ]]; then
     echo "irregular prompt-length ranges are supported only for Qwen3" >&2
     exit 2
@@ -610,10 +634,27 @@ CASE_PORT_SLOT=${FASTAFD_CASE_PORT_SLOT:-$CASE_ORDINAL}
     echo "FASTAFD_CASE_PORT_SLOT must be single or a non-negative integer" >&2
     exit 2
 }
+CASE_ID=single
+if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
+    if (( IRREGULAR )); then
+        DEFAULT_CASE_ID=r${CONTEXT_MIN}-${CONTEXT_MAX}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
+    else
+        DEFAULT_CASE_ID=i${CONTEXT}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
+    fi
+    CASE_ID=${FASTAFD_CASE_ID:-$DEFAULT_CASE_ID}
+    if [[ -n "${FASTAFD_CASE_ID:-}" ]]; then
+        [[ "$CASE_ID" == "$DEFAULT_CASE_ID-$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" ]] || {
+            echo "FASTAFD_CASE_ID must identify the shape and MegaMoE precision" >&2
+            exit 2
+        }
+    fi
+fi
 
 if [[ "${FASTAFD_DRY_RUN:-0}" == 1 && -z "${SLURM_JOB_ID:-}" ]]; then
-    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
-        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
+    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s afd_model_placement=%s afd_moe_backend=%s megamoe_expert_weight_dtype=%s case_id=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
+        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$MINISGL_AFD_MOE_BACKEND" \
+        "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" "$CASE_ID" \
+        "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
         "$BATCH" "$CAPACITY_MAX_BATCH" "$RAW_KV_MAX_BATCH" "$REQUIRE_CAPACITY_MAX" \
         "$MICROBATCH_REAL_SIZES" "$NODES" "$ALLOCATED_GPUS" \
         "$ACTIVE_GPUS" "$SHARED_ROLE_TRAYS" "$NORMALIZED_AF_RATIO" \
@@ -739,6 +780,9 @@ if [[ "${FASTAFD_IN_CONTAINER:-0}" != 1 ]]; then
         ALLOW_OBSERVED_CAPACITY_PROBE="$ALLOW_OBSERVED_CAPACITY_PROBE" \
         MAX_SEQ_LEN="$MAX_SEQ_LEN" NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE" \
         NSYS_CAPTURE_DECODE_STEPS="$NSYS_CAPTURE_DECODE_STEPS" \
+        AFD_MODEL_PLACEMENT="$AFD_MODEL_PLACEMENT" \
+        MINISGL_AFD_MOE_BACKEND="$MINISGL_AFD_MOE_BACKEND" \
+        MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" \
         MODEL_PATH="$MODEL_PATH" \
         MODEL_SOURCE_PATH="$MODEL_SOURCE_PATH" MODEL_CONFIG_SHA256="$MODEL_CONFIG_SHA256" \
         MODEL_SOURCE_CONFIG_SHA256="$MODEL_SOURCE_CONFIG_SHA256" \
@@ -1567,6 +1611,7 @@ PADDED_BATCH=$PADDED_BATCH PROMPT_MANIFEST=$PROMPT_MANIFEST \
 AFD_MEMORY_RATIO=$AFD_MEMORY_RATIO \
 AFD_NUM_PAGES=$AFD_NUM_PAGES \
 OUTPUT_TOKENS=$OUTPUT_TOKENS TRACE_WARMUP_DECODE_STEPS=$TRACE_WARMUP_DECODE_STEPS \
+MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE \
 "$PYTHON" - <<'PY'
 import json, os, re, statistics
 from pathlib import Path
@@ -1600,6 +1645,8 @@ trace_warmup_steps = int(os.environ["TRACE_WARMUP_DECODE_STEPS"])
 model_placement = os.environ["AFD_MODEL_PLACEMENT"]
 model_placement_requested = os.environ["AFD_MODEL_PLACEMENT_REQUESTED"]
 model_placement_policy = os.environ["AFD_MODEL_PLACEMENT_POLICY"]
+moe_backend = os.environ["MINISGL_AFD_MOE_BACKEND"]
+megamoe_expert_weight_dtype = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"]
 num_mb = int(os.environ["AFD_NUM_MB"])
 mb_base, mb_remainder = divmod(batch, num_mb)
 if model_placement == "fmha-only":
@@ -1782,6 +1829,8 @@ result = {
     "afd_model_placement": model_placement,
     "afd_model_placement_requested": model_placement_requested,
     "afd_model_placement_policy": model_placement_policy,
+    "afd_moe_backend": moe_backend,
+    "megamoe_expert_weight_dtype": megamoe_expert_weight_dtype,
     "model_key": os.environ.get("MODEL_KEY"),
     "prompt_mode": os.environ["PROMPT_MODE"],
     "context_tokens": context,
@@ -1904,16 +1953,12 @@ print(json.dumps(result, indent=2, sort_keys=True))
 PY
 
 if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
-    if (( IRREGULAR )); then
-        CASE_ID=r${CONTEXT_MIN}-${CONTEXT_MAX}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
-    else
-        CASE_ID=i${CONTEXT}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
-    fi
     CUDA_CASE_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT/$SLURM_JOB_ID-$CASE_ORDINAL
     mkdir -p "$CUDA_METRICS_ROOT" "$CUDA_CASE_TEMP_ROOT"
     "$PYTHON" "$CUDA_EXTRACT_SCRIPT" \
         --result "$RUN_DIR/afd-result.json" \
         --plan "$CUDA_METRIC_PLAN" \
+        --case-id "$CASE_ID" \
         --nsys /usr/local/cuda/bin/nsys \
         --cuda-span-module "$CUDA_SPAN_MODULE" \
         --temp-root "$CUDA_CASE_TEMP_ROOT" \

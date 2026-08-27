@@ -11,6 +11,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GB200OverlapContractTests(unittest.TestCase):
+    def test_bundle_pool_accepts_precision_qualified_case_ids(self) -> None:
+        path = (
+            ROOT
+            / "scripts/experiments/afd/oci_hsg/afd_online_case_pool.py"
+        )
+        spec = importlib.util.spec_from_file_location("afd_online_case_pool", path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for precision in ("fp8", "fp4"):
+            case_id = f"i131072-fep8-r7-atp1-b6-{precision}"
+            self.assertEqual(module.validate_case_id(case_id), case_id)
+
     def test_gpu_cleanup_uses_pidfd_events_without_sleep(self) -> None:
         path = (
             ROOT
@@ -159,6 +173,32 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn('if [[ "$ALLOW_DIRTY_SOURCE" == 1 ]]; then', runner)
         self.assertIn('SOURCE_VALIDATION_DETAIL="dirty_source_with_manifest"', runner)
 
+    def test_reproduction_window_retains_warmup_and_all_measured_steps(self) -> None:
+        source = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh"
+        ).read_text()
+        self.assertIn("TRACE_WARMUP_DECODE_STEPS=1", source)
+        self.assertIn(
+            "OUTPUT_TOKENS=$((1 + TRACE_WARMUP_DECODE_STEPS + "
+            "NSYS_CAPTURE_DECODE_STEPS))",
+            source,
+        )
+        self.assertIn("MAX_TOKENS=$OUTPUT_TOKENS", source)
+        self.assertIn("set(lengths) != {output_tokens}", source)
+        self.assertIn(
+            'r"target_batch_per_dp=(\\d+) warmup_step_id=(\\d+) "', source
+        )
+        self.assertIn('r"step_ids=([0-9,]+) count=(\\d+) trace_count=(\\d+)"', source)
+        self.assertIn("int(trace_count) != 16", source)
+        self.assertIn("int(captured_warmup) != steps[0] - 1", source)
+        self.assertIn('capture = json.loads((run / "capture-complete.json").read_text())', source)
+        self.assertIn('capture.get("trace_decode_step_ids") != expected_trace_steps', source)
+        self.assertIn('capture.get("gpu_worker_profiler_stop_logs", -1)', source)
+        self.assertIn('worker_log.count("nsys profiler:start sync=1") != 1', source)
+        self.assertIn('worker_log.count("nsys profiler:stop sync=1") != 1', source)
+        self.assertNotIn("afd_ag_decode_graph:replay step_id=", source)
+        self.assertNotIn("MAX_TOKENS=16", source)
+
     def test_fmha_campaign_uses_launch_safe_prefill_and_shared_builds(self) -> None:
         runner = (
             ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
@@ -199,6 +239,21 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("historical-runtime watchdog", bundle)
         self.assertIn("watchdog_timeout=1", bundle)
         self.assertIn("watchdog_timeout || failures >= MAX_FAILURES", bundle)
+        self.assertIn("per-case AFD memory contract is incomplete", bundle)
+        self.assertIn(
+            "per-case MegaMoE expert weight dtype must be fp8 or fp4", bundle
+        )
+        self.assertIn(
+            "case_id must end with its MegaMoE expert weight dtype", bundle
+        )
+        self.assertIn('FASTAFD_CASE_ID="$case_id"', bundle)
+        self.assertIn(
+            'FASTAFD_AFD_KV_CAPACITY_TOKENS="$case_kv_capacity"', bundle
+        )
+        self.assertIn(
+            'MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$case_expert_weight_dtype"',
+            bundle,
+        )
 
     def test_trtllm_decode_matches_original_source_policy(self) -> None:
         path = ROOT / "python/minisgl/attention/trtllm.py"
@@ -589,6 +644,102 @@ class GB200OverlapContractTests(unittest.TestCase):
             "        return _MoEMLPPrepared(",
             model_source,
         )
+
+    def test_fmha_megamoe_adds_fp8_fp8_without_replacing_fp8_fp4(self) -> None:
+        api_source = (
+            ROOT
+            / "python/minisgl/kernel/csrc/deepgemm/csrc/apis/mega.hpp"
+        ).read_text()
+        self.assertIn('m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe)', api_source)
+        self.assertIn('m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe)', api_source)
+
+        jit_source = (
+            ROOT
+            / "python/minisgl/kernel/csrc/deepgemm/csrc/jit_kernels/impls/"
+            "sm100_fp8_fp4_mega_moe.hpp"
+        ).read_text()
+        self.assertIn("static void sm100_fp8_fp4_mega_moe(", jit_source)
+        self.assertIn("static void sm100_fp8_fp8_mega_moe(", jit_source)
+        self.assertIn("/* use_fp8_weights */ false", jit_source)
+        self.assertIn("/* use_fp8_weights */ true", jit_source)
+
+        kernel_source = (
+            ROOT
+            / "python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/deep_gemm/"
+            "impls/sm100_fp8_fp4_mega_moe.cuh"
+        ).read_text()
+        self.assertIn("std::conditional_t<kUseFP8Weights", kernel_source)
+        self.assertIn(
+            "kUseFP8Weights ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE",
+            kernel_source,
+        )
+
+        adapter_source = (
+            ROOT / "python/minisgl/moe/megamoe_afd.py"
+        ).read_text()
+        self.assertIn("requant_qwen_fp8_weights_per32(", adapter_source)
+        self.assertIn("requant_qwen_fp8_weights_to_fp4(", adapter_source)
+        self.assertIn("_mega.fp8_fp8_mega_moe", adapter_source)
+        self.assertIn("_mega.fp8_fp4_mega_moe", adapter_source)
+        self.assertNotIn("num_concurrent_lanes=self.num_lanes", adapter_source)
+        self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", adapter_source)
+
+        wrapper_source = (
+            ROOT / "python/minisgl/kernel/megamoe_mega.py"
+        ).read_text()
+        self.assertIn("def fp8_fp4_mega_moe(", wrapper_source)
+        self.assertIn("_ext().fp8_fp4_mega_moe(", wrapper_source)
+
+        weight_source = (
+            ROOT / "python/minisgl/kernel/megamoe_m2n_mega.py"
+        ).read_text()
+        self.assertIn("def requant_qwen_fp8_weights_to_fp4(", weight_source)
+
+        runtime_source = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()
+        create_start = runtime_source.index("    def _create_megamoe")
+        create_end = runtime_source.index("    def _run_model_moe", create_start)
+        create_source = runtime_source[create_start:create_end]
+        self.assertIn("reserved_sms = 2", create_source)
+        self.assertIn("compute_sms = total_sms - reserved_sms", create_source)
+        self.assertIn("compute_sms <= 0 or compute_sms % 2", create_source)
+        self.assertIn("deep_gemm.set_num_sms(compute_sms)", create_source)
+        self.assertIn("reserved_sms={reserved_sms}", create_source)
+
+    def test_fmha_only_defaults_to_same_rank_megamoe(self) -> None:
+        support_source = (ROOT / "python/minisgl/afd_support.py").read_text()
+        self.assertIn(
+            'default_backend = "megamoe" if placement == "fmha-only" else "deepep"',
+            support_source,
+        )
+        self.assertIn(
+            'backend == "megamoe" and placement != "fmha-only"', support_source
+        )
+        self.assertIn(
+            'backend == "megamoe_m2n" and placement != "legacy"', support_source
+        )
+
+        runner = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh"
+        ).read_text()
+        self.assertIn("legacy) DEFAULT_AFD_MOE_BACKEND=megamoe_m2n", runner)
+        self.assertIn("fmha-only) DEFAULT_AFD_MOE_BACKEND=megamoe", runner)
+        self.assertIn(
+            "MINISGL_AFD_MOE_BACKEND=${MINISGL_AFD_MOE_BACKEND:-$DEFAULT_AFD_MOE_BACKEND}",
+            runner,
+        )
+        self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", runner)
+        self.assertIn('FASTAFD_JOB_TIME_LIMIT:-01:00:00', runner)
+
+        campaign = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
+        ).read_text()
+        self.assertIn('if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then', campaign)
+        self.assertIn("DEFAULT_AFD_MOE_BACKEND=megamoe", campaign)
+        self.assertIn("DEFAULT_AFD_MOE_BACKEND=deepep", campaign)
+        self.assertIn("afd_moe_backend=%s", campaign)
+        self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", campaign)
+        self.assertIn("FASTAFD_CASE_ID must identify the shape", campaign)
+        self.assertIn('--case-id "$CASE_ID"', campaign)
 
     def test_model_lazy_setup_finishes_before_transport_ready_barrier(self) -> None:
         runtime_source = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()

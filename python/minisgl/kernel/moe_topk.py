@@ -106,7 +106,10 @@ def gate_topk(
     expert_map: torch.Tensor | None = None,
     num_token_non_padded: int | torch.Tensor | None = None,
     topk_idx_dtype: torch.dtype = torch.int32,
-    quant_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    quant_out: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None
+    ] | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
     16-way K-split) + softmax + top-k (+ optional renormalize) in ONE kernel
@@ -143,8 +146,35 @@ def gate_topk(
         device=hidden.device,
         num_tokens=int(n),
     )
-    ids = torch.empty((n, top_k), dtype=topk_idx_dtype, device=hidden.device)
-    weights = torch.empty((n, top_k), dtype=torch.float32, device=hidden.device)
+    if out is None:
+        ids = torch.empty((n, top_k), dtype=topk_idx_dtype, device=hidden.device)
+        weights = torch.empty((n, top_k), dtype=torch.float32, device=hidden.device)
+    else:
+        ids, weights = out
+        if (
+            tuple(ids.shape) != (n, top_k)
+            or ids.dtype != topk_idx_dtype
+            or not ids.is_cuda
+            or ids.device != hidden.device
+            or not ids.is_contiguous()
+        ):
+            raise RuntimeError(
+                "gate_topk output ids must be a contiguous CUDA tensor with "
+                f"shape={(n, top_k)} dtype={topk_idx_dtype}, got "
+                f"shape={tuple(ids.shape)} dtype={ids.dtype} device={ids.device}"
+            )
+        if (
+            tuple(weights.shape) != (n, top_k)
+            or weights.dtype != torch.float32
+            or not weights.is_cuda
+            or weights.device != hidden.device
+            or not weights.is_contiguous()
+        ):
+            raise RuntimeError(
+                "gate_topk output weights must be a contiguous CUDA FP32 tensor "
+                f"with shape={(n, top_k)}, got shape={tuple(weights.shape)} "
+                f"dtype={weights.dtype} device={weights.device}"
+            )
     if n == 0:
         return ids, weights
     partials, counters = _gate_topk_workspace(hidden.device, (n + 15) // 16)

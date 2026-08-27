@@ -9,6 +9,7 @@ import threading
 from typing import Any
 
 import ray
+from minisgl.env import afd_env
 from minisgl.scheduler.config import SchedulerConfig
 from minisgl.utils import div_ceil
 from minisgl.utils import is_sm100_supported
@@ -110,6 +111,24 @@ def _scope_cache_env(
 # ---------------------------------------------------------------------------
 # Runtime config and sizing records
 # ---------------------------------------------------------------------------
+
+
+def resolve_afd_moe_backend(model_placement: str) -> str:
+    """Resolve and validate the MoE transport/compute backend for a placement."""
+    placement = str(model_placement)
+    if placement not in ("legacy", "fmha-only"):
+        raise ValueError(f"unsupported AFD model placement {placement!r}")
+
+    default_backend = "megamoe" if placement == "fmha-only" else "deepep"
+    backend = str(afd_env("MOE_BACKEND", default_backend))
+    if backend not in ("deepep", "megamoe", "megamoe_m2n"):
+        raise ValueError(f"unsupported AFD MoE backend {backend!r}")
+    if backend == "megamoe" and placement != "fmha-only":
+        raise ValueError("same-rank megamoe requires fmha-only placement")
+    if backend == "megamoe_m2n" and placement != "legacy":
+        raise ValueError("split megamoe_m2n requires legacy placement")
+    return backend
+
 
 @dataclass(frozen=True)
 class AfdRuntimeSizing:
