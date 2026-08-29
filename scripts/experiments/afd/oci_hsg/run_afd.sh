@@ -506,11 +506,11 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != leg
     echo "MINISGL_AFD_MOE_BACKEND=megamoe_m2n requires legacy placement" >&2
     exit 2
 fi
-MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=${MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE:-fp8}
-case "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" in
-    fp8|fp4) ;;
-    *) echo "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE must be fp8 or fp4" >&2; exit 2 ;;
-esac
+MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=${MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE:-fp4}
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" != fp4 ]]; then
+    echo "FP8xFP4 MegaMoE requires MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp4" >&2
+    exit 2
+fi
 export MINISGL_AFD_MOE_BACKEND MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
 if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 ]]; then
     echo "irregular prompt-length ranges are supported only for Qwen3" >&2

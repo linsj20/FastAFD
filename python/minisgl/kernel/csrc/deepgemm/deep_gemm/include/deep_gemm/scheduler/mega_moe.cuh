@@ -23,6 +23,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerWave,
           uint32_t kNumSMs, uint32_t kNumRanks,
           uint32_t kRecvCountHighTarget = kNumSMs * kNumRanks,
+          bool kAcquireRecvCounts = false,
+          bool kRankReadyRecvCounts = false,
           typename workspace_t = layout::Workspace,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
@@ -44,6 +46,7 @@ struct MegaMoEScheduler {
 
     // Arrival counts
     const workspace_t& workspace;
+    const uint32_t* prefetched_recv_counts;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -60,7 +63,9 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const workspace_t& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(
+            const workspace_t& workspace, const uint32_t* prefetched_recv_counts = nullptr):
+            workspace(workspace), prefetched_recv_counts(prefetched_recv_counts) {
         block_idx = blockIdx.x;
     }
 
@@ -187,13 +192,25 @@ struct MegaMoEScheduler {
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
-            uint64_t value = 0;
+            uint32_t count = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
+                if constexpr (kRankReadyRecvCounts) {
+                    count = prefetched_recv_counts[expert_idx];
+                } else {
+                    uint64_t value = 0;
+                    do {
+                        if constexpr (kAcquireRecvCounts) {
+                            value = ptx::ld_acq_sys(
+                                workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                        } else {
+                            value = ptx::ld_volatile(
+                                workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                        }
+                    } while (static_cast<uint32_t>(value >> 32) != kRecvCountHighTarget);
+                    count = static_cast<uint32_t>(value);
+                }
             }
-            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+            stored_num_tokens_per_expert[i] = count;
         }
         __syncwarp();
     }

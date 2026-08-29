@@ -64,6 +64,11 @@ class MegaMoESymmBuffer:
             if self.num_ranks == 1
             else symm_mem.rendezvous(self.buffer, group=group)
         )
+        self.buffer_ptrs_device = torch.tensor(
+            self.handle.buffer_ptrs,
+            dtype=torch.int64,
+            device=self.buffer.device,
+        )
         self.buffer.zero_()
         dist.barrier(group=group)
         torch.cuda.synchronize()
@@ -88,12 +93,31 @@ class MegaMoESymmBuffer:
     def buffer_ptrs(self) -> list[int]:
         return list(self.handle.buffer_ptrs)
 
+    def route_prepare_args(
+        self, *, rank_ready: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, bool]:
+        return (
+            self.buffer,
+            self.buffer_ptrs_device,
+            self.rank,
+            self.num_ranks,
+            self.num_max_tokens_per_rank,
+            int(_dg.get_num_sms()),
+            bool(rank_ready),
+        )
+
 
 def fp8_fp8_mega_moe(
     y: torch.Tensor,
     l1_weights: tuple[torch.Tensor, torch.Tensor],
     l2_weights: tuple[torch.Tensor, torch.Tensor],
     sym_buffer: MegaMoESymmBuffer,
+    *,
+    debug_timings: torch.Tensor | None = None,
+    routes_prepared: bool = False,
+    rank_gated_combine: bool = False,
+    route_ready_dispatch: bool = False,
+    rank_ready_route_publish: bool = False,
 ) -> None:
     """Run one fused FP8-activation/FP8-weight MegaMoE kernel."""
     _ext().fp8_fp8_mega_moe(
@@ -111,6 +135,11 @@ def fp8_fp8_mega_moe(
         "swiglu",
         None,
         True,
+        debug_timings,
+        bool(routes_prepared),
+        bool(rank_gated_combine),
+        bool(route_ready_dispatch),
+        bool(rank_ready_route_publish),
     )
 
 
@@ -119,6 +148,12 @@ def fp8_fp4_mega_moe(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
     l2_weights: tuple[torch.Tensor, torch.Tensor],
     sym_buffer: MegaMoESymmBuffer,
+    *,
+    debug_timings: torch.Tensor | None = None,
+    routes_prepared: bool = False,
+    rank_gated_combine: bool = False,
+    route_ready_dispatch: bool = False,
+    rank_ready_route_publish: bool = False,
 ) -> None:
     """Run one fused FP8-activation/MXFP4-weight MegaMoE kernel."""
     _ext().fp8_fp4_mega_moe(
@@ -136,6 +171,11 @@ def fp8_fp4_mega_moe(
         "swiglu",
         None,
         True,
+        debug_timings,
+        bool(routes_prepared),
+        bool(rank_gated_combine),
+        bool(route_ready_dispatch),
+        bool(rank_ready_route_publish),
     )
 
 

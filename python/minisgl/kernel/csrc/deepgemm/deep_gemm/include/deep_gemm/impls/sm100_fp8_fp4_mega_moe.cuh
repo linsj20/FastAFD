@@ -19,6 +19,43 @@
 
 namespace deep_gemm {
 
+namespace mega_detail {
+
+enum class TimingSlot: uint32_t {
+    DispatchPrePull = 0,
+    DispatchPull = 1,
+    DispatchCleanup = 2,
+    TmaALoop = 3,
+    TmaAFirstL1ArrivalWait = 4,
+    TmaAL1ArrivalWait = 5,
+    TmaAL2ArrivalWait = 6,
+    TmaAEmptyWait = 7,
+    TmaBLoop = 8,
+    TmaBEmptyWait = 9,
+    MmaLoop = 10,
+    MmaFirstFullWait = 11,
+    MmaTmemEmptyWait = 12,
+    MmaFullWait = 13,
+    EpilogueLoop = 14,
+    EpilogueTmemFullWait = 15,
+    L2RemoteWriteback = 16,
+    Tag2Barrier = 17,
+    Combine = 18,
+    TmaAFirstL1ReadyFromKernelStart = 19,
+    MmaFirstFullReadyFromKernelStart = 20,
+    NumSlots = 21,
+};
+
+CUTLASS_DEVICE void timing_store(
+    unsigned long long* debug_timings,
+    const TimingSlot& slot,
+    const unsigned long long& value) {
+    if (debug_timings != nullptr)
+        debug_timings[static_cast<uint32_t>(slot)] = value;
+}
+
+} // namespace mega_detail
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -36,6 +73,11 @@ template <
     float kActivationClamp,
     bool kFastMath,
     bool kUseFP8Weights = false,
+    bool kEnableDebugTiming = false,
+    bool kRoutesPrepared = false,
+    bool kRankGatedCombine = false,
+    bool kRouteReadyDispatch = false,
+    bool kRankReadyRoutePublish = false,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -51,6 +93,7 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
+                            unsigned long long* debug_timings,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -71,13 +114,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
-
+    DG_STATIC_ASSERT(not kRouteReadyDispatch or kRoutesPrepared,
+                     "Route-ready dispatch requires prepared routes");
+    DG_STATIC_ASSERT(not kRankReadyRoutePublish or kRouteReadyDispatch,
+                     "Rank-ready route publication requires route-ready dispatch");
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t sm_idx = blockIdx.x;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+    const bool do_timing_leader =
+        kEnableDebugTiming and sm_idx == 0 and lane_idx == 0;
+    const unsigned long long kernel_t0 =
+        do_timing_leader ? clock64() : 0;
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -317,6 +367,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // and `barrier.cluster.wait.aligned` is by default `.acquire`
     comm::cluster_sync_with_relaxed_arrive();
 
+    // Rank-ready publication replaces the per-expert completion atomics.
+    // Aggregate each local expert once per CTA, then share exact totals with
+    // every scheduler role through the existing expert-count shared memory.
+    if constexpr (kRankReadyRoutePublish) {
+        if (warp_idx == 0 and lane_idx < kNumExpertsPerRank) {
+            uint64_t ready = 0;
+            do {
+                ready = ptx::ld_acq_sys(workspace.get_route_ready_count_ptr());
+            } while (ready != kNumRanks);
+            uint32_t count = 0;
+            #pragma unroll
+            for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
+                const uint32_t rank_count = static_cast<uint32_t>(ptx::ld_volatile(
+                    workspace.get_expert_recv_count_ptr(
+                        rank_idx, lane_idx)));
+                count += rank_count;
+
+                // Cache all but the final rank expert-major. The exact total
+                // reconstructs that final count, so totals plus this cache fit
+                // in the existing kNumExperts shared-memory words.
+                if (rank_idx + 1 < kNumRanks)
+                    smem_expert_count[
+                        kNumExpertsPerRank +
+                        lane_idx * (kNumRanks - 1) + rank_idx] = rank_count;
+            }
+            smem_expert_count[lane_idx] = count;
+        }
+        __syncthreads();
+    }
+
     // Task scheduler
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
@@ -324,7 +404,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank,
         kNumExpertsPerWave,
-        kNumSMs, kNumRanks>(workspace);
+        kNumSMs, kNumRanks,
+        /* kRecvCountHighTarget = */ kNumSMs * kNumRanks,
+        /* kAcquireRecvCounts = */ kRouteReadyDispatch,
+        /* kRankReadyRecvCounts = */ kRankReadyRoutePublish>(workspace, smem_expert_count);
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
@@ -359,92 +442,110 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Grid sync index assignments (dispatch and epilogue use separate counters to avoid conflicts)
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
+    constexpr uint32_t kCleanupPublishCounterIndex = 2;
 
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+        const bool do_timing_dispatch_leader =
+            do_timing_leader and warp_idx == 0;
+        unsigned long long timing_t0 =
+            do_timing_dispatch_leader ? clock64() : 0;
 
-        // Dispatch warps
-        DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-        constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-        const auto read_topk_idx = [&](const auto& process) {
-            // TODO: figure out better unrolling
-            // Now, `unroll` is better than `unroll 8`
-            #pragma unroll
-            for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
-                 i < num_tokens;
-                 i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
-                // Allocate slots for each token-topk
-                int expert_idx = -1;
-                if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
-                    expert_idx = static_cast<int>(
-                        __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
-                    if (expert_idx >= 0)
-                        process(i * kNumTopk + lane_idx, expert_idx);
+        if constexpr (not kRoutesPrepared) {
+            // Dispatch warps
+            DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+            constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
+            const auto read_topk_idx = [&](const auto& process) {
+                // TODO: figure out better unrolling
+                // Now, `unroll` is better than `unroll 8`
+                #pragma unroll
+                for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
+                     i < num_tokens;
+                     i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
+                    // Allocate slots for each token-topk
+                    int expert_idx = -1;
+                    if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+                        expert_idx = static_cast<int>(
+                            __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+                        if (expert_idx >= 0)
+                            process(i * kNumTopk + lane_idx, expert_idx);
+                    }
+                    __syncwarp();
                 }
-                __syncwarp();
-            }
-        };
+            };
 
-        // Count experts' tokens
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-           atomicAdd_block(smem_expert_count + expert_idx, 1);
-        });
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            // Count experts' tokens
+            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+               atomicAdd_block(smem_expert_count + expert_idx, 1);
+            });
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Get SM offset (~6.5 us)
-        #pragma unroll
-        for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-            smem_expert_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
-        }
-        ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-
-        // Write source indices (~2 us with 512 tokens)
-        read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
-            const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-            const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
-        });
-
-        // Grid sync
-        comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
-        );
-
-        // Write expert count
-        if (sm_idx == 0) {
+            // Get SM offset (~6.5 us)
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
+                smem_expert_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+            // Write source indices (~2 us with 512 tokens)
+            read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+                const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
+                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            });
+
+            // Grid sync
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+            );
+
+            // Write expert count
+            if (sm_idx == 0) {
+                #pragma unroll
+                for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                    const auto dst_rank_idx = i / kNumExpertsPerRank;
+                    const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+                    const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                    *sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                        dst_rank_idx) = expert_status & 0xffffffff;
+                    ptx::atomic_add_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                        expert_status);
+                }
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-        // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
+        // Prepared routes publish an exact per-expert completion word. Acquiring
+        // those words is sufficient for dispatch and avoids waiting for ranks
+        // that own no local route dependency. Keep the original rank barrier as
+        // a separately compiled control specialization.
+        if constexpr (not kRouteReadyDispatch) {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        if (do_timing_dispatch_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::DispatchPrePull,
+                clock64() - timing_t0);
+            timing_t0 = clock64();
+        }
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
@@ -484,12 +585,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Load per-rank counts when expert changes
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
-                #pragma unroll
-                for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
-                    const uint32_t j = i * 32 + lane_idx;
-                    // TODO: this is not coalesced
-                    stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                if constexpr (kRankReadyRoutePublish) {
+                    uint32_t cached_count_sum = 0;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        const uint32_t rank_count = j + 1 < kNumRanks ?
+                            smem_expert_count[
+                                kNumExpertsPerRank +
+                                current_expert_idx * (kNumRanks - 1) + j] : 0;
+                        stored_rank_count[i] = rank_count;
+                        cached_count_sum += rank_count;
+                    }
+
+                    // The cache omits the final rank to share storage with the
+                    // exact expert totals. Reconstruct it once per warp.
+                    const uint32_t final_rank_count =
+                        scheduler.get_num_tokens(current_expert_idx) -
+                        __reduce_add_sync(0xffffffff, cached_count_sum);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        if (j + 1 == kNumRanks)
+                            stored_rank_count[i] = final_rank_count;
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        stored_rank_count[i] = j < kNumRanks ?
+                            static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(
+                                j, current_expert_idx)) : 0;
+                    }
                 }
             }
 
@@ -607,6 +734,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+        if (do_timing_dispatch_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::DispatchPull,
+                clock64() - timing_t0);
+            timing_t0 = clock64();
+        }
+
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -621,8 +755,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
                 // Read expert token count before clearing
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    *workspace.get_expert_recv_count_sum_ptr(i));
+                uint32_t num_recv_tokens;
+                if constexpr (kRankReadyRoutePublish)
+                    num_recv_tokens = scheduler.get_num_tokens(i);
+                else
+                    num_recv_tokens = static_cast<uint32_t>(
+                        *workspace.get_expert_recv_count_sum_ptr(i));
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
@@ -655,19 +793,68 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        // Only blocks that can own cleanup work join the local publication
+        // ticket. Block 0 waits for that exact set before retaining the same
+        // cross-rank cleanup barrier.
+        constexpr uint32_t kNumCleanupBlocks =
+            kNumExpertsPerRank + 1 < kNumSMs ? kNumExpertsPerRank + 1 : kNumSMs;
+        auto* cleanup_counter =
+            workspace.template get_grid_sync_count_ptr<
+                kCleanupPublishCounterIndex>();
+        if (sm_idx < kNumCleanupBlocks) {
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if (thread_idx == 0)
+                ptx::atomic_add_acqrel_gpu(cleanup_counter, 1);
+        }
+        if (sm_idx == 0) {
+            constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+            const auto start_clock = clock64();
+            if (thread_idx < kNumRanks) {
+                while (ptx::ld_acq(cleanup_counter) != kNumCleanupBlocks) {
+                    if (thread_idx == 0 and
+                        clock64() - start_clock >= kNumTimeoutCycles) {
+                        printf("MegaMoE cleanup ticket timeout (300s): rank=%d ready=%u target=%u\n",
+                               sym_buffer.rank_idx, ptx::ld_acq(cleanup_counter),
+                               kNumCleanupBlocks);
+                        DG_DEVICE_ASSERT(false and
+                            "Cleanup ticket timeout");
+                    }
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            if constexpr (kRankReadyRoutePublish) {
+                if (thread_idx == 0)
+                    *workspace.get_route_ready_count_ptr() = 0;
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            }
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Local cleanup ticket replaces the grid sync */ false,
+                /* At the end of kernel does not need to sync */ false
+            );
+            if (thread_idx == 0)
+                *cleanup_counter = 0;
+        }
+        if (do_timing_dispatch_leader)
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::DispatchCleanup,
+                clock64() - timing_t0);
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for tokens with SFA
+        const bool do_timing_tmaa_leader = do_timing_leader;
+        const unsigned long long loop_t0 =
+            do_timing_tmaa_leader ? clock64() : 0;
+        unsigned long long first_l1_arrival_wait_cycles = 0;
+        unsigned long long first_l1_ready_from_kernel_start_cycles = 0;
+        unsigned long long l1_arrival_wait_cycles = 0;
+        unsigned long long l2_arrival_wait_cycles = 0;
+        unsigned long long empty_wait_cycles = 0;
+        bool recorded_first_l1_arrival_wait = false;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -687,7 +874,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (block_phase == sched::BlockPhase::Linear1) {
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
+                const unsigned long long wait_t0 =
+                    do_timing_tmaa_leader ? clock64() : 0;
                 while (ptx::ld_acq(ptr) != expected);
+                if (do_timing_tmaa_leader) {
+                    const auto wait_cycles = clock64() - wait_t0;
+                    l1_arrival_wait_cycles += wait_cycles;
+                    if (not recorded_first_l1_arrival_wait) {
+                        first_l1_arrival_wait_cycles = wait_cycles;
+                        first_l1_ready_from_kernel_start_cycles =
+                            clock64() - kernel_t0;
+                        recorded_first_l1_arrival_wait = true;
+                    }
+                }
             } else {
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
@@ -700,12 +899,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
                 // to avoid undefined behavior when `num_k_blocks == 32`
                 const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
+                const unsigned long long wait_t0 =
+                    do_timing_tmaa_leader ? clock64() : 0;
                 while (ptx::ld_acq_gpu(ptr) != expected);
+                if (do_timing_tmaa_leader)
+                    l2_arrival_wait_cycles += clock64() - wait_t0;
             }
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
+                const unsigned long long wait_t0 =
+                    do_timing_tmaa_leader ? clock64() : 0;
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                if (do_timing_tmaa_leader)
+                    empty_wait_cycles += clock64() - wait_t0;
 
                 // Compute token offset from pool block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -732,11 +939,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         });
+        if (do_timing_tmaa_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaALoop,
+                clock64() - loop_t0);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaAFirstL1ArrivalWait,
+                first_l1_arrival_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaAL1ArrivalWait,
+                l1_arrival_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaAL2ArrivalWait,
+                l2_arrival_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaAEmptyWait,
+                empty_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings,
+                mega_detail::TimingSlot::TmaAFirstL1ReadyFromKernelStart,
+                first_l1_ready_from_kernel_start_cycles);
+        }
     } else if (warp_idx == kNumDispatchWarps + 1) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+        const bool do_timing_tmab_leader = do_timing_leader;
+        const unsigned long long loop_t0 =
+            do_timing_tmab_leader ? clock64() : 0;
+        unsigned long long empty_wait_cycles = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -752,7 +984,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
+                const unsigned long long wait_t0 =
+                    do_timing_tmab_leader ? clock64() : 0;
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                if (do_timing_tmab_leader)
+                    empty_wait_cycles += clock64() - wait_t0;
 
                 // Compute weight offset
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
@@ -778,11 +1014,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         });
+        if (do_timing_tmab_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaBLoop,
+                clock64() - loop_t0);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::TmaBEmptyWait,
+                empty_wait_cycles);
+        }
     } else if (warp_idx == kNumDispatchWarps + 2) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM MMA issue warp (only the leader CTA will run)
+        const bool do_timing_mma_leader = do_timing_leader and is_leader_cta;
+        const unsigned long long loop_t0 =
+            do_timing_mma_leader ? clock64() : 0;
+        unsigned long long first_full_wait_cycles = 0;
+        unsigned long long first_full_ready_from_kernel_start_cycles = 0;
+        unsigned long long tmem_empty_wait_cycles = 0;
+        unsigned long long full_wait_cycles = 0;
+        bool recorded_first_full_wait = false;
         if (is_leader_cta) {
             // Make instruction descriptor with block scaling
             // NOTES: always swap A/B
@@ -817,7 +1069,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Wait tensor memory empty barrier arrival
                 const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
                 const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+                unsigned long long wait_t0 =
+                    do_timing_mma_leader ? clock64() : 0;
                 tmem_empty_barriers[accum_stage_idx]->wait(accum_phase ^ 1);
+                if (do_timing_mma_leader)
+                    tmem_empty_wait_cycles += clock64() - wait_t0;
                 ptx::tcgen05_after_thread_sync();
 
                 // Empty barrier arrival
@@ -838,7 +1094,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 #pragma unroll 2
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                     // Wait TMA load completion
+                    wait_t0 = do_timing_mma_leader ? clock64() : 0;
                     full_barriers[stage_idx]->wait(phase);
+                    if (do_timing_mma_leader) {
+                        const auto wait_cycles = clock64() - wait_t0;
+                        full_wait_cycles += wait_cycles;
+                        if (not recorded_first_full_wait) {
+                            first_full_wait_cycles = wait_cycles;
+                            first_full_ready_from_kernel_start_cycles =
+                                clock64() - kernel_t0;
+                            recorded_first_full_wait = true;
+                        }
+                    }
                     ptx::tcgen05_after_thread_sync();
 
                     const auto a_desc_base_lo = ptx::exchange(a_desc_lo, stage_idx);
@@ -888,6 +1155,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 tmem_empty_barriers[(current_iter_idx - 1) % kNumEpilogueStages]->wait(accum_phase_idx);
             }
         }
+        if (do_timing_mma_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::MmaLoop,
+                clock64() - loop_t0);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::MmaFirstFullWait,
+                first_full_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::MmaTmemEmptyWait,
+                tmem_empty_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::MmaFullWait,
+                full_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings,
+                mega_detail::TimingSlot::MmaFirstFullReadyFromKernelStart,
+                first_full_ready_from_kernel_start_cycles);
+        }
     } else if (warp_idx == kNumDispatchWarps + 3) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -928,6 +1213,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Persistently schedule over blocks
+        const bool do_timing_epi_leader =
+            do_timing_leader and epilogue_warp_idx == 0;
+        const unsigned long long loop_t0 =
+            do_timing_epi_leader ? clock64() : 0;
+        unsigned long long tmem_full_wait_cycles = 0;
+        unsigned long long l2_remote_writeback_cycles = 0;
         uint32_t current_iter_idx = 0;
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
@@ -936,7 +1227,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Wait UMMA arrival
             const auto accum_stage_idx = current_iter_idx % kNumEpilogueStages;
             const auto accum_phase = (current_iter_idx ++ / kNumEpilogueStages) & 1;
+            const unsigned long long wait_t0 =
+                do_timing_epi_leader ? clock64() : 0;
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+            if (do_timing_epi_leader)
+                tmem_full_wait_cycles += clock64() - wait_t0;
             ptx::tcgen05_after_thread_sync();
 
             // Compute offsets
@@ -1132,6 +1427,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             } else {
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
+                const unsigned long long writeback_t0 =
+                    do_timing_epi_leader ? clock64() : 0;
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
                 #pragma unroll
@@ -1229,20 +1526,57 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if (do_timing_epi_leader)
+                    l2_remote_writeback_cycles += clock64() - writeback_t0;
             }
         });
+        if (do_timing_epi_leader) {
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::EpilogueLoop,
+                clock64() - loop_t0);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::EpilogueTmemFullWait,
+                tmem_full_wait_cycles);
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::L2RemoteWriteback,
+                l2_remote_writeback_cycles);
+        }
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
         if (epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
-        // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
-                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-        );
+        // Publish one completion epoch per producer rank, or retain the full
+        // tag-2 rank barrier for the control specialization.
+        const unsigned long long tag2_t0 =
+            do_timing_epi_leader ? clock64() : 0;
+        uint64_t combine_ready_epoch = 0;
+        if constexpr (kRankGatedCombine) {
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+            combine_ready_epoch =
+                static_cast<uint64_t>(*workspace.get_nvl_barrier_counter_ptr()) + 1;
+            if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
+                ptx::st_release_sys(
+                    sym_buffer.map(
+                        workspace.get_combine_ready_epoch_ptr(sym_buffer.rank_idx),
+                        epilogue_thread_idx),
+                    combine_ready_epoch);
+        } else {
+            // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+                                 kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+        }
+        if (do_timing_epi_leader)
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::Tag2Barrier,
+                clock64() - tag2_t0);
 
         // Barrier with dispatch warps, so that they can do clean workspace
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -1287,6 +1621,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         });
 
         // Iterate over all tokens
+        const unsigned long long combine_t0 =
+            do_timing_epi_leader ? clock64() : 0;
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
@@ -1294,9 +1630,47 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
              token_idx += kNumSMs * kNumEpilogueWarps) {
             // Read top-k slot indices: each lane reads one slot, then broadcast via exchange
             DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
-            const int stored_topk_slot_idx = lane_idx < kNumTopk ?
+            const int stored_expert_idx = lane_idx < kNumTopk ?
                 static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk + lane_idx)) : -1;
-            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+            const uint32_t total_mask = __ballot_sync(0xffffffff, stored_expert_idx >= 0);
+
+            if constexpr (kRankGatedCombine) {
+                const int expert_rank_idx = stored_expert_idx >= 0
+                    ? stored_expert_idx / static_cast<int>(kNumExpertsPerRank)
+                    : -1;
+                uint32_t required_rank_mask = 0;
+                #pragma unroll
+                for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
+                    if (__any_sync(0xffffffff,
+                                   expert_rank_idx == static_cast<int>(rank_idx)))
+                        required_rank_mask |= 1u << rank_idx;
+                }
+                if (lane_idx < kNumRanks and
+                    (required_rank_mask & (1u << lane_idx)) != 0) {
+                    constexpr int64_t kNumTimeoutCycles =
+                        300ll * 2000000000ll;
+                    const auto ready_epoch_ptr =
+                        workspace.get_combine_ready_epoch_ptr(lane_idx);
+                    const auto start_clock = clock64();
+                    while (ptx::ld_acq_sys(ready_epoch_ptr) !=
+                           combine_ready_epoch) {
+                        if (clock64() - start_clock >= kNumTimeoutCycles) {
+                            printf("MegaMoE rank-gated combine timeout (300s): rank=%d token=%d expert_rank=%d ready=%llu target=%llu\n",
+                                   sym_buffer.rank_idx, token_idx, lane_idx,
+                                   static_cast<unsigned long long>(
+                                       ptx::ld_acq_sys(ready_epoch_ptr)),
+                                   static_cast<unsigned long long>(
+                                       combine_ready_epoch));
+                            DG_DEVICE_ASSERT(false and
+                                "Rank-gated combine timeout");
+                        }
+                    }
+                }
+                // Only the first kNumRanks lanes perform epoch waits. Keep the
+                // remaining lanes from issuing combine loads until those
+                // dependencies are visible.
+                __syncwarp();
+            }
 
             // Iterate all chunks
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
@@ -1378,6 +1752,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             }
         }
+        if (do_timing_epi_leader)
+            mega_detail::timing_store(
+                debug_timings, mega_detail::TimingSlot::Combine,
+                clock64() - combine_t0);
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

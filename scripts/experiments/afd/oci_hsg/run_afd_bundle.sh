@@ -302,8 +302,8 @@ memory = [
 if not all(memory):
     raise SystemExit("per-case AFD memory contract is incomplete")
 precision = r.get("megamoe_expert_weight_dtype", "")
-if precision not in {"fp8", "fp4"}:
-    raise SystemExit("per-case MegaMoE expert weight dtype must be fp8 or fp4")
+if precision != "fp4":
+    raise SystemExit("per-case MegaMoE expert weight dtype must be fp4")
 if not c["case_id"].endswith(f"-{precision}"):
     raise SystemExit("case_id must end with its MegaMoE expert weight dtype")
 print("\t".join([
@@ -318,7 +318,7 @@ PY
     [[ "$case_num_pages" == none || "$case_num_pages" =~ ^[1-9][0-9]*$ ]]
     [[ "$case_kv_capacity" =~ ^[1-9][0-9]*$ ]]
     [[ "$case_require_capacity_max" == 0 || "$case_require_capacity_max" == 1 ]]
-    [[ "$case_expert_weight_dtype" == fp8 || "$case_expert_weight_dtype" == fp4 ]]
+    [[ "$case_expert_weight_dtype" == fp4 ]]
     if [[ "$case_num_pages" == none ]]; then
         case_num_pages=""
     fi

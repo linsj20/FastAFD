@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -16,10 +17,42 @@ from minisgl.kernel.fp8_quant import per_token_cast_to_fp8
 from minisgl.kernel.moe_topk import gate_topk
 
 
+_MEGAMOE_TIMING_SLOTS = (
+    "dispatch_pre_pull",
+    "dispatch_pull",
+    "dispatch_cleanup",
+    "tma_a_loop",
+    "tma_a_first_l1_arrival_wait",
+    "tma_a_l1_arrival_wait",
+    "tma_a_l2_arrival_wait",
+    "tma_a_empty_wait",
+    "tma_b_loop",
+    "tma_b_empty_wait",
+    "mma_loop",
+    "mma_first_full_wait",
+    "mma_tmem_empty_wait",
+    "mma_full_wait",
+    "epilogue_loop",
+    "epilogue_tmem_full_wait",
+    "l2_remote_writeback",
+    "tag2_barrier",
+    "combine",
+    "tma_a_first_l1_ready_from_kernel_start",
+    "mma_first_full_ready_from_kernel_start",
+)
+
+
 def _positive_int_list(name: str, default: str) -> list[int]:
     values = [int(value) for value in os.environ.get(name, default).split(",")]
     if not values or any(value <= 0 for value in values):
         raise RuntimeError(f"{name} must be a comma-separated list of positive integers")
+    return values
+
+
+def _nonnegative_int_list(name: str, default: str) -> list[int]:
+    values = [int(value) for value in os.environ.get(name, default).split(",")]
+    if not values or any(value < 0 for value in values):
+        raise RuntimeError(f"{name} must be a comma-separated list of nonnegative integers")
     return values
 
 
@@ -274,7 +307,7 @@ def _numeric_case(rank: int, world_size: int) -> dict[str, float]:
 
 def _exact_qwen_case(
     rank: int, world_size: int
-) -> dict[str, dict[str, float | int]]:
+) -> dict[str, dict[str, Any]]:
     row_counts = _positive_int_list("MEGAMOE_SMOKE_ROWS", "3")
     sm_counts = _positive_int_list(
         "MEGAMOE_SMOKE_SMS",
@@ -284,18 +317,88 @@ def _exact_qwen_case(
     iterations = int(os.environ.get("MEGAMOE_SMOKE_ITERATIONS", "100"))
     bucket = int(os.environ.get("MEGAMOE_SMOKE_BUCKET", str(max(row_counts))))
     contend_cycles = int(os.environ.get("MEGAMOE_SMOKE_CONTEND_CYCLES", "0"))
+    debug_timings = int(os.environ.get("MEGAMOE_SMOKE_DEBUG_TIMINGS", "0"))
+    route_prepare_modes = _nonnegative_int_list(
+        "MEGAMOE_SMOKE_ROUTE_PREPARE_MODES", "0"
+    )
+    combine_modes = _nonnegative_int_list(
+        "MEGAMOE_SMOKE_COMBINE_MODES", "0"
+    )
+    route_ready_dispatch_modes = _nonnegative_int_list(
+        "MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES", "0"
+    )
+    paired_modes_text = os.environ.get(
+        "MEGAMOE_SMOKE_SPECIALIZATION_MODES", ""
+    ).strip()
     if warmups < 0 or iterations <= 0:
         raise RuntimeError("MegaMoE smoke warmups must be nonnegative and iterations positive")
     if contend_cycles < 0:
         raise RuntimeError("MEGAMOE_SMOKE_CONTEND_CYCLES must be nonnegative")
+    if debug_timings not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_DEBUG_TIMINGS must be 0 or 1")
+    if any(mode not in (0, 1) for mode in route_prepare_modes):
+        raise RuntimeError("MEGAMOE_SMOKE_ROUTE_PREPARE_MODES only supports 0 and 1")
+    if any(mode not in (0, 1) for mode in combine_modes):
+        raise RuntimeError("MEGAMOE_SMOKE_COMBINE_MODES only supports 0 and 1")
+    if any(mode not in (0, 1) for mode in route_ready_dispatch_modes):
+        raise RuntimeError(
+            "MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES only supports 0 and 1"
+        )
+    if paired_modes_text:
+        specialization_modes: list[tuple[int, int, int, int]] = []
+        for entry in paired_modes_text.split(","):
+            fields = entry.split(":")
+            if len(fields) not in (2, 3, 4):
+                raise RuntimeError(
+                    "MEGAMOE_SMOKE_SPECIALIZATION_MODES entries must be "
+                    "route:combine[:dispatch[:rank-ready]] tuples"
+                )
+            mode = (
+                int(fields[0]),
+                int(fields[1]),
+                int(fields[2]) if len(fields) >= 3 else 0,
+                int(fields[3]) if len(fields) == 4 else 0,
+            )
+            if any(value not in (0, 1) for value in mode):
+                raise RuntimeError(
+                    "MEGAMOE_SMOKE_SPECIALIZATION_MODES only supports 0/1 "
+                    "route, combine, dispatch, and rank-ready fields"
+                )
+            if mode[2] and not mode[0]:
+                raise RuntimeError(
+                    "route-ready dispatch requires prepared routes"
+                )
+            if mode[3] and (not mode[0] or not mode[2]):
+                raise RuntimeError(
+                    "rank-ready publication requires prepared, route-ready dispatch"
+                )
+            specialization_modes.append(mode)
+    else:
+        specialization_modes = [
+            (route_mode, combine_mode, dispatch_mode, 0)
+            for route_mode in route_prepare_modes
+            for combine_mode in combine_modes
+            for dispatch_mode in route_ready_dispatch_modes
+            if not dispatch_mode or route_mode
+        ]
     if bucket < max(row_counts):
         raise RuntimeError(
             f"MEGAMOE_SMOKE_BUCKET={bucket} is smaller than rows={max(row_counts)}"
         )
+    if debug_timings and (len(row_counts) != 1 or len(sm_counts) != 1):
+        raise RuntimeError(
+            "MEGAMOE_SMOKE_DEBUG_TIMINGS requires exactly one row and SM configuration"
+        )
 
     hidden, intermediate = 4096, 1536
-    local_experts, top_k = 32, 8
-    num_experts = local_experts * world_size
+    num_experts = int(os.environ.get("MEGAMOE_SMOKE_NUM_EXPERTS", "128"))
+    top_k = 8
+    if num_experts <= 0 or num_experts % world_size:
+        raise RuntimeError(
+            "MEGAMOE_SMOKE_NUM_EXPERTS must be positive and divisible by "
+            f"world_size={world_size}, got {num_experts}"
+        )
+    local_experts = num_experts // world_size
     _l1, _l2, transformed = _make_weights(local_experts, hidden, intermediate)
     del _l1, _l2
     buffer = megamoe_mega.MegaMoESymmBuffer(
@@ -313,15 +416,25 @@ def _exact_qwen_case(
         (num_experts, hidden), dtype=torch.bfloat16, device="cuda"
     )
     expert_map = torch.arange(num_experts, dtype=torch.int64, device="cuda")
-    results: dict[str, dict[str, float | int]] = {}
+    results: dict[str, dict[str, Any]] = {}
 
     for rows in row_counts:
-        hidden_view = hidden_states[:rows]
+        hidden_views = (
+            hidden_states[:rows],
+            -hidden_states[:rows],
+        )
+        hidden_view = hidden_views[0]
         ids = buffer.topk_idx[:rows]
         weights = buffer.topk_weights[:rows]
         output = buffer.y[:rows]
 
-        def run_stage() -> None:
+        route_prepare_mode = 0
+        rank_gated_combine_mode = 0
+        route_ready_dispatch_mode = 0
+
+        rank_ready_route_publish_mode = 0
+
+        def prepare_input() -> None:
             gate_topk(
                 hidden_view,
                 gate_weight,
@@ -331,25 +444,156 @@ def _exact_qwen_case(
                 topk_idx_dtype=torch.int64,
                 quant_out=(buffer.x[:rows], buffer.x_sf[:rows], None),
                 out=(ids, weights),
-            )
-            megamoe_mega.fp8_fp8_mega_moe(
-                output, transformed[0], transformed[1], buffer
+                route_prepare=(
+                    buffer.route_prepare_args(
+                        rank_ready=bool(rank_ready_route_publish_mode)
+                    ) if route_prepare_mode else None
+                ),
             )
 
-        run_stage()
-        torch.cuda.synchronize()
-        max_active = _max_active_experts(ids, local_experts, world_size)
+        def run_stage() -> None:
+            prepare_input()
+            megamoe_mega.fp8_fp8_mega_moe(
+                output,
+                transformed[0],
+                transformed[1],
+                buffer,
+                routes_prepared=bool(route_prepare_mode),
+                rank_gated_combine=bool(rank_gated_combine_mode),
+                route_ready_dispatch=bool(route_ready_dispatch_mode),
+                rank_ready_route_publish=bool(
+                    rank_ready_route_publish_mode
+                ),
+            )
+
+        reference: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        reference_alt: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         for num_sms in sm_counts:
             deepgemm.set_num_sms(num_sms)
-            elapsed, output_max = _time_graph(
-                run_stage, output, warmups=warmups, iterations=iterations
-            )
-            results[f"bucket{bucket}_rows{rows}_sms{num_sms}"] = {
-                "milliseconds": elapsed,
-                "output_max": output_max,
-                "max_active_experts": max_active,
-            }
-            dist.barrier()
+            for specialization_trial, (
+                route_prepare_mode,
+                rank_gated_combine_mode,
+                route_ready_dispatch_mode,
+                rank_ready_route_publish_mode,
+            ) in enumerate(specialization_modes):
+                output.fill_(float("nan"))
+                run_stage()
+                torch.cuda.synchronize()
+                if not torch.isfinite(output).all():
+                    raise RuntimeError(
+                        "MegaMoE specialization did not overwrite every output "
+                        f"for rows={rows} sms={num_sms}"
+                    )
+                current = (ids.clone(), weights.clone(), output.clone())
+                if reference is None:
+                    reference = current
+                elif not all(
+                    torch.equal(expected, actual)
+                    for expected, actual in zip(reference, current)
+                ):
+                    raise RuntimeError(
+                        "MegaMoE specialization is not bitwise equal to control "
+                        f"for rows={rows} sms={num_sms} "
+                        f"route_mode={route_prepare_mode} "
+                        f"combine_mode={rank_gated_combine_mode} "
+                        f"dispatch_mode={route_ready_dispatch_mode}"
+                        f" rank_ready_mode={rank_ready_route_publish_mode}"
+                    )
+                hidden_view = hidden_views[1]
+                output.fill_(float("nan"))
+                run_stage()
+                torch.cuda.synchronize()
+                if not torch.isfinite(output).all():
+                    raise RuntimeError(
+                        "MegaMoE specialization did not overwrite every output "
+                        f"for alternate input rows={rows} sms={num_sms}"
+                    )
+                current_alt = (ids.clone(), weights.clone(), output.clone())
+                if reference_alt is None:
+                    reference_alt = current_alt
+                elif not all(
+                    torch.equal(expected, actual)
+                    for expected, actual in zip(reference_alt, current_alt)
+                ):
+                    raise RuntimeError(
+                        "MegaMoE specialization is not bitwise equal to control "
+                        f"for alternate input rows={rows} sms={num_sms} "
+                        f"route_mode={route_prepare_mode} "
+                        f"combine_mode={rank_gated_combine_mode} "
+                        f"dispatch_mode={route_ready_dispatch_mode}"
+                        f" rank_ready_mode={rank_ready_route_publish_mode}"
+                    )
+                hidden_view = hidden_views[0]
+                max_active = _max_active_experts(current[0], local_experts, world_size)
+                elapsed, output_max = _time_graph(
+                    run_stage, output, warmups=warmups, iterations=iterations
+                )
+                key = f"bucket{bucket}_rows{rows}_sms{num_sms}"
+                if len(specialization_modes) > 1:
+                    key += (
+                        f"_routes{route_prepare_mode}"
+                        f"_combine{rank_gated_combine_mode}"
+                        f"_dispatch{route_ready_dispatch_mode}"
+                        f"_trial{specialization_trial}"
+                        f"_rankready{rank_ready_route_publish_mode}"
+                    )
+                results[key] = {
+                    "milliseconds": elapsed,
+                    "output_max": output_max,
+                    "max_active_experts": max_active,
+                }
+                if debug_timings:
+                    timing_tensor = torch.zeros(
+                        len(_MEGAMOE_TIMING_SLOTS), dtype=torch.int64, device="cuda"
+                    )
+                    # Compile the timing specialization before the synchronized
+                    # measurement so one rank's JIT cannot become another rank's
+                    # in-kernel communication wait.
+                    prepare_input()
+                    megamoe_mega.fp8_fp8_mega_moe(
+                        output,
+                        transformed[0],
+                        transformed[1],
+                        buffer,
+                        debug_timings=timing_tensor,
+                        routes_prepared=bool(route_prepare_mode),
+                        rank_gated_combine=bool(rank_gated_combine_mode),
+                        route_ready_dispatch=bool(route_ready_dispatch_mode),
+                        rank_ready_route_publish=bool(
+                            rank_ready_route_publish_mode
+                        ),
+                    )
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    timing_tensor.zero_()
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    prepare_input()
+                    megamoe_mega.fp8_fp8_mega_moe(
+                        output,
+                        transformed[0],
+                        transformed[1],
+                        buffer,
+                        debug_timings=timing_tensor,
+                        routes_prepared=bool(route_prepare_mode),
+                        rank_gated_combine=bool(rank_gated_combine_mode),
+                        route_ready_dispatch=bool(route_ready_dispatch_mode),
+                        rank_ready_route_publish=bool(
+                            rank_ready_route_publish_mode
+                        ),
+                    )
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    local_timings = dict(
+                        zip(
+                            _MEGAMOE_TIMING_SLOTS,
+                            (int(value) for value in timing_tensor.cpu()),
+                        )
+                    )
+                    timings_by_rank: list[dict[str, int] | None] = [None] * world_size
+                    dist.all_gather_object(timings_by_rank, local_timings)
+                    results[key]["debug_timing_cycles_by_rank"] = timings_by_rank
+                dist.barrier()
 
     fixed_rows = min(row_counts)
     if fixed_rows * top_k != 24:
@@ -361,7 +605,10 @@ def _exact_qwen_case(
     for pattern in ("balanced24", "one_rank32"):
         flat = torch.arange(fixed_rows * top_k, dtype=torch.int64, device="cuda")
         if pattern == "balanced24":
-            fixed_ids = (flat % world_size) * local_experts + rank * 6 + flat // 4
+            routes_per_owner = (fixed_rows * top_k) // world_size
+            fixed_ids = (flat % world_size) * local_experts + (
+                rank * routes_per_owner + flat // world_size
+            ) % local_experts
         else:
             fixed_ids = (flat + rank * fixed_rows * top_k) % local_experts
         fixed_ids = fixed_ids.view(fixed_rows, top_k)
@@ -408,8 +655,11 @@ def _exact_qwen_case(
 def main() -> None:
     rank = int(os.environ["SLURM_PROCID"])
     world_size = int(os.environ["SLURM_NTASKS"])
-    if world_size != 4:
-        raise RuntimeError(f"same-rank MegaMoE smoke requires four ranks, got {world_size}")
+    if world_size not in (4, 8):
+        raise RuntimeError(
+            "same-rank MegaMoE smoke supports four- or eight-rank topology "
+            f"checks, got {world_size}"
+        )
     local_rank = int(os.environ["SLURM_LOCALID"])
     device_index = 0 if torch.cuda.device_count() == 1 else local_rank
     torch.cuda.set_device(device_index)

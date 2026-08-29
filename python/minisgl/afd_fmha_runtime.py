@@ -17,9 +17,9 @@ from minisgl.afd_fmha_protocol import (
 )
 from minisgl.kernel.afd_fmha_transport import (
     ensure_afd_fmha_transport_built,
-    publish_o_fp8,
-    publish_o_fp8_release_turn,
     publish_qkv,
+    quantize_publish_o_fp8,
+    quantize_publish_o_fp8_release_turn,
     wait_ready,
 )
 from minisgl.kernel.fabric_memory import (
@@ -347,6 +347,27 @@ class AfdFmhaRuntime:
             self.q_ready.zero_()
             self.o_publish_counters = torch.zeros(
                 (self.transport_slots,), dtype=torch.int32, device=self.device
+            )
+            self.o_quantization_counters = torch.zeros(
+                (self.transport_slots,), dtype=torch.int32, device=self.device
+            )
+            self.o_fp8_staging = torch.empty(
+                (
+                    self.transport_slots,
+                    self.max_rows,
+                    self.table.attn_local_q_heads * self.head_dim,
+                ),
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            self.o_scale_staging = torch.empty(
+                (
+                    self.transport_slots,
+                    self.max_rows,
+                    self.table.attn_local_q_heads,
+                ),
+                dtype=torch.uint8,
+                device=self.device,
             )
             kv_owner = getattr(self.state, "fabric_kv", None)
             if kv_owner is None:
@@ -2219,11 +2240,14 @@ class AfdFmhaRuntime:
                 expected_turn=expected_turn,
             )
         o = self.state.ctx.attn_backend.forward_prepared(q_slot, layer, batch)
-        o_fp8, o_scale = self._quantize_attention_o(o.view(rows, -1))
+        o = o.view(rows, -1).contiguous()
+        staged_o = self.o_fp8_staging[slot, :rows]
+        staged_scales = self.o_scale_staging[slot, :rows]
         if attention_turn is None:
-            publish_o_fp8(
-                o_fp8,
-                o_scale,
+            quantize_publish_o_fp8(
+                o,
+                staged_o,
+                staged_scales,
                 self.o_descriptors,
                 self.o_ready_descriptors,
                 self.o_publish_counters[slot : slot + 1],
@@ -2234,15 +2258,17 @@ class AfdFmhaRuntime:
             )
         else:
             assert next_turn is not None
-            # Quantization remains part of the attention compute unit. Once it
-            # completes, the fused FP8 O publication releases the next lane while
-            # payload and packed-scale stores proceed.
-            publish_o_fp8_release_turn(
-                o_fp8,
-                o_scale,
+            # The fused publisher releases the next lane only after every CTA
+            # completes quantization. Remote visibility remains independently
+            # ordered by the publication counter and readiness release.
+            quantize_publish_o_fp8_release_turn(
+                o,
+                staged_o,
+                staged_scales,
                 self.o_descriptors,
                 self.o_ready_descriptors,
                 self.o_publish_counters[slot : slot + 1],
+                self.o_quantization_counters[slot : slot + 1],
                 attention_turn,
                 slot=slot,
                 destination_source_stride=destination_source_stride,

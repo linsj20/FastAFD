@@ -26,11 +26,17 @@ public:
         float activation_clamp;
         bool fast_math;
         bool use_fp8_weights;
+        bool enable_debug_timing;
+        bool routes_prepared;
+        bool rank_gated_combine;
+        bool route_ready_dispatch;
+        bool rank_ready_route_publish;
         MegaMoEConfig config;
 
         // Runtime arguments
         void* y;
         int* cumulative_local_expert_recv_stats;
+        unsigned long long* debug_timings;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -71,6 +77,11 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
+        {},
+        {},
+        {},
+        {},
         {}
     >);
 }};
@@ -88,7 +99,12 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.use_fp8_weights ? "true" : "false");
+    args.use_fp8_weights ? "true" : "false",
+    args.enable_debug_timing ? "true" : "false",
+    args.routes_prepared ? "true" : "false",
+    args.rank_gated_combine ? "true" : "false",
+    args.route_ready_dispatch ? "true" : "false",
+    args.rank_ready_route_publish ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -96,6 +112,7 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
+            args.debug_timings,
             args.num_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
@@ -118,6 +135,7 @@ static void sm100_fp8_mega_moe_impl(
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor> debug_timings,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
@@ -125,7 +143,11 @@ static void sm100_fp8_mega_moe_impl(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& use_fp8_weights
+    const bool& use_fp8_weights,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -187,6 +209,10 @@ static void sm100_fp8_mega_moe_impl(
     int* cumulative_local_expert_recv_stats_ptr = nullptr;
     if (cumulative_local_expert_recv_stats.has_value())
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+    unsigned long long* debug_timings_ptr = nullptr;
+    if (debug_timings.has_value())
+        debug_timings_ptr = reinterpret_cast<unsigned long long*>(
+            debug_timings->data_ptr<int64_t>());
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
@@ -198,9 +224,15 @@ static void sm100_fp8_mega_moe_impl(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_fp8_weights = use_fp8_weights,
+        .enable_debug_timing = debug_timings_ptr != nullptr,
+        .routes_prepared = routes_prepared,
+        .rank_gated_combine = rank_gated_combine,
+        .route_ready_dispatch = route_ready_dispatch,
+        .rank_ready_route_publish = rank_ready_route_publish,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .debug_timings = debug_timings_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
@@ -230,21 +262,27 @@ static void sm100_fp8_fp4_mega_moe(
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor> debug_timings,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
         l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
-        cumulative_local_expert_recv_stats, sym_buffer_ptrs,
+        cumulative_local_expert_recv_stats, debug_timings, sym_buffer_ptrs,
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
-        activation_clamp, fast_math, /* use_fp8_weights */ false);
+        activation_clamp, fast_math, /* use_fp8_weights */ false,
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish);
 }
 
 static void sm100_fp8_fp8_mega_moe(
@@ -254,21 +292,27 @@ static void sm100_fp8_fp8_mega_moe(
     const torch::Tensor& l1_weights, const torch::Tensor& l2_weights,
     const torch::Tensor& l1_weights_sf, const torch::Tensor& l2_weights_sf,
     const std::optional<torch::Tensor> cumulative_local_expert_recv_stats,
+    const std::optional<torch::Tensor> debug_timings,
     const std::vector<int64_t>& sym_buffer_ptrs,
     const int& rank_idx, const int& num_max_tokens_per_rank,
     const int& num_experts_per_rank,
     const int& num_tokens, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
         l1_weights, l2_weights, l1_weights_sf, l2_weights_sf,
-        cumulative_local_expert_recv_stats, sym_buffer_ptrs,
+        cumulative_local_expert_recv_stats, debug_timings, sym_buffer_ptrs,
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
-        activation_clamp, fast_math, /* use_fp8_weights */ true);
+        activation_clamp, fast_math, /* use_fp8_weights */ true,
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish);
 }
 
 } // namespace deep_gemm

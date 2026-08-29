@@ -143,6 +143,11 @@ static void fp8_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
+    const std::optional<torch::Tensor>& debug_timings,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish,
     const bool& use_fp8_weights
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
@@ -187,6 +192,8 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+    DG_HOST_ASSERT(not route_ready_dispatch or routes_prepared);
+    DG_HOST_ASSERT(not rank_ready_route_publish or route_ready_dispatch);
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -200,6 +207,12 @@ static void fp8_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
+    }
+    if (debug_timings.has_value()) {
+        DG_HOST_ASSERT(debug_timings->is_cuda());
+        DG_HOST_ASSERT(debug_timings->scalar_type() == torch::kInt64);
+        DG_HOST_ASSERT(debug_timings->numel() >= 21);
+        DG_HOST_ASSERT(debug_timings->is_contiguous());
     }
 
     // Check buffer bytes
@@ -227,12 +240,15 @@ static void fp8_mega_moe(
                                l1_weights, l2_weights,
                                l1_weights_sf, l2_weights_sf,
                                cumulative_local_expert_recv_stats,
+                               debug_timings,
                                sym_buffer_ptrs,
                                rank_idx, num_max_tokens_per_rank,
                                num_experts_per_rank,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math,
+                               routes_prepared, rank_gated_combine,
+                               route_ready_dispatch, rank_ready_route_publish);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -255,12 +271,18 @@ static void fp8_fp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp,
-    const bool& fast_math) {
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& debug_timings,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
-                 recipe, activation, activation_clamp, fast_math,
+                 recipe, activation, activation_clamp, fast_math, debug_timings,
+                 routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
                  /* use_fp8_weights */ false);
 }
 
@@ -276,12 +298,18 @@ static void fp8_fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp,
-    const bool& fast_math) {
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& debug_timings,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
-                 recipe, activation, activation_clamp, fast_math,
+                 recipe, activation, activation_clamp, fast_math, debug_timings,
+                 routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
                  /* use_fp8_weights */ true);
 }
 

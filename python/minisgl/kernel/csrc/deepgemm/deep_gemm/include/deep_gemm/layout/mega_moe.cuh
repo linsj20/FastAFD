@@ -73,6 +73,12 @@ struct Workspace {
         // Barrier
         num_bytes += kNumBarrierSignalBytes;
 
+        // Rank-level route publication completion
+        num_bytes += sizeof(uint64_t);
+
+        // Per-expert-rank combine readiness epoch
+        num_bytes += num_ranks * sizeof(uint64_t);
+
         // Expert send/recv count
         num_bytes += num_experts * sizeof(uint64_t) * 2;
 
@@ -126,8 +132,25 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
+    uint32_t* get_route_prepare_counter_ptr() const {
+        // The final word in the fixed 32-byte barrier region is reserved for
+        // the fused router's last-block publication ticket.
+        return static_cast<uint32_t*>(base) + 7;
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_route_ready_count_ptr() const {
+        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_combine_ready_epoch_ptr(const uint32_t& rank_idx = 0) const {
+        return get_route_ready_count_ptr() + 1 + rank_idx;
+    }
+
+    CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
-        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
+        return get_combine_ready_epoch_ptr(num_ranks) + expert_idx;
     }
 
     CUTLASS_DEVICE

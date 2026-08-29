@@ -7,8 +7,8 @@ import torch.distributed as dist
 
 from minisgl.kernel.afd_fmha_transport import (
     ensure_afd_fmha_transport_built,
-    publish_o_fp8_release_turn,
     publish_qkv,
+    quantize_publish_o_fp8_release_turn,
     wait_ready,
 )
 from minisgl.kernel.fabric_memory import (
@@ -25,15 +25,17 @@ def _prebuild() -> None:
     """Build both extensions once before the four ranks enter collectives."""
     torch.cuda.set_device(0)
     ensure_afd_fmha_transport_built(128)
+    from minisgl.kernel import deepep_moe
     from minisgl.kernel import deepgemm as deep_gemm
 
+    deepep_moe._load_extension()
     deep_gemm.per_token_cast_to_fp8(
         torch.zeros((4, 64 * 128), dtype=torch.bfloat16, device="cuda"),
         use_ue8m0=True,
         gran_k=128,
         use_packed_ue8m0=True,
     )
-    print("AFD_FABRIC_TRANSPORT_PREBUILD_OK head_dim=128")
+    print("AFD_FABRIC_TRANSPORT_PREBUILD_OK head_dim=128 fabric_extension=ready")
 
 
 def main() -> None:
@@ -86,6 +88,15 @@ def main() -> None:
         )
         q_ready_owner.tensor.zero_()
         o_publish_counters = torch.zeros((2,), dtype=torch.int32, device=device)
+        o_quantization_counters = torch.zeros((2,), dtype=torch.int32, device=device)
+        o_fp8_staging = torch.empty(
+            (2, rows, q_heads * head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        o_scale_staging = torch.empty(
+            (2, rows, q_heads), dtype=torch.uint8, device=device
+        )
         turn = torch.zeros((1,), dtype=torch.int64, device=device)
         attention_handle = q_owner.handle
         record.update(
@@ -289,18 +300,10 @@ def main() -> None:
                 and o_scale_map is not None
                 and o_ready_map is not None
             )
-            from minisgl.kernel import deepgemm as deep_gemm
-
             o = torch.full(
                 (rows, q_heads * head_dim), o_value, device=device, dtype=torch.bfloat16
             )
             o.view(-1)[::251] = -0.0
-            o_fp8, o_scale = deep_gemm.per_token_cast_to_fp8(
-                o,
-                use_ue8m0=True,
-                gran_k=128,
-                use_packed_ue8m0=True,
-            )
             o_desc = _descriptor(
                 [
                     [
@@ -322,12 +325,14 @@ def main() -> None:
             o_ready_desc = _descriptor(
                 [[o_ready_map.tensor.data_ptr(), 0, 1]], 3, device
             )
-            publish_o_fp8_release_turn(
-                o_fp8,
-                o_scale,
+            quantize_publish_o_fp8_release_turn(
+                o,
+                o_fp8_staging[slot],
+                o_scale_staging[slot],
                 o_desc,
                 o_ready_desc,
                 o_publish_counters[slot : slot + 1],
+                o_quantization_counters[slot : slot + 1],
                 turn,
                 slot=slot,
                 destination_source_stride=rows,

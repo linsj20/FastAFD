@@ -55,19 +55,16 @@ class MegaMoEAfdAdapter:
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
         self.expert_weight_dtype = os.environ.get(
-            "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp8"
+            "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp4"
         ).strip().lower()
-        if self.expert_weight_dtype not in ("fp8", "fp4"):
+        if self.expert_weight_dtype != "fp4":
             raise RuntimeError(
-                "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE must be fp8 or fp4, "
+                "FP8xFP4 MegaMoE requires "
+                "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp4, "
                 f"got {self.expert_weight_dtype!r}"
             )
-        self.precision = f"fp8_{self.expert_weight_dtype}"
-        self._run_mega_moe = (
-            _mega.fp8_fp8_mega_moe
-            if self.expert_weight_dtype == "fp8"
-            else _mega.fp8_fp4_mega_moe
-        )
+        self.precision = "fp8_fp4"
+        self._run_mega_moe = _mega.fp8_fp4_mega_moe
         if self.group_size * self.tp_size * self.num_local_experts < self.real_num_experts:
             raise RuntimeError(
                 "MegaMoE rank group does not cover the model experts: "
@@ -115,20 +112,12 @@ class MegaMoEAfdAdapter:
                 "megamoe requires Qwen 128x128 FP8 block scales, "
                 f"got block_shape={block_shape}"
             )
-        if self.expert_weight_dtype == "fp8":
-            l1 = _weights.requant_qwen_fp8_weights_per32(
-                experts.gate_up_proj, experts.gate_up_proj_scale, inplace=True
-            )
-            l2 = _weights.requant_qwen_fp8_weights_per32(
-                experts.down_proj, experts.down_proj_scale, inplace=True
-            )
-        else:
-            l1 = _weights.requant_qwen_fp8_weights_to_fp4(
-                experts.gate_up_proj, experts.gate_up_proj_scale
-            )
-            l2 = _weights.requant_qwen_fp8_weights_to_fp4(
-                experts.down_proj, experts.down_proj_scale
-            )
+        l1 = _weights.requant_qwen_fp8_weights_to_fp4(
+            experts.gate_up_proj, experts.gate_up_proj_scale
+        )
+        l2 = _weights.requant_qwen_fp8_weights_to_fp4(
+            experts.down_proj, experts.down_proj_scale
+        )
         self.weights[int(layer_id)] = _weights.transform_weights_for_mega_moe(
             l1, l2
         )
@@ -172,6 +161,7 @@ class MegaMoEAfdAdapter:
         buffer = self.buffers[int(lane) % self.num_lanes]
         ids = buffer.topk_idx[:num_tokens]
         weights = buffer.topk_weights[:num_tokens]
+        routes_prepared = num_tokens > 0
         gate_topk(
             hidden,
             gate_weight,
@@ -182,9 +172,19 @@ class MegaMoEAfdAdapter:
             topk_idx_dtype=torch.int64,
             quant_out=(buffer.x[:num_tokens], buffer.x_sf[:num_tokens], None),
             out=(ids, weights),
+            route_prepare=(buffer.route_prepare_args(rank_ready=True) if routes_prepared else None),
         )
         y = buffer.y[:num_tokens]
-        self._run_mega_moe(y, l1_weights, l2_weights, buffer)
+        self._run_mega_moe(
+            y,
+            l1_weights,
+            l2_weights,
+            buffer,
+            routes_prepared=routes_prepared,
+            rank_gated_combine=True,
+            route_ready_dispatch=routes_prepared,
+            rank_ready_route_publish=routes_prepared,
+        )
         return y.view_as(hidden_states)
 
 

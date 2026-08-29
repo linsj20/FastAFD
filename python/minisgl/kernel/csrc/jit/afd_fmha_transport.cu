@@ -5,6 +5,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -92,6 +93,27 @@ struct PublishOFp8ReleaseTurnParams {
   PublishOFp8Params publish;
   int64_t* turn;
   int64_t next_turn;
+};
+
+struct QuantizePublishOFp8Params {
+  const __nv_bfloat16* o;
+  uint8_t* staged_o;
+  uint8_t* staged_scales;
+  const int64_t* desc;
+  const int64_t* ready_desc;
+  int* completion_counter;
+  int* quantization_counter;
+  int64_t* turn;
+  int64_t ready_value;
+  int64_t next_turn;
+  int64_t o_stride;
+  int64_t staged_o_stride;
+  int64_t staged_scale_stride;
+  int edges;
+  int ready_edges;
+  int slot;
+  int rows;
+  int destination_source_stride;
 };
 
 __device__ __forceinline__ uint64_t load_acquire_system(const int64_t* ptr) {
@@ -501,6 +523,210 @@ __global__ void publish_o_fp8_kernel_release_turn(
       params.publish.ready_value);
 }
 
+template <int kHeadDim, bool kSingleEdge>
+__device__ __forceinline__ void quantize_o_fp8_to_stage(
+    const QuantizePublishOFp8Params params) {
+  // Keep quantization as the attention compute tail, but materialize its small
+  // FP8 result locally so remote publication can remain a communication tail.
+  static_assert(kHeadDim == 128);
+  constexpr int kWarpsPerBlock = kThreads / 32;
+  constexpr int kLanesPerHead = 8;
+  constexpr int kHeadsPerWarp = 32 / kLanesPerHead;
+  constexpr int kValuesPerLane = kHeadDim / kLanesPerHead;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int head_in_warp = lane / kLanesPerHead;
+  const int lane_in_head = lane % kLanesPerHead;
+  const int64_t global_warp =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  const int64_t warp_stride =
+      static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+  const int edges = kSingleEdge ? 1 : params.edges;
+
+  for (int edge = 0; edge < edges; ++edge) {
+    const int64_t* desc = params.desc + static_cast<int64_t>(edge) * 10;
+    const int src_head = static_cast<int>(desc[2]);
+    const int head_count = static_cast<int>(desc[4]);
+
+    const int64_t tasks = static_cast<int64_t>(params.rows) * head_count;
+    const int64_t task_group_stride = warp_stride * kHeadsPerWarp;
+    for (int64_t first_task = global_warp;
+         first_task < tasks;
+         first_task += task_group_stride) {
+      // Each 8-lane subgroup quantizes one head while the other subgroups
+      // process three additional tasks owned by this warp.  This preserves
+      // the publication mapping below and shortens the pre-handoff phase
+      // without changing the grid, payload layout, or scale definition.
+      const int64_t task = first_task + head_in_warp * warp_stride;
+      if (task >= tasks)
+        continue;
+      const int head = static_cast<int>(task % head_count);
+      const int row = static_cast<int>(task / head_count);
+      const auto* source_values = params.o +
+          static_cast<int64_t>(row) * params.o_stride +
+          static_cast<int64_t>(src_head + head) * kHeadDim +
+          lane_in_head * kValuesPerLane;
+      const uint4 packed_bf16[2] = {
+          *reinterpret_cast<const uint4*>(source_values),
+          *reinterpret_cast<const uint4*>(source_values + 8),
+      };
+      const auto* values =
+          reinterpret_cast<const __nv_bfloat16*>(packed_bf16);
+      float converted[kValuesPerLane];
+      float amax = 1.0e-4f;
+      #pragma unroll
+      for (int i = 0; i < kValuesPerLane; ++i) {
+        converted[i] = __bfloat162float(values[i]);
+        amax = fmaxf(amax, fabsf(converted[i]));
+      }
+      #pragma unroll
+      for (int offset = kLanesPerHead / 2; offset > 0; offset >>= 1)
+        amax = fmaxf(
+            amax,
+            __shfl_xor_sync(
+                0xffu << (head_in_warp * kLanesPerHead),
+                amax,
+                offset,
+                kLanesPerHead));
+
+      const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
+      const uint8_t exponent = static_cast<uint8_t>(
+          ((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1u : 0u));
+      const float inverse_scale = __uint_as_float(
+          static_cast<uint32_t>(254u - exponent) << 23);
+      alignas(16) __nv_fp8x2_storage_t output[kValuesPerLane / 2];
+      #pragma unroll
+      for (int i = 0; i < kValuesPerLane; i += 2)
+        output[i / 2] = __nv_cvt_float2_to_fp8x2(
+            make_float2(
+                converted[i] * inverse_scale,
+                converted[i + 1] * inverse_scale),
+            __NV_SATFINITE,
+            __NV_E4M3);
+
+      const int source_head = src_head + head;
+      const int64_t staged_offset =
+          static_cast<int64_t>(row) * params.staged_o_stride +
+          static_cast<int64_t>(source_head) * kHeadDim +
+          lane_in_head * kValuesPerLane;
+      *reinterpret_cast<uint4*>(params.staged_o + staged_offset) =
+          *reinterpret_cast<const uint4*>(output);
+      if (lane_in_head == 0)
+        params.staged_scales[
+            static_cast<int64_t>(row) * params.staged_scale_stride +
+            source_head] = exponent;
+    }
+  }
+}
+
+template <int kHeadDim, bool kSingleEdge>
+__device__ __forceinline__ void publish_staged_o_fp8_payload(
+    const QuantizePublishOFp8Params params) {
+  static_assert(kHeadDim == 128);
+  constexpr int kWarpsPerBlock = kThreads / 32;
+  constexpr int kPacksPerHead = kHeadDim / 16;
+  constexpr int kHeadsPerWarp = 32 / kPacksPerHead;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int head_in_warp = lane / kPacksPerHead;
+  const int pack = lane % kPacksPerHead;
+  const int64_t global_warp =
+      static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  const int64_t warp_stride =
+      static_cast<int64_t>(gridDim.x) * kWarpsPerBlock;
+  const int edges = kSingleEdge ? 1 : params.edges;
+
+  for (int edge = 0; edge < edges; ++edge) {
+    const int64_t* desc = params.desc + static_cast<int64_t>(edge) * 10;
+    auto* destination = reinterpret_cast<uint8_t*>(desc[0]);
+    auto* destination_scales = reinterpret_cast<uint8_t*>(desc[1]);
+    const int src_head = static_cast<int>(desc[2]);
+    const int dst_head = static_cast<int>(desc[3]);
+    const int head_count = static_cast<int>(desc[4]);
+    const int dst_local_heads = static_cast<int>(desc[5]);
+    const int64_t slot_rows = desc[6];
+    const int64_t scale_slot_elements = desc[7];
+    const int source = kSingleEdge ? 0 : static_cast<int>(desc[8]);
+    const int source_count = kSingleEdge ? 1 : static_cast<int>(desc[9]);
+    destination +=
+        static_cast<int64_t>(params.slot) * slot_rows * dst_local_heads * kHeadDim;
+    destination += static_cast<int64_t>(source) *
+        params.destination_source_stride * dst_local_heads * kHeadDim;
+    destination_scales +=
+        static_cast<int64_t>(params.slot) * scale_slot_elements * sizeof(int32_t);
+
+    const int64_t tasks = static_cast<int64_t>(params.rows) * head_count;
+    const int64_t task_group_stride = warp_stride * kHeadsPerWarp;
+    for (int64_t first_task = global_warp;
+         first_task < tasks;
+         first_task += task_group_stride) {
+      // Quantization assigned every warp tasks separated by warp_stride.  Fold
+      // four of those owned heads into one full-warp publication instruction
+      // group, matching the accepted publisher's lane utilization without
+      // reading staging produced by another CTA.
+      const int64_t task = first_task + head_in_warp * warp_stride;
+      if (task >= tasks)
+        continue;
+      const int head = static_cast<int>(task % head_count);
+      const int row = static_cast<int>(task / head_count);
+      const int source_head = src_head + head;
+      const int64_t staged_offset =
+          static_cast<int64_t>(row) * params.staged_o_stride +
+          static_cast<int64_t>(source_head) * kHeadDim +
+          pack * 16;
+      const int64_t dst_offset =
+          (static_cast<int64_t>(row) * dst_local_heads + dst_head + head) *
+              kHeadDim +
+          pack * 16;
+      *reinterpret_cast<uint4*>(destination + dst_offset) =
+          *reinterpret_cast<const uint4*>(params.staged_o + staged_offset);
+      if (pack == 0) {
+        const int64_t destination_rows =
+            static_cast<int64_t>(params.destination_source_stride) * source_count;
+        const int64_t destination_scale_stride =
+            (destination_rows + 3) / 4 * 4;
+        const int destination_head = dst_head + head;
+        const int64_t destination_row =
+            static_cast<int64_t>(source) * params.destination_source_stride + row;
+        const int64_t destination_word =
+            destination_row + static_cast<int64_t>(destination_head / 4) *
+                destination_scale_stride;
+        destination_scales[destination_word * sizeof(int32_t) +
+                           destination_head % 4] =
+            params.staged_scales[
+                static_cast<int64_t>(row) * params.staged_scale_stride +
+                source_head];
+      }
+    }
+  }
+}
+
+template <int kHeadDim, bool kSingleEdge, bool kSingleReady, bool kReleaseTurn>
+__global__ void quantize_publish_o_fp8_kernel(
+    const QuantizePublishOFp8Params params) {
+  quantize_o_fp8_to_stage<kHeadDim, kSingleEdge>(params);
+  __syncthreads();
+  if constexpr (kReleaseTurn) {
+    // Release attention ownership as soon as every CTA has stopped reading BF16
+    // O. Each CTA then publishes only its own staged tasks, so publication can
+    // overlap the peer lane without a cooperative grid barrier.
+    if (threadIdx.x == 0) {
+      const int arrived = atomicAdd(params.quantization_counter, 1);
+      if (arrived == static_cast<int>(gridDim.x) - 1) {
+        atomicExch(params.quantization_counter, 0);
+        store_release_device(params.turn, params.next_turn);
+      }
+    }
+  }
+  publish_staged_o_fp8_payload<kHeadDim, kSingleEdge>(params);
+  finish_payload_publication<kSingleReady>(
+      params.completion_counter,
+      params.ready_desc,
+      params.ready_edges,
+      params.slot,
+      params.ready_value);
+}
+
 __global__ void wait_ready_kernel(
     const int64_t* ready,
     int ready_count,
@@ -528,6 +754,139 @@ __global__ void wait_ready_kernel(
       return;
     }
     __nanosleep(64);
+  }
+}
+
+template <int kHeadDim>
+void launch_quantize_publish_o_fp8(
+    const tvm::ffi::TensorView o,
+    const tvm::ffi::TensorView staged_o,
+    const tvm::ffi::TensorView staged_scales,
+    const tvm::ffi::TensorView desc,
+    const tvm::ffi::TensorView ready_desc,
+    const tvm::ffi::TensorView completion_counter,
+    const tvm::ffi::TensorView* quantization_counter,
+    const tvm::ffi::TensorView* turn,
+    int64_t slot,
+    int64_t destination_source_stride,
+    int64_t next_turn,
+    int64_t ready_value) {
+  using namespace host;
+  static_assert(kHeadDim == 128);
+  auto device = SymbolicDevice{};
+  auto rows = SymbolicSize{"rows"};
+  auto width = SymbolicSize{"width"};
+  auto heads = SymbolicSize{"heads"};
+  auto edges = SymbolicSize{"edges"};
+  auto ready_edges = SymbolicSize{"ready_edges"};
+  auto data_dtype = SymbolicDType{};
+  auto staged_dtype = SymbolicDType{};
+  TensorMatcher({rows, width})
+      .with_strides({-1, 1})
+      .with_dtype(data_dtype)
+      .with_device<kDLCUDA>(device)
+      .verify(o);
+  TensorMatcher({rows, width})
+      .with_strides({-1, 1})
+      .with_dtype(staged_dtype)
+      .with_device<kDLCUDA>(device)
+      .verify(staged_o);
+  TensorMatcher({rows, heads})
+      .with_strides({-1, 1})
+      .with_dtype<uint8_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(staged_scales);
+  TensorMatcher({edges, 10})
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(desc);
+  TensorMatcher({ready_edges, 3})
+      .with_dtype<int64_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(ready_desc);
+  TensorMatcher({1})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device)
+      .verify(completion_counter);
+  const bool release_turn = turn != nullptr;
+  RuntimeCheck(
+      release_turn == (quantization_counter != nullptr),
+      "fused O quantization turn release requires its completion counter");
+  if (release_turn) {
+    TensorMatcher({1})
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(*quantization_counter);
+    TensorMatcher({1})
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(*turn);
+  }
+  const auto dtype = data_dtype.unwrap();
+  const auto output_dtype = staged_dtype.unwrap();
+  RuntimeCheck(
+      dtype.code == DLDataTypeCode::kDLBfloat and dtype.bits == 16 and
+      dtype.lanes == 1,
+      "fused AFD O quantization requires BF16 input");
+  RuntimeCheck(
+      output_dtype.bits == 8 and output_dtype.lanes == 1,
+      "fused AFD O staging requires an 8-bit payload");
+  RuntimeCheck(heads.unwrap() * kHeadDim == width.unwrap());
+  RuntimeCheck(width.unwrap() % (4 * kHeadDim) == 0);
+  RuntimeCheck(
+      rows.unwrap() > 0 and edges.unwrap() > 0 and ready_edges.unwrap() > 0);
+  RuntimeCheck(
+      slot >= 0 and slot < kTransportSlots and
+      destination_source_stride > 0 and ready_value > 0 and
+      (!release_turn or next_turn >= 0));
+  const QuantizePublishOFp8Params params{
+      .o = static_cast<const __nv_bfloat16*>(o.data_ptr()),
+      .staged_o = static_cast<uint8_t*>(staged_o.data_ptr()),
+      .staged_scales = static_cast<uint8_t*>(staged_scales.data_ptr()),
+      .desc = static_cast<const int64_t*>(desc.data_ptr()),
+      .ready_desc = static_cast<const int64_t*>(ready_desc.data_ptr()),
+      .completion_counter = static_cast<int*>(completion_counter.data_ptr()),
+      .quantization_counter = release_turn
+          ? static_cast<int*>(quantization_counter->data_ptr())
+          : nullptr,
+      .turn = release_turn ? static_cast<int64_t*>(turn->data_ptr()) : nullptr,
+      .ready_value = ready_value,
+      .next_turn = next_turn,
+      .o_stride = o.stride(0),
+      .staged_o_stride = staged_o.stride(0),
+      .staged_scale_stride = staged_scales.stride(0),
+      .edges = static_cast<int>(edges.unwrap()),
+      .ready_edges = static_cast<int>(ready_edges.unwrap()),
+      .slot = static_cast<int>(slot),
+      .rows = static_cast<int>(rows.unwrap()),
+      .destination_source_stride = static_cast<int>(destination_source_stride),
+  };
+  const int64_t tasks =
+      std::max<int64_t>(1, rows.unwrap() * width.unwrap() / 16);
+  const LaunchKernel launch(
+      publication_blocks(tasks), kThreads, device.unwrap());
+  const bool single_ready = ready_edges.unwrap() == 1;
+  const bool single_edge = single_ready and edges.unwrap() == 1;
+  if (release_turn) {
+    if (single_edge)
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, true, true, true>, params);
+    else if (single_ready)
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, false, true, true>, params);
+    else
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, false, false, true>, params);
+  } else {
+    if (single_edge)
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, true, true, false>, params);
+    else if (single_ready)
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, false, true, false>, params);
+    else
+      launch(
+          quantize_publish_o_fp8_kernel<kHeadDim, false, false, false>, params);
   }
 }
 
@@ -966,6 +1325,59 @@ struct AfdFmhaTransportKernel {
       launch(publish_o_fp8_kernel_release_turn<kHeadDim, false, true>, params);
     else
       launch(publish_o_fp8_kernel_release_turn<kHeadDim, false, false>, params);
+  }
+
+  static void quantize_publish_o_fp8(
+      const tvm::ffi::TensorView o,
+      const tvm::ffi::TensorView staged_o,
+      const tvm::ffi::TensorView staged_scales,
+      const tvm::ffi::TensorView desc,
+      const tvm::ffi::TensorView ready_desc,
+      const tvm::ffi::TensorView completion_counter,
+      int64_t slot,
+      int64_t destination_source_stride,
+      int64_t ready_value) {
+    launch_quantize_publish_o_fp8<kHeadDim>(
+        o,
+        staged_o,
+        staged_scales,
+        desc,
+        ready_desc,
+        completion_counter,
+        nullptr,
+        nullptr,
+        slot,
+        destination_source_stride,
+        0,
+        ready_value);
+  }
+
+  static void quantize_publish_o_fp8_release_turn(
+      const tvm::ffi::TensorView o,
+      const tvm::ffi::TensorView staged_o,
+      const tvm::ffi::TensorView staged_scales,
+      const tvm::ffi::TensorView desc,
+      const tvm::ffi::TensorView ready_desc,
+      const tvm::ffi::TensorView completion_counter,
+      const tvm::ffi::TensorView quantization_counter,
+      const tvm::ffi::TensorView turn,
+      int64_t slot,
+      int64_t destination_source_stride,
+      int64_t next_turn,
+      int64_t ready_value) {
+    launch_quantize_publish_o_fp8<kHeadDim>(
+        o,
+        staged_o,
+        staged_scales,
+        desc,
+        ready_desc,
+        completion_counter,
+        &quantization_counter,
+        &turn,
+        slot,
+        destination_source_stride,
+        next_turn,
+        ready_value);
   }
 
   static void wait_turn(

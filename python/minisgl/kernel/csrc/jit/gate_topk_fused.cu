@@ -19,9 +19,13 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <deep_gemm/layout/mega_moe.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
 
@@ -258,7 +262,7 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
 // Second kernel: top-k over the assembled logits (one block per token tile,
 // one warp per token).  The kernel boundary is the cheapest device-wide
 // barrier — much faster than an in-kernel ticket + memory fence round.
-template <typename IndexT, typename MapT>
+template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes, bool kRankReadyRoutePublish>
 __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_kernel(
     const float* __restrict__ logits_gmem,  // [mtiles, 16, kMaxExperts]
     float* __restrict__ topk_weights,
@@ -267,6 +271,10 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     const int64_t* __restrict__ valid_token_count,
     int valid_count_size,
     float* __restrict__ w_stage,            // optional symm-buffer staging copy
+    void* __restrict__ route_workspace,
+    const int64_t* __restrict__ route_buffer_ptrs,
+    const int route_rank, const int route_num_ranks,
+    const int route_bucket, const int route_num_sms,
     const int num_tokens, const int num_experts, const int topk,
     const bool renormalize) {
   const int mtile = blockIdx.x;
@@ -281,9 +289,11 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
   {
     const int t = warp;
     const int token = m0 + t;
-    if (token >= num_tokens) return;
-    if (valid_count_size != 0 &&
-        token >= min(static_cast<int>(valid_token_count[0]), num_tokens)) {
+    if (token >= num_tokens) {
+      if constexpr (!kPrepareMegaMoERoutes)
+        return;
+    } else if (valid_count_size != 0 &&
+               token >= min(static_cast<int>(valid_token_count[0]), num_tokens)) {
       if (lane < topk) {
         topk_ids[static_cast<size_t>(token) * topk + lane] =
             static_cast<IndexT>(-1);
@@ -291,8 +301,9 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
         if (w_stage != nullptr)
           w_stage[static_cast<size_t>(token) * topk + lane] = 0.0f;
       }
-      return;
-    }
+      if constexpr (!kPrepareMegaMoERoutes)
+        return;
+    } else {
 
     float logit[kMaxExpertsPerLane];
     #pragma unroll
@@ -360,12 +371,107 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
       const auto mapped_expert = expert_map == nullptr
                                      ? static_cast<MapT>(my_expert)
                                      : __ldg(expert_map + my_expert);
-      topk_ids[static_cast<size_t>(token) * topk + lane] =
-          static_cast<IndexT>(mapped_expert);
+      const auto token_topk_idx = static_cast<size_t>(token) * topk + lane;
+      topk_ids[token_topk_idx] = static_cast<IndexT>(mapped_expert);
       const float w_out = renormalize ? w / w_sum : w / denom_all;
-      topk_weights[static_cast<size_t>(token) * topk + lane] = w_out;
+      topk_weights[token_topk_idx] = w_out;
       if (w_stage != nullptr)
-        w_stage[static_cast<size_t>(token) * topk + lane] = w_out;
+        w_stage[token_topk_idx] = w_out;
+
+      if constexpr (kPrepareMegaMoERoutes) {
+        if (mapped_expert >= 0 && mapped_expert < num_experts) {
+          const auto workspace = deep_gemm::layout::Workspace(
+              route_workspace, route_num_ranks, num_experts,
+              route_bucket, topk);
+          auto* send_count = reinterpret_cast<unsigned int*>(
+              workspace.get_expert_send_count_ptr(
+                  static_cast<uint32_t>(mapped_expert)));
+          const auto dst_slot = atomicAdd(send_count, 1u);
+          const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
+                                workspace.num_experts_per_rank;
+          const auto dst_local_expert =
+              static_cast<uint32_t>(mapped_expert) %
+              workspace.num_experts_per_rank;
+          auto* local_dst = workspace.get_src_token_topk_idx_ptr(
+              dst_local_expert, route_rank, dst_slot);
+          const auto byte_offset =
+              reinterpret_cast<uintptr_t>(local_dst) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_dst = reinterpret_cast<uint32_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+              byte_offset);
+          *remote_dst = static_cast<uint32_t>(token_topk_idx);
+        }
+      }
+    }
+    }
+  }
+
+  if constexpr (kPrepareMegaMoERoutes) {
+    // Every route is now grouped and its source index is already in the
+    // destination's symmetric workspace.  A release/acquire last-block ticket
+    // lets one block finalize the per-source and aggregate expert counts
+    // without another kernel or a cooperative grid launch.
+    __syncthreads();
+    const auto workspace = deep_gemm::layout::Workspace(
+        route_workspace, route_num_ranks, num_experts, route_bucket, topk);
+    __shared__ int is_last_block;
+    if (threadIdx.x == 0) {
+      is_last_block = atom_add_acqrel_gpu(
+          reinterpret_cast<int*>(workspace.get_route_prepare_counter_ptr()), 1) ==
+          gridDim.x - 1;
+    }
+    __syncthreads();
+    if (is_last_block) {
+      for (int expert = static_cast<int>(threadIdx.x);
+           expert < num_experts;
+           expert += static_cast<int>(blockDim.x)) {
+        const auto count = static_cast<uint32_t>(
+            *workspace.get_expert_send_count_ptr(expert));
+        const auto dst_rank = expert / workspace.num_experts_per_rank;
+        const auto dst_local_expert = expert % workspace.num_experts_per_rank;
+        const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
+            route_rank, dst_local_expert);
+        const auto recv_count_offset =
+            reinterpret_cast<uintptr_t>(recv_count_ptr) -
+            reinterpret_cast<uintptr_t>(route_workspace);
+        auto* remote_recv_count = reinterpret_cast<uint64_t*>(
+            static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+            recv_count_offset);
+        *remote_recv_count = count;
+
+        if constexpr (not kRankReadyRoutePublish) {
+          const auto recv_sum_ptr =
+              workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
+          const auto recv_sum_offset =
+              reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+              recv_sum_offset);
+          const uint64_t completed_count =
+              (static_cast<uint64_t>(route_num_sms) << 32) | count;
+          deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+        }
+      }
+      __syncthreads();
+      if constexpr (kRankReadyRoutePublish) {
+        if (threadIdx.x < route_num_ranks) {
+          const auto route_ready_offset =
+              reinterpret_cast<uintptr_t>(
+                  workspace.get_route_ready_count_ptr()) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_route_ready = reinterpret_cast<uint64_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[threadIdx.x]) +
+              route_ready_offset);
+          // One release per destination orders every per-expert count and
+          // source-index store above while avoiding a system atomic per expert.
+          deep_gemm::ptx::atomic_add_rel_sys(remote_route_ready, 1);
+        }
+        __syncthreads();
+      }
+      if (threadIdx.x == 0)
+        *workspace.get_route_prepare_counter_ptr() = 0;
     }
   }
 }
@@ -385,7 +491,14 @@ struct GateTopkFusedKernel {
       bool renormalize,
       tvm::ffi::Optional<tvm::ffi::TensorView> x_q,
       tvm::ffi::Optional<tvm::ffi::TensorView> x_sf,
-      tvm::ffi::Optional<tvm::ffi::TensorView> w_stage) {
+      tvm::ffi::Optional<tvm::ffi::TensorView> w_stage,
+      tvm::ffi::Optional<tvm::ffi::TensorView> route_workspace,
+      tvm::ffi::Optional<tvm::ffi::TensorView> route_buffer_ptrs,
+      int route_rank,
+      int route_num_ranks,
+      int route_bucket,
+      int route_num_sms,
+      bool route_rank_ready) {
     using namespace host;
     auto num_tokens = SymbolicSize{"M"};
     auto topk = SymbolicSize{"K"};
@@ -443,6 +556,37 @@ struct GateTopkFusedKernel {
                  "valid_token_count must be empty or shape [1], got ",
                  valid_token_count.size(0));
 
+    const bool prepare_routes = route_workspace.has_value();
+    RuntimeCheck(
+        prepare_routes == route_buffer_ptrs.has_value(),
+        "route_workspace and route_buffer_ptrs must be provided together");
+    RuntimeCheck(prepare_routes || !route_rank_ready,
+                 "rank-ready publication requires route preparation");
+    if (prepare_routes) {
+      TensorMatcher({-1})
+          .with_device<kDLCUDA>(device_ref)
+          .with_dtype<int8_t>()
+          .verify(route_workspace.value());
+      TensorMatcher({route_num_ranks})
+          .with_device<kDLCUDA>(device_ref)
+          .with_dtype<int64_t>()
+          .verify(route_buffer_ptrs.value());
+      RuntimeCheck(route_num_ranks > 0 && experts % route_num_ranks == 0,
+                   "route num_ranks must positively divide num_experts");
+      RuntimeCheck(route_rank >= 0 && route_rank < route_num_ranks,
+                   "route rank is outside the symmetric rank group");
+      RuntimeCheck(route_bucket >= rows,
+                   "route bucket is smaller than the routed token count");
+      RuntimeCheck(route_num_sms > 0,
+                   "route num_sms must be positive");
+      const auto workspace = deep_gemm::layout::Workspace(
+          nullptr, route_num_ranks, experts, route_bucket, topk_value);
+      RuntimeCheck(
+          route_workspace.value().size(0) >=
+              static_cast<int64_t>(workspace.get_num_bytes()),
+          "route workspace is smaller than the MegaMoE metadata region");
+    }
+
     const auto stream = LaunchKernel::resolve_device(device_ref.unwrap());
     const int num_mtiles = (rows + kTokensPerBlock - 1) / kTokensPerBlock;
     constexpr int kNumWarps = kTPB / kWarpSize;
@@ -489,15 +633,35 @@ struct GateTopkFusedKernel {
       const auto* map_ptr = expert_map.size(0) == 0
                                 ? nullptr
                                 : static_cast<const MapT*>(expert_map.data_ptr());
-      gate_topk_select_kernel<IndexT, MapT>
-          <<<num_mtiles,
-             std::min(kTokensPerBlock, rows) * kWarpSize,
-             0, stream>>>(
-              static_cast<const float*>(partials.data_ptr()),
-              static_cast<float*>(topk_weights.data_ptr()),
-              static_cast<IndexT*>(topk_indices.data_ptr()),
-              map_ptr, count_ptr, count_size, w_stage_ptr,
-              rows, experts, topk_value, renormalize);
+      auto* route_workspace_ptr = prepare_routes
+          ? route_workspace.value().data_ptr()
+          : nullptr;
+      const auto* route_buffer_ptrs_ptr = prepare_routes
+          ? static_cast<const int64_t*>(route_buffer_ptrs.value().data_ptr())
+          : nullptr;
+      const auto launch = [&](auto prepare_tag, auto rank_ready_tag) {
+        constexpr bool kPrepareRoutes = decltype(prepare_tag)::value;
+        constexpr bool kRankReady = decltype(rank_ready_tag)::value;
+        gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady>
+            <<<num_mtiles,
+               std::min(kTokensPerBlock, rows) * kWarpSize,
+               0, stream>>>(
+                static_cast<const float*>(partials.data_ptr()),
+                static_cast<float*>(topk_weights.data_ptr()),
+                static_cast<IndexT*>(topk_indices.data_ptr()),
+                map_ptr, count_ptr, count_size, w_stage_ptr,
+                route_workspace_ptr, route_buffer_ptrs_ptr,
+                route_rank, route_num_ranks, route_bucket, route_num_sms,
+                rows, experts, topk_value, renormalize);
+      };
+      if (prepare_routes) {
+        if (route_rank_ready)
+          launch(std::true_type{}, std::true_type{});
+        else
+          launch(std::true_type{}, std::false_type{});
+      } else {
+        launch(std::false_type{}, std::false_type{});
+      }
     };
     if (use_int32_indices && use_int32_map) {
       launch_select(TypeTag<int32_t>{}, TypeTag<int32_t>{});

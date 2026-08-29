@@ -1042,9 +1042,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.o_descriptors = object()
         runtime.o_ready_descriptors = object()
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
-        runtime._quantize_attention_o = lambda o: (
-            o, torch.ones((o.shape[0], 1), dtype=torch.int32)
-        )
+        runtime.o_quantization_counters = torch.zeros((2,), dtype=torch.int32)
+        runtime.o_fp8_staging = torch.empty((2, 4, 1))
+        runtime.o_scale_staging = torch.empty((2, 4, 1), dtype=torch.uint8)
         runtime._attention_turn = object()
         sub0 = SimpleNamespace(positions=torch.arange(4), phase="decode")
         sub1 = SimpleNamespace(positions=torch.arange(4), phase="decode")
@@ -1081,10 +1081,13 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
             patch(
-                "minisgl.afd_fmha_runtime.publish_o_fp8_release_turn",
+                "minisgl.afd_fmha_runtime.quantize_publish_o_fp8_release_turn",
                 side_effect=fake_publish_release,
             ),
-            patch("minisgl.afd_fmha_runtime.publish_o_fp8", side_effect=fake_publish),
+            patch(
+                "minisgl.afd_fmha_runtime.quantize_publish_o_fp8",
+                side_effect=fake_publish,
+            ),
         ):
             runtime._run_attention_body(
                 batch,
@@ -1208,9 +1211,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.o_descriptors = object()
         runtime.o_ready_descriptors = object()
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
-        runtime._quantize_attention_o = lambda o: (
-            o, torch.ones((o.shape[0], 1), dtype=torch.int32)
-        )
+        runtime.o_quantization_counters = torch.zeros((2,), dtype=torch.int32)
+        runtime.o_fp8_staging = torch.empty((2, 3, 1))
+        runtime.o_scale_staging = torch.empty((2, 3, 1), dtype=torch.uint8)
         runtime._attention_turn = object()
         subs = [
             SimpleNamespace(positions=torch.arange(3), phase="decode")
@@ -1250,7 +1253,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
             patch(
-                "minisgl.afd_fmha_runtime.publish_o_fp8_release_turn",
+                "minisgl.afd_fmha_runtime.quantize_publish_o_fp8_release_turn",
                 side_effect=fake_publish_release,
             ),
         ):

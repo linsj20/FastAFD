@@ -238,7 +238,7 @@ def validate_plan_rows(rows: list[dict[str, str]], source: str) -> None:
             or row["legacy_isl_mode"] not in {"uniform", "irregular"}
             or (row["legacy_isl_mode"] == "uniform") != bool(row["isl_tokens"])
             or int(row["normalized_af_ratio"]) < 1
-            or row["megamoe_expert_weight_dtype"] not in {"fp8", "fp4"}
+            or row["megamoe_expert_weight_dtype"] != "fp4"
             or not case_id.endswith(f"-{row['megamoe_expert_weight_dtype']}")
             or not 0 < float(row["afd_memory_ratio"]) <= 1
             or (

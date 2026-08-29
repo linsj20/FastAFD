@@ -1299,6 +1299,7 @@ sm100_mega_moe_m2n_eg_impl(int* cumulative_local_expert_recv_stats,
         kNumExpertsPerWave,
         kNumSMs, kNumAGRanks,
         /* kRecvCountHighTarget = */ kNumAGRanks,
+        /* kAcquireRecvCounts = */ false,
         layout::WorkspaceM2N>(workspace);
 
     // Intra-SM Barrier indices

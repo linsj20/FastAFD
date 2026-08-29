@@ -48,12 +48,15 @@ def _jit_moe_topk_softmax_module() -> Module:
 
 @functools.cache
 def _jit_gate_topk_fused_module() -> Module:
-    from .utils import load_jit
+    from .utils import KERNEL_PATH, load_jit
 
     return load_jit(
         "gate_topk_fused",
         cuda_files=["gate_topk_fused.cu"],
         cuda_wrappers=[("launch", "GateTopkFusedKernel::run")],
+        extra_include_paths=[
+            str(KERNEL_PATH / "deepgemm" / "deep_gemm" / "include")
+        ],
     )
 
 
@@ -110,6 +113,9 @@ def gate_topk(
         torch.Tensor, torch.Tensor, torch.Tensor | None
     ] | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    route_prepare: tuple[
+        torch.Tensor, torch.Tensor, int, int, int, int, bool
+    ] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
     16-way K-split) + softmax + top-k (+ optional renormalize) in ONE kernel
@@ -119,7 +125,11 @@ def gate_topk(
     ``quant_out`` = (x_q u8 [n, hidden], x_sf u8 [n, hidden/32],
     w_stage f32 [n, top_k]) additionally emits the per-32 FP8 quant of
     ``hidden`` (bit-identical to the MegaMoE AG kernel's phase-0) and a copy
-    of the top-k weights — the comm kernel then skips its quant phase."""
+    of the top-k weights — the comm kernel then skips its quant phase.
+
+    ``route_prepare`` = (symmetric buffer, device buffer-pointer table, rank,
+    ranks, aligned token capacity, MegaMoE SMs, rank-ready publication) groups
+    and remotely publishes the selected routes before MegaMoE starts."""
     assert hidden.is_cuda and hidden.dtype == torch.bfloat16
     assert gate_weight.is_cuda and gate_weight.dtype == torch.bfloat16
     n = hidden.shape[0]
@@ -182,6 +192,46 @@ def gate_topk(
     x_q = x_sf = w_stage = None
     if quant_out is not None:
         x_q, x_sf, w_stage = quant_out
+    route_workspace = route_buffer_ptrs = None
+    route_rank = route_num_ranks = route_bucket = route_num_sms = 0
+    route_rank_ready = False
+    if route_prepare is not None:
+        (
+            route_workspace,
+            route_buffer_ptrs,
+            route_rank,
+            route_num_ranks,
+            route_bucket,
+            route_num_sms,
+            route_rank_ready,
+        ) = route_prepare
+        if (
+            not route_workspace.is_cuda
+            or route_workspace.device != hidden.device
+            or route_workspace.dtype != torch.int8
+            or not route_workspace.is_contiguous()
+        ):
+            raise RuntimeError(
+                "gate_topk route workspace must be a contiguous int8 CUDA tensor "
+                "on the hidden device"
+            )
+        if (
+            not route_buffer_ptrs.is_cuda
+            or route_buffer_ptrs.device != hidden.device
+            or route_buffer_ptrs.dtype != torch.int64
+            or not route_buffer_ptrs.is_contiguous()
+            or tuple(route_buffer_ptrs.shape) != (int(route_num_ranks),)
+        ):
+            raise RuntimeError(
+                "gate_topk route pointer table must be contiguous int64 CUDA "
+                f"shape={(int(route_num_ranks),)} on the hidden device"
+            )
+        if not (0 <= int(route_rank) < int(route_num_ranks)):
+            raise RuntimeError("gate_topk route rank is outside the rank group")
+        if int(route_bucket) < int(n):
+            raise RuntimeError("gate_topk route bucket is smaller than the token count")
+        if int(route_num_sms) <= 0:
+            raise RuntimeError("gate_topk route MegaMoE SM count must be positive")
     module.launch(
         weights, ids,
         hidden.contiguous(), gate_weight.contiguous(),
@@ -189,6 +239,10 @@ def gate_topk(
         expert_map, valid_count,
         bool(renormalize),
         x_q, x_sf, w_stage,
+        route_workspace, route_buffer_ptrs,
+        int(route_rank), int(route_num_ranks),
+        int(route_bucket), int(route_num_sms),
+        bool(route_rank_ready),
     )
     return ids, weights
 

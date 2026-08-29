@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GB200OverlapContractTests(unittest.TestCase):
-    def test_bundle_pool_accepts_precision_qualified_case_ids(self) -> None:
+    def test_bundle_pool_accepts_fp4_qualified_case_ids(self) -> None:
         path = (
             ROOT
             / "scripts/experiments/afd/oci_hsg/afd_online_case_pool.py"
@@ -21,9 +21,8 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIsNotNone(spec.loader)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        for precision in ("fp8", "fp4"):
-            case_id = f"i131072-fep8-r7-atp1-b6-{precision}"
-            self.assertEqual(module.validate_case_id(case_id), case_id)
+        case_id = "i131072-fep8-r7-atp1-b6-fp4"
+        self.assertEqual(module.validate_case_id(case_id), case_id)
 
     def test_gpu_cleanup_uses_pidfd_events_without_sleep(self) -> None:
         path = (
@@ -241,7 +240,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("watchdog_timeout || failures >= MAX_FAILURES", bundle)
         self.assertIn("per-case AFD memory contract is incomplete", bundle)
         self.assertIn(
-            "per-case MegaMoE expert weight dtype must be fp8 or fp4", bundle
+            "per-case MegaMoE expert weight dtype must be fp4", bundle
         )
         self.assertIn(
             "case_id must end with its MegaMoE expert weight dtype", bundle
@@ -407,7 +406,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("LaunchKernel(1, kSignalThreads", source)
         self.assertIn("wait_ready_turn", source)
         self.assertIn("publish_o_kernel_release_turn", source)
-        self.assertIn("publish_o_fp8_kernel_release_turn", source)
+        self.assertIn("quantize_publish_o_fp8_kernel", source)
+        self.assertIn("quantize_o_fp8_to_stage", source)
+        self.assertIn("publish_staged_o_fp8_payload", source)
+        self.assertIn("uint8_t* staged_o", source)
+        self.assertIn("uint8_t* staged_scales", source)
+        self.assertIn("quantization_counter", source)
         self.assertIn("const int32_t* scales", source)
         self.assertIn("wait_turn_kernel", source)
         self.assertNotIn("publish_turn_kernel", source)
@@ -424,7 +428,8 @@ class GB200OverlapContractTests(unittest.TestCase):
         ).read_text()
         self.assertIn("wait_ready_turn", wrapper_source)
         self.assertIn("publish_o_release_turn", wrapper_source)
-        self.assertIn("publish_o_fp8_release_turn", wrapper_source)
+        self.assertIn("quantize_publish_o_fp8_release_turn", wrapper_source)
+        self.assertIn("def _validate_fp8_staging(", wrapper_source)
         self.assertIn("def _validate_packed_scales(", wrapper_source)
         self.assertIn("def wait_turn(", wrapper_source)
         self.assertNotIn("def publish_turn(", wrapper_source)
@@ -435,7 +440,10 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertNotIn("consumed_", wrapper_source)
         runtime_source = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()
         self.assertIn("self._attention_turn", runtime_source)
-        self.assertIn("publish_o_fp8_release_turn(", runtime_source)
+        self.assertIn("quantize_publish_o_fp8_release_turn(", runtime_source)
+        self.assertIn("self.o_quantization_counters", runtime_source)
+        self.assertIn("self.o_fp8_staging", runtime_source)
+        self.assertIn("self.o_scale_staging", runtime_source)
         self.assertIn("self._quantize_attention_o", runtime_source)
         self.assertIn("finish_attention_fp8(", runtime_source)
         self.assertNotIn("self_attn.finish_attention(o)", runtime_source)
@@ -534,16 +542,16 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("constexpr int kTransportSlots = 2", source)
         self.assertIn("slot < kTransportSlots", source)
         self.assertIn("constexpr int64_t kMaxPublicationBlocks = 1024", source)
-        self.assertEqual(source.count("publication_blocks(tasks)"), 5)
+        self.assertEqual(source.count("publication_blocks(tasks)"), 6)
         self.assertIn("first_flattened_task", source)
         self.assertEqual(source.count("global_task - edge_base"), 2)
         self.assertIn("bool kSingleEdge", source)
         self.assertIn("bool kSingleReady", source)
         self.assertIn("if constexpr (!kSingleEdge)", source)
         self.assertIn("source_offset_count.unwrap() == 2", source)
-        self.assertEqual(source.count("ready_edges.unwrap() == 1"), 5)
+        self.assertEqual(source.count("ready_edges.unwrap() == 1"), 6)
         self.assertIn("q_edges.unwrap() == 1 and kv_edges.unwrap() == 1", source)
-        self.assertEqual(source.count("single_ready and edges.unwrap() == 1"), 4)
+        self.assertEqual(source.count("single_ready and edges.unwrap() == 1"), 5)
         self.assertIn("publish_qkv_kernel<kHeadDim, true, true>", source)
         self.assertIn("publish_qkv_kernel<kHeadDim, false, false>", source)
         self.assertIn("publish_o_kernel<kHeadDim, true, true>", source)
@@ -551,6 +559,53 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("publish_o_fp8_kernel<kHeadDim, true, true>", source)
         self.assertIn(
             "publish_o_fp8_kernel_release_turn<kHeadDim, true, true>", source
+        )
+        self.assertIn(
+            "quantize_publish_o_fp8_kernel<kHeadDim, true, true, true>", source
+        )
+        fused_start = source.index("__global__ void quantize_publish_o_fp8_kernel(")
+        fused_end = source.index("__global__ void wait_ready_kernel", fused_start)
+        fused_source = source[fused_start:fused_end]
+        quantize_at = fused_source.index("quantize_o_fp8_to_stage")
+        release_at = fused_source.index("atomicAdd(params.quantization_counter, 1)")
+        publish_at = fused_source.index("publish_staged_o_fp8_payload")
+        self.assertLess(quantize_at, release_at)
+        self.assertLess(release_at, publish_at)
+        self.assertIn("store_release_device(params.turn", fused_source)
+        staged_quantize_start = source.index("void quantize_o_fp8_to_stage(")
+        staged_quantize_end = source.index(
+            "void publish_staged_o_fp8_payload(", staged_quantize_start
+        )
+        staged_quantize_source = source[
+            staged_quantize_start:staged_quantize_end
+        ]
+        self.assertIn("constexpr int kLanesPerHead = 8", staged_quantize_source)
+        self.assertIn(
+            "kHeadsPerWarp = 32 / kLanesPerHead", staged_quantize_source
+        )
+        self.assertIn(
+            "task_group_stride = warp_stride * kHeadsPerWarp",
+            staged_quantize_source,
+        )
+        self.assertIn(
+            "reinterpret_cast<const uint4*>(source_values + 8)",
+            staged_quantize_source,
+        )
+        self.assertIn(
+            "reinterpret_cast<uint4*>(params.staged_o + staged_offset)",
+            staged_quantize_source,
+        )
+        staged_publish_start = source.index("void publish_staged_o_fp8_payload(")
+        staged_publish_end = source.index(
+            "__global__ void quantize_publish_o_fp8_kernel(", staged_publish_start
+        )
+        staged_publish_source = source[staged_publish_start:staged_publish_end]
+        self.assertIn(
+            "reinterpret_cast<uint4*>(destination + dst_offset)",
+            staged_publish_source,
+        )
+        self.assertIn(
+            "kHeadsPerWarp = 32 / kPacksPerHead", staged_publish_source
         )
         release_start = source.index("void publish_o_kernel_release_turn(")
         release_end = source.index("__global__ void wait_ready_kernel", release_start)
@@ -673,22 +728,81 @@ class GB200OverlapContractTests(unittest.TestCase):
             "kUseFP8Weights ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE",
             kernel_source,
         )
+        self.assertIn("enum class TimingSlot", kernel_source)
+        self.assertIn("TmaAFirstL1ArrivalWait", kernel_source)
+        self.assertIn("MmaFirstFullWait", kernel_source)
+        self.assertIn("TmaAFirstL1ReadyFromKernelStart", kernel_source)
+        self.assertIn("MmaFirstFullReadyFromKernelStart", kernel_source)
+        self.assertIn("bool kRoutesPrepared = false", kernel_source)
+        self.assertIn("if constexpr (not kRoutesPrepared)", kernel_source)
+        self.assertIn("bool kRankGatedCombine = false", kernel_source)
+        self.assertIn("if constexpr (kRankGatedCombine)", kernel_source)
+        self.assertIn("bool kRouteReadyDispatch = false", kernel_source)
+        self.assertIn("if constexpr (not kRouteReadyDispatch)", kernel_source)
+        self.assertIn("bool kRankReadyRoutePublish = false", kernel_source)
+        self.assertIn("get_combine_ready_epoch_ptr", kernel_source)
+        self.assertIn("get_route_ready_count_ptr", kernel_source)
+        self.assertIn("st_release_sys", kernel_source)
+
+        scheduler_source = (
+            ROOT / "python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/"
+            "deep_gemm/scheduler/mega_moe.cuh"
+        ).read_text()
+        self.assertIn(
+            "count = prefetched_recv_counts[expert_idx]",
+            scheduler_source,
+        )
+
+        router_source = (
+            ROOT / "python/minisgl/kernel/csrc/jit/gate_topk_fused.cu"
+        ).read_text()
+        self.assertIn("kPrepareMegaMoERoutes", router_source)
+        self.assertIn("get_route_prepare_counter_ptr", router_source)
+        self.assertIn("atom_add_acqrel_gpu", router_source)
+        self.assertIn("atomic_add_rel_sys(remote_route_ready", router_source)
+        self.assertIn("atomic_add_rel_sys(remote_recv_sum", router_source)
 
         adapter_source = (
             ROOT / "python/minisgl/moe/megamoe_afd.py"
         ).read_text()
-        self.assertIn("requant_qwen_fp8_weights_per32(", adapter_source)
         self.assertIn("requant_qwen_fp8_weights_to_fp4(", adapter_source)
-        self.assertIn("_mega.fp8_fp8_mega_moe", adapter_source)
         self.assertIn("_mega.fp8_fp4_mega_moe", adapter_source)
+        self.assertNotIn("_mega.fp8_fp8_mega_moe", adapter_source)
+        self.assertIn("FP8xFP4 MegaMoE requires", adapter_source)
         self.assertNotIn("num_concurrent_lanes=self.num_lanes", adapter_source)
         self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", adapter_source)
+        self.assertIn("route_prepare=", adapter_source)
+        self.assertIn("routes_prepared=routes_prepared", adapter_source)
+        self.assertIn("rank_gated_combine=True", adapter_source)
+        self.assertIn("route_ready_dispatch=routes_prepared", adapter_source)
+        self.assertIn("rank_ready_route_publish=routes_prepared", adapter_source)
 
         wrapper_source = (
             ROOT / "python/minisgl/kernel/megamoe_mega.py"
         ).read_text()
         self.assertIn("def fp8_fp4_mega_moe(", wrapper_source)
         self.assertIn("_ext().fp8_fp4_mega_moe(", wrapper_source)
+        self.assertIn("debug_timings: torch.Tensor | None = None", wrapper_source)
+        self.assertIn("def route_prepare_args", wrapper_source)
+        self.assertIn("routes_prepared: bool = False", wrapper_source)
+        self.assertIn("rank_gated_combine: bool = False", wrapper_source)
+        self.assertIn("route_ready_dispatch: bool = False", wrapper_source)
+        self.assertIn("rank_ready_route_publish: bool = False", wrapper_source)
+
+        smoke_source = (
+            ROOT / "tests/afd_megamoe_same_rank_smoke.py"
+        ).read_text()
+        self.assertIn("_MEGAMOE_TIMING_SLOTS", smoke_source)
+        self.assertIn("debug_timing_cycles_by_rank", smoke_source)
+        self.assertIn("timing_tensor.zero_()", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_ROUTE_PREPARE_MODES", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_COMBINE_MODES", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_SPECIALIZATION_MODES", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_NUM_EXPERTS", smoke_source)
+        self.assertIn("world_size not in (4, 8)", smoke_source)
+        self.assertIn("MegaMoE specialization is not bitwise equal", smoke_source)
+        self.assertIn("hidden_views", smoke_source)
 
         weight_source = (
             ROOT / "python/minisgl/kernel/megamoe_m2n_mega.py"

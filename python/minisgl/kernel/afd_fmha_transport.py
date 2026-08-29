@@ -26,6 +26,14 @@ def _jit_module(head_dim: int):
                 "publish_o_fp8_release_turn",
                 f"AfdFmhaTransportKernel<{args}>::publish_o_fp8_release_turn",
             ),
+            (
+                "quantize_publish_o_fp8",
+                f"AfdFmhaTransportKernel<{args}>::quantize_publish_o_fp8",
+            ),
+            (
+                "quantize_publish_o_fp8_release_turn",
+                f"AfdFmhaTransportKernel<{args}>::quantize_publish_o_fp8_release_turn",
+            ),
             ("wait_turn", f"AfdFmhaTransportKernel<{args}>::wait_turn"),
             ("wait_ready", f"AfdFmhaTransportKernel<{args}>::wait_ready"),
             ("wait_ready_turn", f"AfdFmhaTransportKernel<{args}>::wait_ready_turn"),
@@ -191,6 +199,78 @@ def publish_o_fp8_release_turn(
     )
 
 
+def quantize_publish_o_fp8(
+    o: torch.Tensor,
+    staged_o: torch.Tensor,
+    staged_scales: torch.Tensor,
+    descriptors: torch.Tensor,
+    ready_descriptors: torch.Tensor,
+    completion_counter: torch.Tensor,
+    *,
+    slot: int,
+    destination_source_stride: int,
+    head_dim: int,
+    ready_value: int,
+) -> None:
+    """Quantize O locally and publish it remotely in one kernel launch."""
+    _validate_bf16_rows("o", o, head_dim)
+    _validate_fp8_o_quant_shape(o, head_dim)
+    _validate_fp8_staging(o, staged_o, staged_scales, head_dim)
+    _validate_completion_counter(completion_counter)
+    _validate_ready_value(ready_value)
+    _jit_module(int(head_dim)).quantize_publish_o_fp8(
+        o,
+        staged_o,
+        staged_scales,
+        descriptors,
+        ready_descriptors,
+        completion_counter,
+        int(slot),
+        int(destination_source_stride),
+        int(ready_value),
+    )
+
+
+def quantize_publish_o_fp8_release_turn(
+    o: torch.Tensor,
+    staged_o: torch.Tensor,
+    staged_scales: torch.Tensor,
+    descriptors: torch.Tensor,
+    ready_descriptors: torch.Tensor,
+    completion_counter: torch.Tensor,
+    quantization_counter: torch.Tensor,
+    turn: torch.Tensor,
+    *,
+    slot: int,
+    destination_source_stride: int,
+    next_turn: int,
+    head_dim: int,
+    ready_value: int,
+) -> None:
+    """Fuse quantize/publish while releasing ownership after quantization."""
+    _validate_bf16_rows("o", o, head_dim)
+    _validate_fp8_o_quant_shape(o, head_dim)
+    _validate_fp8_staging(o, staged_o, staged_scales, head_dim)
+    _validate_completion_counter(completion_counter)
+    _validate_completion_counter(quantization_counter)
+    _validate_turn(turn, next_turn)
+    _validate_ready_value(ready_value)
+    _jit_module(int(head_dim)).quantize_publish_o_fp8_release_turn(
+        o,
+        staged_o,
+        staged_scales,
+        descriptors,
+        ready_descriptors,
+        completion_counter,
+        quantization_counter,
+        turn,
+        int(slot),
+        int(destination_source_stride),
+        int(next_turn),
+        int(ready_value),
+    )
+
+
 def wait_ready(
     ready: torch.Tensor,
     timeout_record: torch.Tensor,
@@ -340,6 +420,41 @@ def _validate_packed_scales(
         )
 
 
+def _validate_fp8_o_quant_shape(o: torch.Tensor, head_dim: int) -> None:
+    if int(head_dim) != 128 or o.shape[1] % (4 * int(head_dim)):
+        raise ValueError(
+            "Fused AFD O quantization requires 128-wide heads and the existing "
+            f"four-head alignment, got width={o.shape[1]} head_dim={head_dim}"
+        )
+
+
+def _validate_fp8_staging(
+    o: torch.Tensor,
+    staged_o: torch.Tensor,
+    staged_scales: torch.Tensor,
+    head_dim: int,
+) -> None:
+    _validate_fp8_rows("staged_o", staged_o, head_dim)
+    heads = int(o.shape[1]) // int(head_dim)
+    if tuple(staged_o.shape) != tuple(o.shape):
+        raise ValueError(
+            "AFD staged FP8 O must match the BF16 O shape: "
+            f"o={tuple(o.shape)} staged_o={tuple(staged_o.shape)}"
+        )
+    if (
+        staged_scales.dtype != torch.uint8
+        or not staged_scales.is_cuda
+        or not staged_scales.is_contiguous()
+        or tuple(staged_scales.shape) != (int(o.shape[0]), heads)
+    ):
+        raise ValueError(
+            "AFD staged O scales must be contiguous CUDA uint8 with one UE8M0 "
+            f"byte per row and head, got shape={tuple(staged_scales.shape)} "
+            f"dtype={staged_scales.dtype} device={staged_scales.device} "
+            f"stride={staged_scales.stride()}"
+        )
+
+
 def _validate_bf16_rows(name: str, tensor: torch.Tensor, head_dim: int) -> None:
     if (
         tensor.dtype != torch.bfloat16
@@ -361,6 +476,8 @@ __all__ = [
     "publish_o_release_turn",
     "publish_o_fp8",
     "publish_o_fp8_release_turn",
+    "quantize_publish_o_fp8",
+    "quantize_publish_o_fp8_release_turn",
     "publish_qkv",
     "wait_ready",
     "wait_turn",
