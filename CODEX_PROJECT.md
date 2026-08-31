@@ -1,5 +1,38 @@
 # Project Memory
 
+## A2 fan-in correctness repair (2026-08-31 PDT)
+
+A2 output corruption is localized to the FMHA O single-edge publisher, not the
+FP8xFP4 MegaMoE math.  One outgoing edge does not imply destination source
+partition zero: in A2 the second attention source still has one edge but owns
+partition one.  The old BF16/FP8/fused-FP8 publisher specializations wrote it
+to partition zero, and the FP8 paths also used the wrong packed-scale stride.
+Remote fix `b769743` always honors descriptor source/source-count metadata and
+adds no copy/materialization, synchronization, fallback, launch, or math.
+Direct pre-fix job `6741945` reproduced complete source-1 payload corruption
+and scale-stride corruption; generalized post-fix job `6742728` passes 72 exact
+publications for every source partition at A=1 through A=8.  Kernel-only job
+`6743049` passes all rows 3/6 x buckets 518/1036 x ordinary/prepared
+combinations at the unchanged
+0.96 gate (actual cosine at least 0.999891400), and 41/41 focused runtime tests
+pass.  Tests are committed at `bd1e3ca`.  Full unchanged A2 model job `6743115`
+completed `0:0` in 18:08 with 22.938265067-ms strict CUDA and 174.381104603
+TPS/active GPU.  Relative to pre-fix job `6691133`, latency is 0.145% lower and
+throughput is 0.146% higher (noise-level, no measured regression).  It produced
+48 coherent 17-token samples and twelve Nsight reports with the unchanged
+capture shape.  Unchanged official scorer job `6743442` completed `0:0` with
+816/816 top-1 decisions, top-10/top-100 also 100%, and average/max rank 1.
+After that pass, requested A3:F1/EP4 full-model job `6743740` completed `0:0`
+in 19:50 on four trays (12 attention + 4 EP4 model GPUs) with the same
+128K/b6/MB2/capture contract.  It retained 15/15 steps at 23.188910933-ms
+strict CUDA and 194.058272635 TPS/active GPU, produced 72 coherent samples /
+1,224 tokens and all sixteen traces, and its first 48 token arrays exactly equal
+the perfectly aligned A2 sample.  Unchanged A3 scorer job `6744025` completed
+`0:0` in 21:00: 1,224/1,224 top-1 decisions, top-10/top-100 also 100%,
+average/max rank 1, and inspected attention/model ranks each retain exactly 16
+graph launches.  This validates the repair at source count three as well as two.
+See `CODEX_PROJECT_qwen3_ffn_overheads.md` for exact evidence.
+
 ## Completed FP8xFP4 MegaMoE cleanup (2026-08-29 PDT)
 
 The accumulated candidate `9a84a5a` restores the participant cleanup ticket

@@ -370,13 +370,14 @@ __device__ __forceinline__ void publish_o_payload(const PublishOParams params) {
     const int head_count = static_cast<int>(desc[3]);
     const int dst_local_heads = static_cast<int>(desc[4]);
     const int64_t slot_rows = desc[5];
+    const int source = static_cast<int>(desc[6]);
     destination +=
         static_cast<int64_t>(params.slot) * slot_rows * dst_local_heads * kHeadDim;
-    if constexpr (!kSingleEdge) {
-      const int source = static_cast<int>(desc[6]);
-      destination += static_cast<int64_t>(source) *
-          params.destination_source_stride * dst_local_heads * kHeadDim;
-    }
+    // A single outgoing edge does not imply source zero. In grouped fan-in,
+    // every attention rank has one edge to its model rank, but that edge can
+    // own any source partition in the destination arena.
+    destination += static_cast<int64_t>(source) *
+        params.destination_source_stride * dst_local_heads * kHeadDim;
     const int64_t tasks =
         static_cast<int64_t>(params.rows) * head_count * kPacksPerHead;
     for (int64_t task = thread; task < tasks; task += stride) {
@@ -447,8 +448,8 @@ __device__ __forceinline__ void publish_o_fp8_payload(
     const int dst_local_heads = static_cast<int>(desc[5]);
     const int64_t slot_rows = desc[6];
     const int64_t scale_slot_elements = desc[7];
-    const int source = kSingleEdge ? 0 : static_cast<int>(desc[8]);
-    const int source_count = kSingleEdge ? 1 : static_cast<int>(desc[9]);
+    const int source = static_cast<int>(desc[8]);
+    const int source_count = static_cast<int>(desc[9]);
     destination +=
         static_cast<int64_t>(params.slot) * slot_rows * dst_local_heads * kHeadDim;
     destination += static_cast<int64_t>(source) *
@@ -646,8 +647,8 @@ __device__ __forceinline__ void publish_staged_o_fp8_payload(
     const int dst_local_heads = static_cast<int>(desc[5]);
     const int64_t slot_rows = desc[6];
     const int64_t scale_slot_elements = desc[7];
-    const int source = kSingleEdge ? 0 : static_cast<int>(desc[8]);
-    const int source_count = kSingleEdge ? 1 : static_cast<int>(desc[9]);
+    const int source = static_cast<int>(desc[8]);
+    const int source_count = static_cast<int>(desc[9]);
     destination +=
         static_cast<int64_t>(params.slot) * slot_rows * dst_local_heads * kHeadDim;
     destination += static_cast<int64_t>(source) *

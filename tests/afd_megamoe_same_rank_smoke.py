@@ -190,6 +190,19 @@ def _make_weights(
         l2_kernel = weight_utils.requant_qwen_fp8_weights_to_fp4(
             l2, block_scales(hidden, intermediate)
         )
+
+        def dequantized_fp4_reference(weight: torch.Tensor) -> torch.Tensor:
+            experts = []
+            for expert in range(local_experts):
+                packed, sf = weight_utils.per_token_cast_to_fp4(
+                    weight[expert].float(), use_ue8m0=True, gran_k=32
+                )
+                experts.append(weight_utils.dequant_fp4(packed, sf, gran_k=32))
+            return torch.stack(experts)
+
+        # Reference the exact requantized FP4 values consumed by the kernel.
+        l1_reference = (dequantized_fp4_reference(l1), l1_reference[1])
+        l2_reference = (dequantized_fp4_reference(l2), l2_reference[1])
     else:
         l1_kernel, l2_kernel = l1_reference, l2_reference
     transformed = weight_utils.transform_weights_for_mega_moe(
@@ -303,6 +316,176 @@ def _numeric_case(rank: int, world_size: int) -> dict[str, float]:
             f"max_abs={max_abs:.6f} cosine={cosine:.6f}"
         )
     return {"max_abs": max_abs, "cosine": cosine}
+
+
+def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]]:
+    """Reference-check A1/A2 row counts across graph-stable buffer buckets."""
+    row_counts = sorted(set(_positive_int_list("MEGAMOE_NUMERIC_ROWS", "3,6")))
+    bucket_counts = sorted(
+        set(_positive_int_list("MEGAMOE_NUMERIC_BUCKETS", "518,1036"))
+    )
+    if min(bucket_counts) < max(row_counts):
+        raise RuntimeError(
+            "MEGAMOE_NUMERIC_BUCKETS must all cover the largest numeric row count"
+        )
+
+    hidden, intermediate = 1024, 512
+    local_experts, top_k = 2, 2
+    num_experts = local_experts * world_size
+    l1, l2, transformed = _make_weights(local_experts, hidden, intermediate)
+    hidden_states = torch.randn(
+        (max(row_counts), hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    gate_weight = torch.randn(
+        (num_experts, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    expert_map = torch.arange(
+        num_experts, dtype=torch.int64, device="cuda"
+    )
+
+    def reference_for(
+        buffer: megamoe_mega.MegaMoESymmBuffer,
+        rows: int,
+    ) -> torch.Tensor:
+        # Consume the fused gate's registered FP8 values and packed UE8M0
+        # scales so the reference starts from the exact kernel inputs.
+        x_q = buffer.x[:rows]
+        x_sf_exponents = (
+            buffer.x_sf[:rows]
+            .view(torch.uint8)
+            .view(rows, hidden // 32)
+            .to(torch.int32)
+        )
+        x_sf = torch.exp2(x_sf_exponents.float() - 127.0)
+        x_dequant = x_q.float() * torch.repeat_interleave(x_sf, 32, dim=1)
+        ids = buffer.topk_idx[:rows]
+        weights = buffer.topk_weights[:rows]
+        all_x = torch.empty(
+            (world_size * rows, hidden), dtype=torch.float32, device="cuda"
+        )
+        all_ids = torch.empty(
+            (world_size * rows, top_k), dtype=torch.int64, device="cuda"
+        )
+        all_weights = torch.empty(
+            (world_size * rows, top_k), dtype=torch.float32, device="cuda"
+        )
+        dist.all_gather_into_tensor(all_x, x_dequant)
+        dist.all_gather_into_tensor(all_ids, ids)
+        dist.all_gather_into_tensor(all_weights, weights)
+        all_x = all_x.view(world_size, rows, hidden)
+        all_ids = all_ids.view(world_size, rows, top_k)
+        all_weights = all_weights.view(world_size, rows, top_k)
+
+        reference = torch.zeros(
+            (world_size, rows, hidden), dtype=torch.float32, device="cuda"
+        )
+        for source in range(world_size):
+            for token in range(rows):
+                for route in range(top_k):
+                    expert = int(all_ids[source, token, route])
+                    if expert // local_experts != rank:
+                        continue
+                    local_expert = expert % local_experts
+                    gate_up = F.linear(
+                        all_x[source, token], l1[0][local_expert].float()
+                    )
+                    gate, up = gate_up.chunk(2)
+                    activated = (
+                        F.silu(gate)
+                        * up
+                        * all_weights[source, token, route]
+                    )
+                    act_q, act_sf = per_token_cast_to_fp8(
+                        activated[None],
+                        use_ue8m0=True,
+                        gran_k=32,
+                        use_packed_ue8m0=False,
+                        backend="torch",
+                    )
+                    act_dequant = act_q[0].float() * torch.repeat_interleave(
+                        act_sf[0].float(), 32
+                    )
+                    reference[source, token].add_(
+                        F.linear(act_dequant, l2[0][local_expert].float())
+                    )
+        dist.all_reduce(reference)
+        return reference[rank]
+
+    def run_case(bucket: int, rows: int, prepared: bool) -> dict[str, float]:
+        # A1 and A2 are separate processes with separately initialized buffers.
+        # Keep this scope self-contained so its rendezvous allocation is released
+        # before the next shape is created.
+        buffer = megamoe_mega.MegaMoESymmBuffer(
+            dist.group.WORLD,
+            num_experts=num_experts,
+            num_max_tokens_per_rank=bucket,
+            num_topk=top_k,
+            hidden=hidden,
+            intermediate_hidden=intermediate,
+        )
+        ids = buffer.topk_idx[:rows]
+        weights = buffer.topk_weights[:rows]
+        output = buffer.y[:rows]
+        output.fill_(float("nan"))
+        gate_topk(
+            hidden_states[:rows],
+            gate_weight,
+            top_k,
+            renormalize=True,
+            expert_map=expert_map,
+            num_token_non_padded=rows,
+            topk_idx_dtype=torch.int64,
+            quant_out=(buffer.x[:rows], buffer.x_sf[:rows], None),
+            out=(ids, weights),
+            route_prepare=(
+                buffer.route_prepare_args(rank_ready=True) if prepared else None
+            ),
+        )
+        megamoe_mega.fp8_fp8_mega_moe(
+            output,
+            transformed[0],
+            transformed[1],
+            buffer,
+            routes_prepared=prepared,
+            rank_gated_combine=prepared,
+            route_ready_dispatch=prepared,
+            rank_ready_route_publish=prepared,
+        )
+        torch.cuda.synchronize()
+        expected = reference_for(buffer, rows)
+        actual = output.float()
+        max_abs = float((actual - expected).abs().max())
+        cosine = float(
+            F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+        )
+        if not torch.isfinite(actual).all() or cosine < 0.96:
+            raise RuntimeError(
+                "same-rank MegaMoE row sweep mismatch "
+                f"rank={rank} bucket={bucket} rows={rows} "
+                f"prepared={int(prepared)} max_abs={max_abs:.6f} "
+                f"cosine={cosine:.6f}"
+            )
+        return {"max_abs": max_abs, "cosine": cosine}
+
+    results: dict[str, dict[str, float]] = {}
+    for bucket in bucket_counts:
+        for rows in row_counts:
+            for prepared in (False, True):
+                result = run_case(bucket, rows, prepared)
+                key = f"bucket{bucket}_rows{rows}_prepared{int(prepared)}"
+                results[key] = result
+                if rank == 0:
+                    print(
+                        "MEGAMOE_NUMERIC_ROW_OK "
+                        f"bucket={bucket} rows={rows} "
+                        f"prepared={int(prepared)} "
+                        f"cosine={result['cosine']:.9f} "
+                        f"max_abs={result['max_abs']:.6f}",
+                        flush=True,
+                    )
+                torch.cuda.synchronize()
+                dist.barrier()
+    return results
 
 
 def _exact_qwen_case(
@@ -682,12 +865,15 @@ def main() -> None:
     torch.manual_seed(20260825 + rank)
     numeric = _numeric_case(rank, world_size)
     dist.barrier()
+    numeric_rows = _numeric_row_sweep(rank, world_size)
+    dist.barrier()
     exact = _exact_qwen_case(rank, world_size)
     if rank == 0:
         print(json.dumps({
             "status": "ok",
             "expert_weight_dtype": expert_weight_dtype,
             "numeric": numeric,
+            "numeric_rows": numeric_rows,
             "exact_qwen": exact,
         }, sort_keys=True))
     dist.destroy_process_group()

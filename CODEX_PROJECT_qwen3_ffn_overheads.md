@@ -1,5 +1,113 @@
 # Qwen3 FMHA-Only Attention Worker and FFN Pipeline
 
+## A2 fan-in correctness repair (2026-08-31 PDT)
+
+The A2 failure is localized outside the FP8xFP4 MegaMoE math.  Each A2 attention
+rank has one outgoing O edge, so the JIT selects the single-edge publisher, but
+the second attention rank's sole edge owns destination source partition 1.  The
+BF16, FP8, and fused-quantized FP8 O publishers incorrectly equated one edge
+with source index zero; the FP8 paths also substituted source count one when
+computing the packed-scale stride.  That overwrote source partition zero and
+left partition one invalid.  A1 has only one source per model rank, which is
+why the same defect is invisible there.
+
+The minimal repair always reads source index and source count from the existing
+descriptor while retaining the one-edge loop specialization.  It is zero-copy
+and adds no tensor materialization, barrier, synchronization, fallback, launch,
+or numerical operation.  The fix is remote commit `b769743`, descended from
+aligned checkpoint `9a84a5a`; completed test coverage is commit `bd1e3ca` on
+branch `codex/a2-fp8fp4-fix-20260831`.
+
+Four-GPU pre-fix control job `6741945` exercised two one-edge attention/model
+pairs with source indices 0/1 and source count 2.  It failed exactly at the
+predicted boundary: source-1 payload mismatched all 24,576 bytes and the
+source-count-dependent scale view mismatched 24/48 words.  The unchanged test
+passed after the repair in job `6742095` for all nine iterations.  Generalized
+job `6742728` then passed 72 exact publications covering every source partition
+for logical fan-in A=1 through A=8, validating the entire FP8 payload arena,
+packed-scale arena, and readiness state.
+
+The repaired kernel-only numerical check compares exact deployed FP8
+activations and requantized FP4 weights at the unchanged cosine threshold 0.96.
+Job `6743049` passed all eight combinations of rows 3/6, graph buckets
+518/1036, and ordinary/production-prepared routes; observed cosine is
+0.999891400--0.999959111.  Each case owns a scoped symmetric buffer, matching
+the separate A1/A2 processes and avoiding invalid cross-case route state.
+Focused runtime contracts pass 41/41.
+
+Full unchanged A2:F1/EP4 model validation is job `6743115`: 3 trays/12 GPUs,
+attention DP 8, EP4, batch 6 per lane, two microbatches, 128K context,
+FMHA-only placement, and MegaMoE FP8xFP4.  It completed `0:0` in 18:08,
+retaining all 15 measured decode steps and producing 48 coherent samples / 816
+tokens plus all twelve Nsight reports.  Strict CUDA is 22.938265067 ms and
+throughput is 174.381104603 TPS/active GPU, versus 22.971659867 ms and
+174.127599974 TPS/active GPU in pre-fix job `6691133`: respectively 0.145%
+lower latency and 0.146% higher throughput, which is noise-level evidence of no
+performance regression.  Unchanged official scorer job `6743442` completed
+`0:0` in 15:48: all 816 token decisions are top-1 matches, top-10/top-100 are
+also 100%, average/max vLLM rank are 1, and representative attention/model
+ranks retain exactly 16 graph launches.  After this pass, requested A3:F1/EP4
+full-model job `6743740` completed `0:0` in 19:50 with twelve attention lanes
+plus four EP4 model GPUs, batch 6 per attention lane, and the same
+128K/MB2/FP8xFP4/capture contract.  All four model ranks receive exactly three
+mapped sources (`q_edges=3`, max rows 1554), while every attention publisher
+retains one O edge, directly exercising source indices 0/1/2.  It retained
+15/15 measured steps at 23.188910933-ms strict CUDA and 194.058272635
+TPS/active GPU, produced 72 coherent samples / 1,224 tokens and all sixteen
+Nsight reports, and its first 48 token arrays exactly equal the perfectly
+aligned A2 sample.  Unchanged official A3 scorer job `6744025` completed `0:0`
+in 21:00: all 1,224 token decisions are top-1 matches, top-10/top-100 are also
+100%, average/max vLLM rank are 1, and representative attention/model ranks
+each retain exactly 16 graph launches.  A2 and A3 therefore both pass the
+unchanged end-to-end correctness standard, while the generalized kernel test
+already covers every source partition for A1 through A8.  A representative
+model-trace audit finds no reshape/contiguous kernel names; A2 and A3 have the
+same three PyTorch copy-kernel classes at the same 16-launch counts.  Together
+with the source diff (descriptor loads/address arithmetic only), this excludes
+a fix-specific copy launch or synchronization.  Earlier jobs `6742458` and
+`6742681` did not execute the model: the first failed campaign
+ordinal validation and the second was canceled pending before kernel-first
+validation, respectively.
+
+## A1 control rerun and A2:F1/EP4 alignment failure (2026-08-31 PDT)
+
+The requested A2:F1/EP4 correctness test and A1 control rerun are complete on
+preserved clean source `9a84a5a`.  A2 reused the exact successful production
+sweep sample from job `6691133`: 48 prompts x 17 generated tokens at 128K,
+attention DP 8, four FFN GPUs, EP4, batch 6 per lane, two microbatches,
+FMHA-only placement, and MegaMoE FP8xFP4.  Every FFN-rank log independently
+records `fmha_megamoe_buffers precision=fp8_fp4 ... group_ranks=4`.  The
+unchanged one-tray official scorer job `6740882` completed all 48 HTTP
+comparisons but correctly exited `1:0` on strict acceptance after 16:05.
+Across 816 generated-token decisions, A2 has 314 top-1, 442 top-10, and 540
+top-100 hits: rates 0.384803922/0.541666667/0.661764706, average vLLM rank
+10100.873775, maximum rank 151798, and perplexity 631.597994.  Forty-seven
+prompts first disagree at generated position zero and one at position one.
+All eight attention lanes are affected.  Accuracy also falls sharply by the
+six per-lane batch slots: top-1 is 0.625000/0.551471/0.477941/0.514706 for
+slots 0--3, then 0.110294/0.029412 for slots 4--5.  This localizes a strong
+batch-row effect but does not yet prove the root cause.
+
+To exclude scorer drift, one-tray control job `6741120` rescored the exact A1
+sample from job `6690293` with the identical current script, model, image,
+environment, and thresholds.  It completed `0:0` in 10:57 and reproduced
+perfect alignment across 24 prompts and 408 generated tokens: top-1/top-10/
+top-100 all 1.0, average/max rank both 1.0, and perplexity 1.009447258.  The
+current scorer is therefore repeatable; A1 remains validated, while the tested
+A2 production path is not alignment-correct.  Compact evidence is local under
+`scratch/megamoe_alignment_a1_a2_20260831/`; full A1/A2 alignment JSONs remain
+remote under `results/fmha_megamoe_cleanup_20260829/a1_rerun_9a84a5a_20260831/`
+and `.../a2_alignment_9a84a5a_20260831/`.
+
+The same-sweep A1:F1/EP8/batch-6 sample on `9a84a5a` was then compared directly
+with the previously official-scored A1:F1/EP8 sample on tree-identical production
+base `0bee9f3`.  All 48 prompts, all 48 generated-token arrays, and all 48 decoded
+texts match exactly.  The earlier unchanged scorer reported 816/816 top-1 tokens,
+so current A1/EP8 is also alignment-correct without spending another scorer run.
+Together with current A1/EP4 correctness, this excludes EP4 or EP8 size alone:
+the failing structural delta is A2 fan-in (two attention sources and six rows per
+microbatch per FFN rank) or an interaction between that fan-in and EP4.
+
 ## FP8xFP4 MegaMoE cleanup continuation (2026-08-29 PDT)
 
 The adopted FMHA-only production source remains `0bee9f3`.  Same-allocation
