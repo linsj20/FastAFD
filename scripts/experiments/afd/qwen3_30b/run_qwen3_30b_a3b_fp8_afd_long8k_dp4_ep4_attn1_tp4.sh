@@ -548,7 +548,7 @@ if [[ "$RUN_VLLM_ALIGNMENT" == "1" ]]; then
       --ready-timeout "$VLLM_WAIT_READY_TIMEOUT" \
       --gpus-per-server "${VLLM_SHARDED_GPUS_PER_SERVER:-4}" \
       --conda-sh "${VLLM_CONDA_SH:-${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}}" \
-      --env-name "$ENV_NAME" \
+      --env-name "${VLLM_ENV_NAME:-$ENV_NAME}" \
       --cuda-home "$CUDA_13_HOME" \
       --output-json "$ALIGNMENT_JSON" \
       --log-dir "$RUN_DIR/vllm_shards" \

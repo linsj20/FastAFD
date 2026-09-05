@@ -8,9 +8,13 @@ current `fmha_only` branch's two-lane schedule and optimizations. Linear
 attention, its convolution state, and its recurrent GDN state must remain on
 attention workers in both placements. The canonical split-placement name is
 `attn-only`; accept and immediately normalize the old `fmha-only` spelling.
-First prove A1:F1/EP4 alignment at the real 128K maximum batch, then prove
-A3:F1/EP4 alignment and retain local Nsight Systems reports for both. Use HSG
-`short`, one-hour jobs, with 5/15-minute monitoring.
+First prove normal-routing A1:F1/EP4 alignment at the real 128K maximum batch,
+then prove normal-routing A3:F1/EP4 alignment. Run each alignment topology in
+both `legacy` and `attn-only`. After correctness is established, capture
+perfect-balanced `attn-only` Nsight Systems reports for A1:F1 and A3:F1 and
+retain both report sets locally. Use HSG `short`, one-hour jobs, with
+5/15-minute monitoring. Keep plans, results, metrics, and traces isolated by
+purpose and placement so repeated shape IDs cannot overwrite one another.
 
 The primary local checkout must remain untouched. The editable source is
 `scratch/qwen35_afd_overheads_20260904/source_mirror`. The isolated remote task
@@ -48,6 +52,13 @@ campaign validation, launch examples, and new metric records use the canonical
 `attn-only` name while retaining the old spelling only as an input/result
 compatibility alias.
 
+The sharded vLLM scorer accepts the pinned environment as an absolute prefix.
+It then launches that prefix's Python via `-m vllm.entrypoints.cli.main` and
+exports its `bin`, `CONDA_PREFIX`, and `VIRTUAL_ENV`, avoiding the nonexistent
+home-Conda activation path and the absent `vllm` console script. Alignment-only
+runs may disable Nsight; comprehensive postprocessing now runs only when Nsight
+was enabled.
+
 ## Validation and active work
 
 - Local Python AST parsing covers all changed Python sources; shell syntax and
@@ -77,7 +88,7 @@ compatibility alias.
   two workers and is progressing. Do not repeat the failed mode.
 
 Next: finish the snapshot, reconcile and commit the isolated remote source,
-run a minimal real Qwen3.5 startup/alignment probe, discover the exact A1 128K
-capacity from post-init page counts, rerun that exact maximum through alignment
-and Nsight capture, then run the final A3 alignment/capture and copy both report
-sets into the local workspace scratch tree.
+discover the placement-specific exact A1 128K capacities from post-init page
+counts, run normal-routing alignment for legacy and attn-only at exact A1 and
+then A3, capture perfect-balanced attn-only A1/A3 Nsight reports, and copy both
+report sets into the local workspace scratch tree.

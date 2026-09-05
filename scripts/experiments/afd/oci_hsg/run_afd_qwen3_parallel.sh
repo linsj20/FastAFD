@@ -245,6 +245,7 @@ export VLLM_SHARDED_NODE_LIST="${VLLM_SHARDED_NODE_LIST:-$AFD_NODE_LIST}"
 export VLLM_SHARDED_GPUS_PER_SERVER="${VLLM_SHARDED_GPUS_PER_SERVER:-$AFD_GPUS_PER_NODE}"
 export VLLM_GPUS="${VLLM_GPUS:-0,1,2,3}"
 export VLLM_TP_SIZE="${VLLM_TP_SIZE:-1}"
+export VLLM_ENV_NAME="${VLLM_ENV_NAME:-${EP_VENV_DIR:-$ENV_NAME}}"
 export VLLM_PROMPT_LOGPROBS="${VLLM_PROMPT_LOGPROBS:-0}"
 export VLLM_SCORE_CONCURRENCY="${VLLM_SCORE_CONCURRENCY:-16}"
 if [[ -z "${VLLM_EXTRA_ARGS:-}" ]]; then
@@ -314,6 +315,7 @@ if [[ "$RUN_VLLM_ALIGNMENT" == "1" ]]; then
   echo "  vllm_sharded_score: $VLLM_SHARDED_SCORE"
   echo "  vllm_shard_nodes: $VLLM_SHARDED_NODE_LIST"
   echo "  vllm_dp/ep/tp_per_shard: 4/4/$VLLM_TP_SIZE"
+  echo "  vllm_env: $VLLM_ENV_NAME"
   echo "  vllm_score_concurrency_per_shard: $VLLM_SCORE_CONCURRENCY"
 fi
 

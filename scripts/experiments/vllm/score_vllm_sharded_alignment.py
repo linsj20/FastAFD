@@ -133,8 +133,24 @@ class _VllmServerActor:
 
     def start(self) -> dict[str, Any]:
         Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
-        argv = [
-            "vllm",
+        env_prefix = Path(self.env_name) if Path(self.env_name).is_absolute() else None
+        if env_prefix is not None:
+            python = env_prefix / "bin/python"
+            if not python.is_file():
+                raise RuntimeError(f"vLLM environment has no Python: {python}")
+            executable = [str(python), "-m", "vllm.entrypoints.cli.main"]
+            activation = f"""
+export PATH={shlex.quote(str(env_prefix / "bin"))}:$PATH
+export CONDA_PREFIX={shlex.quote(str(env_prefix))}
+export VIRTUAL_ENV={shlex.quote(str(env_prefix))}
+"""
+        else:
+            executable = ["vllm"]
+            activation = f"""
+source {shlex.quote(self.conda_sh)}
+conda activate {shlex.quote(self.env_name)}
+"""
+        argv = executable + [
             "serve",
             self.model,
             "--host",
@@ -147,8 +163,7 @@ class _VllmServerActor:
         quoted = " ".join(shlex.quote(arg) for arg in argv)
         script = f"""
 set -eo pipefail
-source {shlex.quote(self.conda_sh)}
-conda activate {shlex.quote(self.env_name)}
+{activation}
 cd {shlex.quote(self.calib_dir)}
 
 HOSTNAME_SAFE="$(hostname | tr '.-' '__')"

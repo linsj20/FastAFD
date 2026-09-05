@@ -1710,6 +1710,7 @@ model_placement_policy = os.environ["AFD_MODEL_PLACEMENT_POLICY"]
 moe_backend = os.environ["MINISGL_AFD_MOE_BACKEND"]
 megamoe_expert_weight_dtype = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"]
 num_mb = int(os.environ["AFD_NUM_MB"])
+nsys_enabled = bool(int(os.environ.get("NSYS", "0")))
 mb_base, mb_remainder = divmod(batch, num_mb)
 if model_placement == "attn-only":
     microbatch_real_sizes = [
@@ -1987,7 +1988,7 @@ result = {
         "across one attention and one model representative"
     ),
     "primary_performance_metric": {
-        "status": "pending_postprocess",
+        "status": "pending_postprocess" if nsys_enabled else "alignment_only",
         "metric_version": (
             "20260904-attn-only-dual-role-cuda-graph-span-v1"
             if model_placement == "attn-only"
@@ -2014,7 +2015,7 @@ if reference > 0:
 print(json.dumps(result, indent=2, sort_keys=True))
 PY
 
-if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
+if [[ "$SWEEP_CONTRACT" == comprehensive && "${NSYS:-0}" == 1 ]]; then
     CUDA_CASE_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT/$SLURM_JOB_ID-$CASE_ORDINAL
     mkdir -p "$CUDA_METRICS_ROOT" "$CUDA_CASE_TEMP_ROOT"
     "$PYTHON" "$CUDA_EXTRACT_SCRIPT" \
