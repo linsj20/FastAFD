@@ -7,7 +7,8 @@
 // GEMM off the tensor cores).  Mapping: one thread block per 16-token tile;
 // the block owns ALL experts, so the top-k epilogue needs no cross-block
 // sync: cp.async double-buffered K loop -> ldmatrix -> mma -> logits in
-// shared memory -> per-token warp top-k (iterative warp arg-max).
+// shared memory -> a per-token grid covering all experts -> per-token warp
+// top-k (iterative warp arg-max).
 
 #include <minisgl/tensor.h>
 #include <minisgl/utils.cuh>

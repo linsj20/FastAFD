@@ -92,6 +92,14 @@ was enabled.
   the new deterministic-ID test called `torch.equal` inside CUDA graph capture.
   The assertion is moved to the synchronized eager validation immediately
   before capture; the candidate kernel itself was not implicated.
+- Corrected HSG job `6925762` (`short`, one tray, one-hour limit) completed
+  `0:0` in 1:24. It exercised hidden 4096, intermediate 1024, 512 experts,
+  top-k 10, EP4, FP8 activations/FP4 weights, route-prepared/rank-ready
+  dispatch, graph replay, and perfect routing. All preliminary numeric cases
+  passed; the exact target case reported 40 active experts, finite output, and
+  0.127328 ms for its single timing iteration. The failed parent allocation
+  from `6925717` lingered after its step failure and was explicitly canceled
+  before the corrected job ran.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   A direct-launch dry run resolves the provisional A1 point to 45 requests per
