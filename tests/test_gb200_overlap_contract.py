@@ -806,6 +806,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("bool kRankReadyRoutePublish = false", kernel_source)
         self.assertIn("get_combine_ready_epoch_ptr", kernel_source)
         self.assertIn("get_route_ready_count_ptr", kernel_source)
+        self.assertIn(
+            "local_expert_idx = lane_idx;\n"
+            "                 local_expert_idx < kNumExpertsPerRank;\n"
+            "                 local_expert_idx += 32",
+            kernel_source,
+        )
         self.assertIn("st_release_sys", kernel_source)
 
         scheduler_source = (

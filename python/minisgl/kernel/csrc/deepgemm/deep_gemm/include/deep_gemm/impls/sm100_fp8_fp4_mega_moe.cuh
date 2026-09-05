@@ -371,28 +371,32 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Aggregate each local expert once per CTA, then share exact totals with
     // every scheduler role through the existing expert-count shared memory.
     if constexpr (kRankReadyRoutePublish) {
-        if (warp_idx == 0 and lane_idx < kNumExpertsPerRank) {
+        if (warp_idx == 0) {
             uint64_t ready = 0;
             do {
                 ready = ptx::ld_acq_sys(workspace.get_route_ready_count_ptr());
             } while (ready != kNumRanks);
-            uint32_t count = 0;
-            #pragma unroll
-            for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
-                const uint32_t rank_count = static_cast<uint32_t>(ptx::ld_volatile(
-                    workspace.get_expert_recv_count_ptr(
-                        rank_idx, lane_idx)));
-                count += rank_count;
+            for (uint32_t local_expert_idx = lane_idx;
+                 local_expert_idx < kNumExpertsPerRank;
+                 local_expert_idx += 32) {
+                uint32_t count = 0;
+                #pragma unroll
+                for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
+                    const uint32_t rank_count = static_cast<uint32_t>(ptx::ld_volatile(
+                        workspace.get_expert_recv_count_ptr(
+                            rank_idx, local_expert_idx)));
+                    count += rank_count;
 
-                // Cache all but the final rank expert-major. The exact total
-                // reconstructs that final count, so totals plus this cache fit
-                // in the existing kNumExperts shared-memory words.
-                if (rank_idx + 1 < kNumRanks)
-                    smem_expert_count[
-                        kNumExpertsPerRank +
-                        lane_idx * (kNumRanks - 1) + rank_idx] = rank_count;
+                    // Cache all but the final rank expert-major. The exact total
+                    // reconstructs that final count, so totals plus this cache fit
+                    // in the existing kNumExperts shared-memory words.
+                    if (rank_idx + 1 < kNumRanks)
+                        smem_expert_count[
+                            kNumExpertsPerRank +
+                            local_expert_idx * (kNumRanks - 1) + rank_idx] = rank_count;
+                }
+                smem_expert_count[local_expert_idx] = count;
             }
-            smem_expert_count[lane_idx] = count;
         }
         __syncthreads();
     }

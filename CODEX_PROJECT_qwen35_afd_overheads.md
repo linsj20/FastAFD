@@ -185,6 +185,14 @@ was enabled.
   The reusable same-rank smoke is therefore parameterized to reference-check
   the actual batch-19/512-expert/top-k-10 production specialization next;
   its earlier target-shape check only established routing reach and finiteness.
+- Production-shape numeric job `6931995` isolated the failure: the ordinary
+  batch-19/512-expert/top-k-10 FP8 path matches its explicit distributed
+  reference at cosine 0.999914, but the route-prepared/rank-ready path falls to
+  0.385559--0.653640. In rank-ready initialization, one warp indexed local
+  experts only by its 32-lane `lane_idx`; this covered Qwen3's 32 experts per
+  EP4 rank but only the first 32 of Qwen3.5's 128. The warp now strides by 32
+  across every local expert while retaining the same shared-memory layout,
+  kernel specialization, and launch count.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
