@@ -1099,6 +1099,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.timeout_record = object()
         runtime.timeout_ms = 1
         runtime.linear_o_descriptors = object()
+        runtime.hybrid_o_descriptors = object()
         runtime.o_ready_descriptors = object()
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
         runtime.state = SimpleNamespace(
@@ -1119,6 +1120,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         quantize.assert_not_called()
         publish.assert_called_once()
+        self.assertIs(publish.call_args.args[1], runtime.hybrid_o_descriptors)
         torch.testing.assert_close(
             publish.call_args.args[0], torch.tensor([[1.0], [2.0]])
         )
@@ -1130,6 +1132,45 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
         self.assertEqual(tuple(finished.shape), (2, 1))
         self.assertEqual(calls, [("finish", 0, 2)])
+
+    def test_hybrid_receive_preserves_distinct_linear_and_full_widths(self) -> None:
+        runtime = object.__new__(AfdFmhaRuntime)
+        runtime.is_hybrid_attention = True
+        runtime.transport_slots = 2
+        runtime.fanin = 1
+        runtime.max_rows = 2
+        runtime.source_max_rows = 2
+        runtime.head_dim = 1
+        runtime.linear_payload_heads = 1
+        runtime.table = SimpleNamespace(model_local_q_heads=2)
+        runtime.model_config = SimpleNamespace(
+            layer_types=("linear_attention", "full_attention")
+        )
+        runtime.linear_o_slots = torch.arange(8, dtype=torch.bfloat16).view(
+            2, 2, 2, 1
+        )
+        runtime.o_ready = torch.zeros((2, 1, 1), dtype=torch.int64)
+        runtime.timeout_record = object()
+        runtime.timeout_ms = 1
+        batch = SimpleNamespace(
+            phase="decode", afd_fmha_source_token_offsets=(0, 2)
+        )
+
+        with patch("minisgl.afd_fmha_runtime.wait_ready"):
+            linear, linear_scale = runtime.receive_attention_o(batch, 0, 0)
+            full, full_scale = runtime.receive_attention_o(batch, 0, 1)
+
+        self.assertEqual(tuple(linear.shape), (2, 1))
+        self.assertEqual(tuple(full.shape), (2, 2))
+        self.assertIsNone(linear_scale)
+        self.assertIsNone(full_scale)
+        torch.testing.assert_close(
+            linear[:, 0], torch.tensor([0.0, 2.0], dtype=torch.bfloat16)
+        )
+        torch.testing.assert_close(
+            full,
+            torch.tensor([[0.0, 1.0], [2.0, 3.0]], dtype=torch.bfloat16),
+        )
 
     def test_mb2_attention_runs_wait_fmha_and_publish_on_matching_main_stream(self) -> None:
         observations: list[tuple] = []

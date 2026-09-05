@@ -275,6 +275,18 @@ was enabled.
   3:06 and verified nine bitwise-exact publication/ready-counter/turn-reuse
   cycles across two attention/model rank pairs. This is the final cheap
   transport proof before repeating 8K attn-only inference.
+- First BF16 full-model retry `6937050` failed fast during decode-graph capture
+  in 9:16, before serving any prompt. The new O-projection correctly rejected
+  a K-width mismatch: Qwen3.5 GDN output is the 4,096-wide hidden size, but
+  full attention has 32 heads x 256 = 8,192 values. The initial candidate had
+  reused a GDN-sized arena and therefore truncated full-attention output. The
+  shared BF16 allocation now uses the larger width and distinct descriptors
+  and receive views preserve 4,096-wide linear versus 8,192-wide full payloads.
+  Five focused runtime tests pass, including both widths and unchanged FP8 MB2.
+  Exact 32Q/2KV/head-dim-256 fabric job `6937235` completed `0:0` in 3:32 and
+  passed nine bitwise-exact BF16 publication/ready/turn-reuse cycles across two
+  attention/model rank pairs. Do not count `6937050` as an inference attempt:
+  it produced no sample and consumed no alignment scorer.
 - The trace-free alignment launcher is committed as mirror commit `b677252`
   and isolated remote commit `f9dc7e1`; the primary checkout remains clean at
   `3c5315f`. The validated small A1 point deliberately overrides the available

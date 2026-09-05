@@ -221,6 +221,11 @@ class AfdFmhaRuntime:
             num_qo_heads=int(self.model_config.num_qo_heads),
             num_kv_heads=int(self.model_config.num_kv_heads),
         )
+        self.hybrid_o_payload_heads = (
+            max(self.linear_payload_heads, self.table.model_local_q_heads)
+            if self.is_hybrid_attention
+            else 0
+        )
         self.source_max_rows = int(worker.max_comm_tokens)
         self.fanin = len(self._mapped_attn_dp_ranks) if self.role == "mlp" else 1
         self.max_rows = self.source_max_rows * self.fanin
@@ -483,7 +488,7 @@ class AfdFmhaRuntime:
                         (
                             self.transport_slots,
                             self.max_rows,
-                            self.linear_payload_heads,
+                            self.hybrid_o_payload_heads,
                             self.head_dim,
                         ),
                         torch.bfloat16,
@@ -668,11 +673,13 @@ class AfdFmhaRuntime:
             self.q_ready_descriptors = self._descriptor_tensor(q_ready_rows, 3)
             self.o_descriptors = self._descriptor_tensor([], 10)
             self.linear_o_descriptors = self._descriptor_tensor([], 7)
+            self.hybrid_o_descriptors = self._descriptor_tensor([], 7)
             self.o_ready_descriptors = self._descriptor_tensor([], 3)
             return
 
         o_rows: list[list[int]] = []
         linear_o_rows: list[list[int]] = []
+        hybrid_o_rows: list[list[int]] = []
         o_ready_rows: list[list[int]] = []
         mlp_dp_rank = self.worker._topology.mlp_dp_for_attn_dp(
             int(worker.attn_dp_rank)
@@ -718,7 +725,18 @@ class AfdFmhaRuntime:
                     0,
                     0,
                     self.linear_payload_heads,
-                    self.linear_payload_heads,
+                    self.hybrid_o_payload_heads,
+                    int(record.linear_o_shape[1]),
+                    source_index,
+                ]
+            )
+            hybrid_o_rows.append(
+                [
+                    int(mapping.tensor.data_ptr()),
+                    0,
+                    0,
+                    self.table.attn_local_q_heads,
+                    self.hybrid_o_payload_heads,
                     int(record.linear_o_shape[1]),
                     source_index,
                 ]
@@ -747,6 +765,7 @@ class AfdFmhaRuntime:
         self.q_ready_descriptors = self._descriptor_tensor([], 3)
         self.o_descriptors = self._descriptor_tensor(o_rows, 10)
         self.linear_o_descriptors = self._descriptor_tensor(linear_o_rows, 7)
+        self.hybrid_o_descriptors = self._descriptor_tensor(hybrid_o_rows, 7)
         self.o_ready_descriptors = self._descriptor_tensor(o_ready_rows, 3)
 
     def _append_model_input_descriptors(
@@ -2560,7 +2579,7 @@ class AfdFmhaRuntime:
             if attention_turn is None:
                 publish_o(
                     o,
-                    self.linear_o_descriptors,
+                    self.hybrid_o_descriptors,
                     self.o_ready_descriptors,
                     self.o_publish_counters[slot : slot + 1],
                     slot=slot,
@@ -2572,7 +2591,7 @@ class AfdFmhaRuntime:
                 assert next_turn is not None
                 publish_o_release_turn(
                     o,
-                    self.linear_o_descriptors,
+                    self.hybrid_o_descriptors,
                     self.o_ready_descriptors,
                     self.o_publish_counters[slot : slot + 1],
                     attention_turn,
@@ -2660,10 +2679,20 @@ class AfdFmhaRuntime:
         if self.is_hybrid_attention:
             if self.linear_o_slots is None:
                 raise RuntimeError("Qwen3.5 BF16 attention output arena is missing")
+            if layer is None:
+                raise RuntimeError("Qwen3.5 BF16 attention receive requires a layer")
+            payload_heads = (
+                self.linear_payload_heads
+                if self.model_config.layer_types[layer] == "linear_attention"
+                else self.table.model_local_q_heads
+            )
             if batch.phase == "decode":
-                return self.linear_o_slots[slot, :rows].view(rows, -1), None
+                return (
+                    self.linear_o_slots[slot, :rows, :payload_heads].reshape(rows, -1),
+                    None,
+                )
             output = torch.empty(
-                (rows, int(self.model_config.hidden_size)),
+                (rows, payload_heads * self.head_dim),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -2674,8 +2703,8 @@ class AfdFmhaRuntime:
                 source_start = source * self.source_max_rows
                 output[left:right].copy_(
                     self.linear_o_slots[
-                        slot, source_start : source_start + count
-                    ].view(count, -1)
+                        slot, source_start : source_start + count, :payload_heads
+                    ].reshape(count, -1)
                 )
             return output, None
         source_rows = tuple(
