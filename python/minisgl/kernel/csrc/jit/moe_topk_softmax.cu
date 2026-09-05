@@ -1157,10 +1157,13 @@ void topk_gating_softmax_group_local_kernel_launcher(
     case 256:
       LAUNCH_GROUP_LOCAL_SOFTMAX(256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_GROUP_LOCAL_SOFTMAX(512, WARPS_PER_TB);
+      break;
     default:
       host::RuntimeCheck(
           false,
-          "group-local topk supports only power-of-two num_experts <= 256; got ",
+          "group-local topk supports only power-of-two num_experts <= 512; got ",
           num_experts);
   }
 }

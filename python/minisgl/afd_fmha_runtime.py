@@ -1112,14 +1112,6 @@ class AfdFmhaRuntime:
     ) -> dict[str, torch.Tensor]:
         expected = model.state_dict()
         weights: dict[str, torch.Tensor] = {}
-        is_qwen35 = self.is_hybrid_attention
-
-        def keep_fp32(key: str) -> bool:
-            return is_qwen35 and (
-                key.endswith(".linear_attn.A_log")
-                or key.endswith("_input_scale")
-                or key.endswith("_weight_scale_2")
-            )
 
         for key, value in load_weight(
             self.config.model_path,
@@ -1132,10 +1124,8 @@ class AfdFmhaRuntime:
                 value.dtype == torch.float32 and key.endswith("_scale")
             ):
                 weights[key] = value
-            elif keep_fp32(key):
-                weights[key] = value.to(torch.float32)
             else:
-                weights[key] = value.to(self.config.dtype)
+                weights[key] = value.to(expected[key].dtype)
         missing = tuple(key for key in expected if key not in weights)
         if missing:
             raise RuntimeError(

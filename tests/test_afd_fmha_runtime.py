@@ -236,6 +236,21 @@ class _FakeEvent:
 
 
 class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
+    def test_selected_weight_uses_parameter_dtype_for_bf16_checkpoint_scale(self) -> None:
+        key = "model.layers.0.linear_attn.in_proj_qkv.weight_scale"
+        runtime = object.__new__(AfdFmhaRuntime)
+        runtime.config = SimpleNamespace(model_path="unused", dtype=torch.bfloat16)
+        runtime.device = torch.device("cpu")
+        model = SimpleNamespace(
+            state_dict=lambda: {key: torch.empty((2, 2), dtype=torch.float32)}
+        )
+
+        def load_weight(*args, **kwargs):
+            yield key, torch.ones((2, 2), dtype=torch.bfloat16)
+
+        weights = runtime._load_selected_weights(model, load_weight)
+        self.assertEqual(weights[key].dtype, torch.float32)
+
     def test_shared_publication_arena_is_imported_once_for_all_views(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
         runtime._imports = {}

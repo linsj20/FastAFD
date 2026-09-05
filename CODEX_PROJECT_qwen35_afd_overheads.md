@@ -113,6 +113,14 @@ was enabled.
   `ServerArgs.num_page_override` into each attention worker; a pinned-environment
   targeted check confirms that 77,659 is retained. This is capacity plumbing
   only and does not alter prompts, model computation, or alignment scoring.
+- Fixed-capacity reruns `6928019`/`6928022` both passed the gate at exactly
+  77,659 pages, 4,970,176 tokens, and batch 37. Legacy then reached prefill but
+  its DeepEP group-local softmax rejected 512 experts because the CUDA launcher
+  stopped at 256 even though the Python contract already allowed 512; the
+  existing warp-per-row kernel is now instantiated for 512. Attn-only exposed
+  BF16 `weight_scale_inv` tensors from the 397B checkpoint loading into FP32
+  runtime scale parameters; selected weights now convert to the expected
+  parameter dtype, with a focused regression test.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
