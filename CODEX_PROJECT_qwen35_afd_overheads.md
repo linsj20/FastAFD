@@ -315,8 +315,14 @@ was enabled.
   that exact sequence only at the worker boundary: the attention worker runs
   attention and gate, transports BF16, and the model worker runs O projection.
   The exact legacy/attn-only generated stream is the end-to-end confirmation.
+- Final normal-routing 397B attn-only A3:F1/EP4 inference job `6937742`
+  completed `0:0` in 11:45 at 8K, batch four per each of 12 attention-DP
+  lanes, MB2, and 17 generated tokens. It produced a validated 48-prompt,
+  816-token sample and `SUCCESS`. Unchanged scorer job `6937912` completed
+  `0:0` in 10:17: top-10/top-100 are 1.0, top-1 is 0.9791667, average rank is
+  1.0318627, and maximum rank is 5. A1 and A3 attn-only therefore both pass
+  the unchanged all-generated-token top-10=1.0 alignment standard.
 
-Next: run the same normal-routing 397B attn-only 8K/batch-four alignment proof
-for A3:F1/EP4, then apply the unchanged scorer. Only after it passes, capture
-perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
-into the local workspace scratch tree.
+Next: capture perfect-balanced FP4 attn-only A1/A3 Nsight reports at the
+planned 128K/batch-37 maximum-capacity point and copy both report sets into the
+local workspace scratch tree.
