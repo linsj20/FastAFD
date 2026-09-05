@@ -261,6 +261,9 @@ class Qwen3_5FullAttention(BaseOP):
             output_dtype=torch.bfloat16,
         )
 
+    def finish_attention(self, output: torch.Tensor) -> torch.Tensor:
+        return self.o_proj.forward(output)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv_proj.forward(hidden_states)
         q_gate, key, value = qkv.split(
@@ -268,7 +271,7 @@ class Qwen3_5FullAttention(BaseOP):
         )
         query, gate = self.split_query_gate(q_gate)
         attn_output = self.attn.forward(torch.cat((query, key, value), dim=-1))
-        return self.o_proj.forward(attn_output * torch.sigmoid(gate))
+        return self.finish_attention(attn_output * torch.sigmoid(gate))
 
 
 class Qwen3_5SharedExpert(BaseOP):

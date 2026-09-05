@@ -245,14 +245,41 @@ was enabled.
   records null/empty trace metrics rather than collecting hundreds of MB of
   trace data. Perfect-balanced `NSYS=1` runs retain the complete strict trace
   contract unchanged.
-- The implementation is committed as mirror commit `2d8eb5e` and isolated
-  remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
-  Direct-launch dry runs resolve the provisional A1 point to 45 requests per
-  attention-DP lane, 180 prompts, four attention plus four EP4 model GPUs on
-  two trays, normal routing, and the unchanged strict vLLM scorer. Legacy uses
-  its established 23+22 MB2 order; attn-only uses 22+23. This is only the
-  planning estimate; the runtime page-count gate remains the placement-specific
-  maximum-batch authority.
+- Normal-routing, trace-free 397B A1 inference jobs `6936281` (legacy) and
+  `6936282` (`attn-only`) completed `0:0` in 9:11 and 10:05 respectively at
+  8K, batch four per attention-DP lane, MB2, and 17 generated tokens. Each
+  wrote a validated 16-prompt sample and `SUCCESS`; 11/16 complete sequences,
+  14/16 first tokens, and 204/272 generated token IDs agree between modes.
+  The one-node score-only wrapper now accepts `SCORE_NODES=1|2`, retaining the
+  same vLLM DP4/EP4 backend and unchanged scorer while avoiding a second tray
+  for these 16-prompt samples.
+- Attn-only score job `6936518` completed baseline evaluation in 9:20 and
+  correctly failed the unchanged top-10=1.0 gate: top-1 0.9080882, top-10
+  0.9926471, top-100 1.0, mean rank 1.46691, and maximum rank 50 over all 272
+  generated tokens. The only top-10 misses are prompt 1 position 7 (rank 19)
+  and prompt 14 position 4 (rank 50). Prompt 1 is identical to legacy through
+  position 6 and diverges exactly at the miss; prompt 14 first chooses a
+  plausible non-top-1 token and the miss occurs after that alternate prefix.
+  No further full-model job was launched before isolating the remaining
+  arithmetic asymmetry.
+- Legacy feeds the gated full-attention result directly into its BF16
+  O-projection, whereas Qwen3.5 attn-only was quantizing that result to FP8 for
+  inter-worker transport. Linear-attention output already uses a BF16 arena.
+  The current candidate uses that existing BF16 arena for both full and linear
+  layers in hybrid Qwen3.5, then runs the model-side BF16 O-projection; the
+  established FP8 O transport remains unchanged for non-hybrid models. Four
+  focused remote unit tests cover BF16 full-attention publication, model-side
+  O-projection finish, linear-layer behavior, and the unchanged FP8 MB2 path;
+  the Qwen3.5 placement structure test also passes. The reusable fabric smoke
+  now selects BF16 or FP8 O payloads. BF16 job `6936921` completed `0:0` in
+  3:06 and verified nine bitwise-exact publication/ready-counter/turn-reuse
+  cycles across two attention/model rank pairs. This is the final cheap
+  transport proof before repeating 8K attn-only inference.
+- The trace-free alignment launcher is committed as mirror commit `b677252`
+  and isolated remote commit `f9dc7e1`; the primary checkout remains clean at
+  `3c5315f`. The validated small A1 point deliberately overrides the available
+  capacity to four requests per attention-DP lane (16 total prompts), using
+  2+2 MB2 on four attention plus four EP4 model GPUs across two trays.
 - The earlier 122B snapshot completed but was superseded by the user's 397B
   selection and remains intact. The pinned 397B snapshot is complete at
   revision `ea5b4f8`: all 107 repository files and 94 tensor shards are present,
@@ -262,9 +289,9 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: run a source-contract check for the alignment-only launcher, then run
-normal-routing 397B legacy and attn-only A1 at 8K/small MB2 batch and score all
-generated tokens with the unchanged top-10=1.0 gate. If both pass, repeat the
+Next: repeat only the normal-routing 397B attn-only A1 8K/batch-four inference
+and unchanged score. Score the already
+durable legacy 8K sample only after attn-only passes. If both pass, repeat the
 same small alignment proof for A3. Only after correctness passes, capture
 perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
 into the local workspace scratch tree.

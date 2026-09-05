@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 from minisgl.kernel.afd_fmha_transport import (
     ensure_afd_fmha_transport_built,
+    publish_o_release_turn,
     publish_qkv,
     quantize_publish_o_fp8_release_turn,
     wait_ready,
@@ -78,6 +79,12 @@ def main() -> None:
     q_heads = int(os.environ.get("AFD_FABRIC_SMOKE_Q_HEADS", "64"))
     kv_heads = int(os.environ.get("AFD_FABRIC_SMOKE_KV_HEADS", "8"))
     head_dim = int(os.environ.get("AFD_FABRIC_SMOKE_HEAD_DIM", "128"))
+    o_transport_dtype = os.environ.get("AFD_FABRIC_SMOKE_O_DTYPE", "fp8")
+    if o_transport_dtype not in ("bf16", "fp8"):
+        raise RuntimeError(
+            "fabric smoke O dtype must be bf16 or fp8, "
+            f"got {o_transport_dtype!r}"
+        )
     scale_groups = q_heads * head_dim // 128
     o_scale_packed_groups = (scale_groups + 3) // 4
     o_scale_row_stride = ((rows + 3) // 4) * 4
@@ -99,13 +106,21 @@ def main() -> None:
         q_ready_owner.tensor.zero_()
         o_publish_counters = torch.zeros((2,), dtype=torch.int32, device=device)
         o_quantization_counters = torch.zeros((2,), dtype=torch.int32, device=device)
-        o_fp8_staging = torch.empty(
-            (2, rows, q_heads * head_dim),
-            dtype=torch.float8_e4m3fn,
-            device=device,
+        o_fp8_staging = (
+            torch.empty(
+                (2, rows, q_heads * head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            if o_transport_dtype == "fp8"
+            else None
         )
-        o_scale_staging = torch.empty(
-            (2, rows, scale_groups), dtype=torch.uint8, device=device
+        o_scale_staging = (
+            torch.empty(
+                (2, rows, scale_groups), dtype=torch.uint8, device=device
+            )
+            if o_transport_dtype == "fp8"
+            else None
         )
         turn = torch.zeros((1,), dtype=torch.int64, device=device)
         attention_handle = q_owner.handle
@@ -121,13 +136,22 @@ def main() -> None:
             kv_offset=kv_owner.byte_offset,
         )
     else:
-        o_owner, o_scale_owner, o_ready_owner = allocate_fabric_tensors(
-            (
-                ((2, rows, q_heads, head_dim), torch.float8_e4m3fn),
-                ((2, o_scale_slot_elements), torch.int32),
-                ((2, 1), torch.int64),
+        if o_transport_dtype == "fp8":
+            o_owner, o_scale_owner, o_ready_owner = allocate_fabric_tensors(
+                (
+                    ((2, rows, q_heads, head_dim), torch.float8_e4m3fn),
+                    ((2, o_scale_slot_elements), torch.int32),
+                    ((2, 1), torch.int64),
+                )
             )
-        )
+        else:
+            o_owner, o_ready_owner = allocate_fabric_tensors(
+                (
+                    ((2, rows, q_heads, head_dim), torch.bfloat16),
+                    ((2, 1), torch.int64),
+                )
+            )
+            o_scale_owner = None
         o_ready_owner.tensor.zero_()
         q_publish_counters = torch.zeros((2,), dtype=torch.int32, device=device)
         model_handle = o_owner.handle
@@ -135,13 +159,16 @@ def main() -> None:
             o_handle=model_handle,
             o_shape=tuple(o_owner.tensor.shape),
             o_offset=o_owner.byte_offset,
-            o_scale_handle=model_handle,
-            o_scale_shape=tuple(o_scale_owner.tensor.shape),
-            o_scale_offset=o_scale_owner.byte_offset,
             o_ready_handle=model_handle,
             o_ready_shape=tuple(o_ready_owner.tensor.shape),
             o_ready_offset=o_ready_owner.byte_offset,
         )
+        if o_scale_owner is not None:
+            record.update(
+                o_scale_handle=model_handle,
+                o_scale_shape=tuple(o_scale_owner.tensor.shape),
+                o_scale_offset=o_scale_owner.byte_offset,
+            )
 
     # Finish local initialization before publishing handles to remote writers.
     torch.cuda.synchronize()
@@ -178,16 +205,21 @@ def main() -> None:
         o_map = import_fabric_tensor(
             eg["o_handle"],  # type: ignore[arg-type]
             eg["o_shape"],  # type: ignore[arg-type]
-            dtype=torch.float8_e4m3fn,
+            dtype=(
+                torch.float8_e4m3fn
+                if o_transport_dtype == "fp8"
+                else torch.bfloat16
+            ),
             byte_offset=eg["o_offset"],  # type: ignore[arg-type]
         )
-        o_scale_map = import_fabric_tensor(
-            eg["o_scale_handle"],  # type: ignore[arg-type]
-            eg["o_scale_shape"],  # type: ignore[arg-type]
-            dtype=torch.int32,
-            byte_offset=eg["o_scale_offset"],  # type: ignore[arg-type]
-            allocation=o_map.allocation,
-        )
+        if o_transport_dtype == "fp8":
+            o_scale_map = import_fabric_tensor(
+                eg["o_scale_handle"],  # type: ignore[arg-type]
+                eg["o_scale_shape"],  # type: ignore[arg-type]
+                dtype=torch.int32,
+                byte_offset=eg["o_scale_offset"],  # type: ignore[arg-type]
+                allocation=o_map.allocation,
+            )
         o_ready_map = import_fabric_tensor(
             eg["o_ready_handle"],  # type: ignore[arg-type]
             eg["o_ready_shape"],  # type: ignore[arg-type]
@@ -305,51 +337,68 @@ def main() -> None:
 
         dist.barrier()
         if is_attention:
-            assert (
-                o_map is not None
-                and o_scale_map is not None
-                and o_ready_map is not None
-            )
+            assert o_map is not None and o_ready_map is not None
             o = torch.full(
                 (rows, q_heads * head_dim), o_value, device=device, dtype=torch.bfloat16
             )
             o.view(-1)[::251] = -0.0
-            o_desc = _descriptor(
-                [
-                    [
-                        o_map.tensor.data_ptr(),
-                        o_scale_map.tensor.data_ptr(),
-                        0,
-                        0,
-                        q_heads,
-                        q_heads,
-                        rows,
-                        o_scale_slot_elements,
-                        0,
-                        1,
-                    ]
-                ],
-                10,
-                device,
-            )
             o_ready_desc = _descriptor(
                 [[o_ready_map.tensor.data_ptr(), 0, 1]], 3, device
             )
-            quantize_publish_o_fp8_release_turn(
-                o,
-                o_fp8_staging[slot],
-                o_scale_staging[slot],
-                o_desc,
-                o_ready_desc,
-                o_publish_counters[slot : slot + 1],
-                o_quantization_counters[slot : slot + 1],
-                turn,
-                slot=slot,
-                destination_source_stride=rows,
-                next_turn=epoch + 1,
-                head_dim=head_dim,
-                ready_value=epoch + 1,
-            )
+            if o_transport_dtype == "fp8":
+                assert o_scale_map is not None
+                assert o_fp8_staging is not None and o_scale_staging is not None
+                o_desc = _descriptor(
+                    [
+                        [
+                            o_map.tensor.data_ptr(),
+                            o_scale_map.tensor.data_ptr(),
+                            0,
+                            0,
+                            q_heads,
+                            q_heads,
+                            rows,
+                            o_scale_slot_elements,
+                            0,
+                            1,
+                        ]
+                    ],
+                    10,
+                    device,
+                )
+                quantize_publish_o_fp8_release_turn(
+                    o,
+                    o_fp8_staging[slot],
+                    o_scale_staging[slot],
+                    o_desc,
+                    o_ready_desc,
+                    o_publish_counters[slot : slot + 1],
+                    o_quantization_counters[slot : slot + 1],
+                    turn,
+                    slot=slot,
+                    destination_source_stride=rows,
+                    next_turn=epoch + 1,
+                    head_dim=head_dim,
+                    ready_value=epoch + 1,
+                )
+            else:
+                o_desc = _descriptor(
+                    [[o_map.tensor.data_ptr(), 0, 0, q_heads, q_heads, rows, 0]],
+                    7,
+                    device,
+                )
+                publish_o_release_turn(
+                    o,
+                    o_desc,
+                    o_ready_desc,
+                    o_publish_counters[slot : slot + 1],
+                    turn,
+                    slot=slot,
+                    destination_source_stride=rows,
+                    next_turn=epoch + 1,
+                    head_dim=head_dim,
+                    ready_value=epoch + 1,
+                )
             torch.cuda.synchronize()
             if int(turn.item()) != epoch + 1:
                 raise RuntimeError(
@@ -364,8 +413,6 @@ def main() -> None:
                 expected_ready=epoch + 1,
             )
             torch.cuda.synchronize()
-            from minisgl.kernel import deepgemm as deep_gemm
-
             expected_o_bf16 = torch.full(
                 (rows, q_heads * head_dim),
                 o_value,
@@ -373,33 +420,45 @@ def main() -> None:
                 dtype=torch.bfloat16,
             )
             expected_o_bf16.view(-1)[::251] = -0.0
-            expected_o, expected_scale = deep_gemm.per_token_cast_to_fp8(
-                expected_o_bf16,
-                use_ue8m0=True,
-                gran_k=128,
-                use_packed_ue8m0=True,
-            )
-            torch.testing.assert_close(
-                o_owner.tensor[slot].view(torch.uint8),
-                expected_o.view(rows, q_heads, head_dim).view(torch.uint8),
-                rtol=0,
-                atol=0,
-            )
-            received_scale = torch.as_strided(
-                o_scale_owner.tensor[slot],
-                size=(rows, o_scale_packed_groups),
-                stride=(1, o_scale_row_stride),
-            )
-            torch.testing.assert_close(
-                received_scale, expected_scale, rtol=0, atol=0
-            )
+            if o_transport_dtype == "fp8":
+                assert o_scale_owner is not None
+                from minisgl.kernel import deepgemm as deep_gemm
+
+                expected_o, expected_scale = deep_gemm.per_token_cast_to_fp8(
+                    expected_o_bf16,
+                    use_ue8m0=True,
+                    gran_k=128,
+                    use_packed_ue8m0=True,
+                )
+                torch.testing.assert_close(
+                    o_owner.tensor[slot].view(torch.uint8),
+                    expected_o.view(rows, q_heads, head_dim).view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+                received_scale = torch.as_strided(
+                    o_scale_owner.tensor[slot],
+                    size=(rows, o_scale_packed_groups),
+                    stride=(1, o_scale_row_stride),
+                )
+                torch.testing.assert_close(
+                    received_scale, expected_scale, rtol=0, atol=0
+                )
+            else:
+                torch.testing.assert_close(
+                    o_owner.tensor[slot].view(torch.int16),
+                    expected_o_bf16.view(rows, q_heads, head_dim).view(torch.int16),
+                    rtol=0,
+                    atol=0,
+                )
         dist.barrier()
 
     if rank == 0:
         print(
             "AFD_FABRIC_TRANSPORT_SMOKE_OK "
             f"pairs={pair_count} rows={rows} iterations={iterations} "
-            f"q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}"
+            f"q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim} "
+            f"o_dtype={o_transport_dtype}"
         )
     dist.destroy_process_group()
 

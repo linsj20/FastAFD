@@ -50,10 +50,11 @@ srun "${COMMON_SRUN[@]}" --ntasks=1 --ntasks-per-node=1 \
   "$FASTAFD_VENV/bin/python" \
   "$FASTAFD_SOURCE_REPO/tests/afd_fabric_transport_smoke.py"
 
-# Exercise repeated turn/counter reuse while checking remote FP8 bytes/scales.
+# Exercise repeated turn/counter reuse while checking the selected O payload.
 srun "${COMMON_SRUN[@]}" --ntasks="$RANKS" --ntasks-per-node="$RANKS" \
   "${COMMON_ENV[@]}" MASTER_ADDR="$MASTER_ADDR" MASTER_PORT=29671 \
   AFD_FABRIC_SMOKE_ROWS="${AFD_FABRIC_SMOKE_ROWS:-3}" \
   AFD_FABRIC_SMOKE_ITERATIONS="${AFD_FABRIC_SMOKE_ITERATIONS:-9}" \
+  AFD_FABRIC_SMOKE_O_DTYPE="${AFD_FABRIC_SMOKE_O_DTYPE:-fp8}" \
   "$FASTAFD_VENV/bin/python" \
   "$FASTAFD_SOURCE_REPO/tests/afd_fabric_transport_smoke.py"

@@ -1080,6 +1080,57 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             [("publish_linear", 0, 0, 2), ("publish_linear", 0, 1, 2)],
         )
 
+    def test_hybrid_full_attention_uses_bf16_output_transport(self) -> None:
+        runtime = object.__new__(AfdFmhaRuntime)
+        runtime.is_hybrid_attention = True
+        runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
+        runtime.q_transport_multiplier = 2
+        runtime.transport_slots = 2
+        runtime.max_rows = 2
+        runtime.source_max_rows = 2
+        runtime.head_dim = 1
+        runtime.q_slots = torch.tensor(
+            [
+                [[[2.0], [0.0]], [[4.0], [0.0]]],
+                [[[0.0], [0.0]], [[0.0], [0.0]]],
+            ]
+        )
+        runtime.q_ready = torch.zeros((2, 1), dtype=torch.int64)
+        runtime.timeout_record = object()
+        runtime.timeout_ms = 1
+        runtime.linear_o_descriptors = object()
+        runtime.o_ready_descriptors = object()
+        runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
+        runtime.state = SimpleNamespace(
+            ctx=SimpleNamespace(
+                attn_backend=SimpleNamespace(
+                    forward_prepared=lambda query, layer, batch: query
+                )
+            )
+        )
+        batch = SimpleNamespace(positions=torch.arange(2), phase="decode")
+
+        with (
+            patch("minisgl.afd_fmha_runtime.wait_ready"),
+            patch("minisgl.afd_fmha_runtime.publish_o") as publish,
+            patch("minisgl.afd_fmha_runtime.quantize_publish_o_fp8") as quantize,
+        ):
+            runtime.run_attention_fmha(batch, layer=0, epoch=0)
+
+        quantize.assert_not_called()
+        publish.assert_called_once()
+        torch.testing.assert_close(
+            publish.call_args.args[0], torch.tensor([[1.0], [2.0]])
+        )
+
+        calls: list[tuple] = []
+        layer = _Layer(0, calls)
+        finished = runtime._finish_model_attention(
+            0, layer, torch.ones((2, 1)), None
+        )
+        self.assertEqual(tuple(finished.shape), (2, 1))
+        self.assertEqual(calls, [("finish", 0, 2)])
+
     def test_mb2_attention_runs_wait_fmha_and_publish_on_matching_main_stream(self) -> None:
         observations: list[tuple] = []
         waits: list[tuple[str, str]] = []
@@ -1108,6 +1159,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.model_config = SimpleNamespace(
             num_layers=2, layer_types=("full_attention", "full_attention")
         )
+        runtime.is_hybrid_attention = False
         runtime.q_transport_multiplier = 1
         runtime.state = SimpleNamespace(ctx=ctx, stream=root, attn_backends=backends)
         runtime.max_rows = 4
@@ -1278,6 +1330,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.model_config = SimpleNamespace(
             num_layers=2, layer_types=("full_attention", "full_attention")
         )
+        runtime.is_hybrid_attention = False
         runtime.q_transport_multiplier = 1
         runtime.state = SimpleNamespace(
             ctx=ctx,

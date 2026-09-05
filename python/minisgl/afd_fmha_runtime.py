@@ -1203,7 +1203,8 @@ class AfdFmhaRuntime:
                             linear_layer, linear_input
                         )
                     o = backend.forward_prepared(q, full_layer, sub)
-                    self._quantize_attention_o(o.view(per_mb_bs, -1))
+                    if not self.is_hybrid_attention:
+                        self._quantize_attention_o(o.view(per_mb_bs, -1))
                 stream.synchronize()
             finally:
                 ctx.attn_backend = previous_backend
@@ -1273,10 +1274,13 @@ class AfdFmhaRuntime:
                                 dtype=self.config.dtype,
                                 device=self.device,
                             )
-                            o_fp8, o_scale = self._quantize_attention_o(o)
-                            hidden = layer.self_attn.finish_attention_fp8(
-                                o_fp8, o_scale
-                            )
+                            if self.is_hybrid_attention:
+                                hidden = layer.self_attn.finish_attention(o)
+                            else:
+                                o_fp8, o_scale = self._quantize_attention_o(o)
+                                hidden = layer.self_attn.finish_attention_fp8(
+                                    o_fp8, o_scale
+                                )
                         hidden, _residual = layer.post_attention_layernorm.forward(
                             hidden, residual
                         )
@@ -1981,12 +1985,8 @@ class AfdFmhaRuntime:
                     output, output_scale = self.receive_attention_o(
                         sub, epoch, layer_id
                     )
-                    hidden[mb] = (
-                        output
-                        if output_scale is None
-                        else layer.self_attn.finish_attention_fp8(
-                            output, output_scale
-                        )
+                    hidden[mb] = self._finish_model_attention(
+                        layer_id, layer, output, output_scale
                     )
                     hidden[mb], residual[mb] = (
                         layer.post_attention_layernorm.forward(
@@ -2135,12 +2135,8 @@ class AfdFmhaRuntime:
                     sub, epoch, layer_id
                 )
                 lane_stream.wait_event(previous_compute_event)
-                hidden[mb] = (
-                    output
-                    if output_scale is None
-                    else layer.self_attn.finish_attention_fp8(
-                        output, output_scale
-                    )
+                hidden[mb] = self._finish_model_attention(
+                    layer_id, layer, output, output_scale
                 )
                 hidden[mb], residual[mb] = (
                     layer.post_attention_layernorm.forward(
@@ -2560,9 +2556,35 @@ class AfdFmhaRuntime:
         if gate is not None:
             o = o * torch.sigmoid(gate)
         o = o.view(rows, -1).contiguous()
-        staged_o = self.o_fp8_staging[slot, :rows]
-        staged_scales = self.o_scale_staging[slot, :rows]
-        if attention_turn is None:
+        if self.is_hybrid_attention:
+            if attention_turn is None:
+                publish_o(
+                    o,
+                    self.linear_o_descriptors,
+                    self.o_ready_descriptors,
+                    self.o_publish_counters[slot : slot + 1],
+                    slot=slot,
+                    destination_source_stride=destination_source_stride,
+                    head_dim=self.head_dim,
+                    ready_value=epoch + 1,
+                )
+            else:
+                assert next_turn is not None
+                publish_o_release_turn(
+                    o,
+                    self.linear_o_descriptors,
+                    self.o_ready_descriptors,
+                    self.o_publish_counters[slot : slot + 1],
+                    attention_turn,
+                    slot=slot,
+                    destination_source_stride=destination_source_stride,
+                    next_turn=next_turn,
+                    head_dim=self.head_dim,
+                    ready_value=epoch + 1,
+                )
+        elif attention_turn is None:
+            staged_o = self.o_fp8_staging[slot, :rows]
+            staged_scales = self.o_scale_staging[slot, :rows]
             quantize_publish_o_fp8(
                 o,
                 staged_o,
@@ -2577,6 +2599,8 @@ class AfdFmhaRuntime:
             )
         else:
             assert next_turn is not None
+            staged_o = self.o_fp8_staging[slot, :rows]
+            staged_scales = self.o_scale_staging[slot, :rows]
             # The fused publisher releases the next lane only after every CTA
             # completes quantization. Remote visibility remains independently
             # ordered by the publication counter and readiness release.
@@ -2633,12 +2657,9 @@ class AfdFmhaRuntime:
             head_dim=self.head_dim,
             expected_ready=epoch + 1,
         )
-        if (
-            layer is not None
-            and self.model_config.layer_types[layer] == "linear_attention"
-        ):
+        if self.is_hybrid_attention:
             if self.linear_o_slots is None:
-                raise RuntimeError("Qwen3.5 linear-attention output arena is missing")
+                raise RuntimeError("Qwen3.5 BF16 attention output arena is missing")
             if batch.phase == "decode":
                 return self.linear_o_slots[slot, :rows].view(rows, -1), None
             output = torch.empty(
@@ -2712,6 +2733,23 @@ class AfdFmhaRuntime:
             )
             o_scale[left:right].copy_(source_scale)
         return o_fp8.view(rows, -1), o_scale
+
+    def _finish_model_attention(
+        self,
+        layer_id: int,
+        layer: Any,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.model_config.layer_types[layer_id] == "linear_attention":
+            if output_scale is not None:
+                raise RuntimeError("linear-attention output must be BF16")
+            return output
+        if output_scale is None:
+            if not self.is_hybrid_attention:
+                raise RuntimeError("full-attention output is missing FP8 scales")
+            return layer.self_attn.finish_attention(output)
+        return layer.self_attn.finish_attention_fp8(output, output_scale)
 
     def run_step(self, plan: Any, *, sent_ns: int) -> AfdFmhaInFlight:
         if int(plan.num_mb) != self.num_mb:
