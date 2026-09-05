@@ -284,7 +284,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("watchdog_timeout || failures >= MAX_FAILURES", bundle)
         self.assertIn("per-case AFD memory contract is incomplete", bundle)
         self.assertIn(
-            "per-case MegaMoE expert weight dtype must be fp4", bundle
+            "per-case MegaMoE expert weight dtype must be fp8 or fp4", bundle
         )
         self.assertIn(
             "case_id must end with its MegaMoE expert weight dtype", bundle
@@ -829,10 +829,11 @@ class GB200OverlapContractTests(unittest.TestCase):
         adapter_source = (
             ROOT / "python/minisgl/moe/megamoe_afd.py"
         ).read_text()
+        self.assertIn("requant_qwen_fp8_weights_per32(", adapter_source)
         self.assertIn("requant_qwen_fp8_weights_to_fp4(", adapter_source)
+        self.assertIn("_mega.fp8_fp8_mega_moe", adapter_source)
         self.assertIn("_mega.fp8_fp4_mega_moe", adapter_source)
-        self.assertNotIn("_mega.fp8_fp8_mega_moe", adapter_source)
-        self.assertIn("FP8xFP4 MegaMoE requires", adapter_source)
+        self.assertIn("to be fp8 or fp4", adapter_source)
         self.assertNotIn("num_concurrent_lanes=self.num_lanes", adapter_source)
         self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", adapter_source)
         self.assertIn("route_prepare=", adapter_source)

@@ -144,6 +144,30 @@ was enabled.
   its exact decode bucket is exercised by the existing attention prewarm, so
   capture no longer depends on lazy compiler activity. The prior eager path is
   retained only as the explicit A/B environment selection.
+- Legacy A1's completed sample from job `6928449` passed the unchanged scorer
+  in score-only job `6930405`: 148 prompts, 2,516 generated tokens, top-1
+  0.9996025, top-10/top-100 1.0, mean rank 1.0003975, and maximum rank 2.
+  This is the first strict normal-routing 397B alignment pass at batch 37.
+  The score-only wrapper now re-enters the container through an explicit script
+  path and uses 8,192-token prompt chunks, concurrency four, and memory ratio
+  0.82. These settings avoid the baseline's Unix-socket limit and its full-vocab
+  prompt-logprob OOM without changing the vLLM model, scorer, compared tokens,
+  or top-10=1.0 requirement.
+- Attn-only A1 sample job `6929543` captured every attention/model graph and
+  produced all 148x17 tokens. Its post-sample exit 3 was only a missing optional
+  coordinator CPU trace after graceful-shutdown timeout. Strict score job
+  `6930412` failed alignment: top-1 0.15938, top-10 0.54412, top-100 0.72655,
+  mean rank 7,802.58, maximum rank 248,310. Per-position analysis shows the
+  mismatch at generated token zero, so this is a prefill-path discrepancy.
+- The discrepancy is explained by a precision contract mismatch rather than
+  routing mode: attn-only selected same-rank MegaMoE, whose adapter always
+  converted the FP8 checkpoint experts to FP4, while the unchanged vLLM
+  reference used the checkpoint FP8 weights. The MegaMoE extension and existing
+  weight utilities already support FP8xFP8. The attn-only adapter and launch
+  contracts now accept explicit `fp8|fp4`: FP8 uses the existing per-32 UE8M0
+  conversion plus `fp8_fp8_mega_moe`; FP4 retains the optimized existing path
+  and remains the default. Alignment plans select FP8 with normal routing;
+  perfect-balanced performance trace plans remain FP4.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
@@ -161,6 +185,8 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: complete normal-routing alignment for legacy and attn-only at exact A1
-batch 37 and then A3, capture perfect-balanced attn-only A1/A3 Nsight reports,
-and copy both report sets into the local workspace scratch tree.
+Next: validate target-shape FP8 same-rank MegaMoE, rerun strict normal-routing
+attn-only A1 alignment at exact batch 37, then complete normal-routing legacy
+and attn-only A3 alignment. Only after correctness passes, capture
+perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
+into the local workspace scratch tree.
