@@ -1,5 +1,82 @@
 # Qwen3 FMHA-Only Attention Worker and FFN Pipeline
 
+## Workspace/archive update (2026-09-04 PDT)
+
+The uncompressed perfect-routing task root and its local result copy were
+removed after verified archival. The authoritative payload is now
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/fastafd_reproduce/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst`
+with external manifest/SHA/summary sidecars. It has exactly 1,599 payload-only
+members (1,512 NSYS, 84 per-case result/metric JSONs, and three audit/comparison
+files), full integrity/member audits passed, and archive SHA-256 is
+`3dc1842ba90410dc921103450ac45ad5eb1cbe6e2d6b4d13cbc6322350f52089`.
+Current rendered figures moved to
+`scratch/visualizations/afd_128k_optimized_attention/`; all other local scratch
+content was deleted. `run_afd.sh` is the sole canonical launcher; see the root
+project memory and OCI-HSG README for merger/test status and the teardown-hang
+explanation.
+
+## Perfect-routing 42-case 128K rerun (2026-09-01 PDT, complete)
+
+The authoritative 42-case 128K matrix was rerun with globally perfect
+expert balance while preserving the original router cost.  Remote clean branch
+`codex/perfect-routing-42-20260901` at
+`e00afda8af6e9fc6ad240ec0bd776b960066a53c` descends from repaired A2/A3
+head `bd1e3ca`.  Opt-in `MINISGL_AFD_PERFECT_ROUTING=1` retains the normal gate
+GEMM, softmax, top-k comparisons, and top-k weight calculation and substitutes
+only the final expert ID through a compile-time specialization.  It adds no
+kernel launch, CUDA graph node, synchronization, or copy; default routing is
+unchanged.  Across each microbatch the global deterministic sequence gives
+every expert either floor(N/128) or ceil(N/128) routes, hence exact equality
+whenever divisible and the mathematically minimal one-route difference
+otherwise.  The source also supports reusing the prior sweep's exact pinned
+prompt source/cache before GPU work.
+
+The now-removed remote task root was
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/afd_128k_perfect_routing_e00afda_20260901`.
+Its `CASES.csv` is byte-identical to the completed `9a84a5a` sweep; the fresh
+pool validated at 42 pending, zero claims/completed/failed, with six cases in
+each 2/3/4/8/12/16/18-tray group.  Focused FMHA/MegaMoE contracts pass 55/55
+in the remote venv.  The first two-tray submission `6796806` failed in Pyxis
+before process startup because it used the obsolete home-directory image path;
+the next submission `6796939` failed source preflight because its pinned full
+SHA was stale even though its short `e00afda` ID matched.  Neither attempt ran
+a case, and both left the pool untouched.  Corrected 2-tray job `6797102` and
+3/4/8/12/16/18-tray jobs `6797854`--`6797859` use the successful original
+sweep's Lustre image and verified full SHA; each is a short-queue/two-hour job.
+All seven final jobs completed `0:0`, including `6797859` for the 18-tray
+group; pool state is 42 complete, zero claims/pending/failed. The strict
+completed-plan audit passes all hashes, topology and measurement contracts,
+42 metric JSONs, and 1,512 Nsight reports. Every paired row has 15 retained
+samples and zero outliers. All 288 model logs contain exactly one FP8xFP4
+`fmha_megamoe_buffers` marker with `perfect_routing=1`, and all 42 prompt
+transforms are exact cache hits on the original pinned source.
+
+Performance contradicts the expected neutral-to-faster outcome: 42-row latency
+geometric mean is +5.867545% and TPS/GPU is -5.542345%, with 14 rows faster
+and 28 slower. Topology latency/TPS geomeans are +18.570508%/-15.661996% (2t),
++14.104891%/-12.361338% (3t), +4.543148%/-4.345716% (4t),
++2.481296%/-2.421218% (8t), +1.224520%/-1.209707% (12t),
++0.926520%/-0.918015% (16t), and +0.653234%/-0.648995% (18t). The worst row
+is A1/EP4 batch 2 at +35.846598%. Global-count balance is therefore not
+performance-neutral; investigate the deterministic per-token expert ordering.
+The exact comparison is the archived `report/perfect-vs-original.txt`; there is
+no longer an uncompressed local result copy.
+
+The verified AFD sweep is included in the seven-series Pareto page as
+`FastAFD_Perfect_Balance_W4` (42 points / 13 sweep-local Pareto points). A
+focused two-series page,
+`scratch/visualizations/afd_128k_optimized_attention/afd-trtllm-perfect-balance-128k-pareto.html`,
+compares it with the accepted 31-point TRT-LLM perfect-router sweep under the
+display names `AFD` and `TRTLLM`. Exact-data and
+Pareto audits cover all 73 points, and the extracted JavaScript passes
+`node --check`. Two versions retain identical 73-point data: the `-zero-start`
+page uses TPS/User/TPS-GPU domains `[0, 80]`/`[0, 245]`, and the `-cropped`
+page uses `[25, 80]`/`[25, 245]`. The unsuffixed page aliases the zero-start
+version; all three display the short labels `TRTLLM` and `AFD`.
+Both named variants use prominent 24px/weight-500 foreground tick labels,
+explicit 9px tick marks, and 1.75px foreground axis/tick strokes; this renders
+black in the light theme while remaining legible in dark mode.
+
 ## A2 fan-in correctness repair (2026-08-31 PDT)
 
 The A2 failure is localized outside the FP8xFP4 MegaMoE math.  Each A2 attention
@@ -107,6 +184,49 @@ so current A1/EP8 is also alignment-correct without spending another scorer run.
 Together with current A1/EP4 correctness, this excludes EP4 or EP8 size alone:
 the failing structural delta is A2 fan-in (two attention sources and six rows per
 microbatch per FFN rank) or an interaction between that fan-in and EP4.
+
+## MegaMoE FP8xFP4 kernel-only decomposition (2026-08-31 PDT)
+
+The requested microsecond-scale phase decomposition is complete on a clean
+descendant of aligned checkpoint `9a84a5a`.  Final remote branch
+`codex/megamoe-fp8fp4-decomposition-20260831` is clean at `7d59050`; its opt-in
+specialization records eight `clock64()` points in private per-warp rows:
+kernel start/end, dispatch start/end, compute start/end, and combine start/end.
+CTA origins use the earliest active warp; host reduction uses minimum starts
+and maximum ends, then calibrates cycles against each rank's kernel-only CUDA
+event.  A GPU symmetric-memory barrier is queued immediately before the start
+event to remove Gloo host-launch skew, but stream ordering keeps that barrier
+outside the timed interval.  Route preparation is also excluded.  There are no
+diagnostic atomics or diagnostic barriers, and production launches compile the
+instrumentation out.  An earlier `%globaltimer`/diagnostic-barrier version
+failed job `6739673` with illegal instruction; switching to `clock64()` and
+removing those barriers fixed the device path, so that attempt is not valid
+timing evidence.
+
+The standalone runner fixes A8:F1, EP8, batch 6 per attention lane, two
+microbatches, hidden 4,096, intermediate 1,536, 128 experts, top-k 8, capacity
+3,840, and 150 compute SMs.  Its deterministic perfect-balance plan creates 24
+rows/rank, 1,536 assignments cluster-wide, 12 assignments/expert, and exactly
+24 local plus 168 remote assignments/rank.  Final job `6740199` completed
+`0:0` in 1:44 on a contiguous NVL72 block with empty stderr.  Across 16 ABBA
+observations, control/instrumented CUDA-event medians are 119.296/126.304 us,
+so diagnostic overhead is 7.008 us or 5.874%.  Median point envelopes are:
+dispatch 1.130--23.269 us, compute 9.108--79.644 us, combine
+23.878--126.292 us, and kernel 0--126.304 us.  Median per-sample phase lengths
+are 22.122/70.516/102.569 us.  Communication union is 124.808 us; compute
+hides 70.200 us (56.320%) and leaves 53.910 us exposed.  Dispatch/compute and
+compute/combine overlaps are 14.115/55.921 us.  Useful-payload rates are
+256.866 GB/s dispatch, 107.342 GB/s combine, and 133.745 GB/s for the union;
+no peak efficiency percentage is reported because no fabric peak was supplied.
+These overlapping envelopes must not be summed, and the control event—not an
+overhead-subtracted diagnostic point—is the production latency baseline.
+
+Final prebuild job `6740082` passed, focused source plus existing contract
+tests passed 6/6, and the remote worktree is clean.  Durable remote artifacts
+are under
+`results/megamoe_fp8fp4_decomposition_20260831`; local code overlay, JSON,
+logs, interpretation, and reproduction notes are under
+`scratch/megamoe_fp8_fp4_decomposition_20260831/`.
 
 ## FP8xFP4 MegaMoE cleanup continuation (2026-08-29 PDT)
 

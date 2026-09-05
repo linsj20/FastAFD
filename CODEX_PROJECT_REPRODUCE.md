@@ -1,5 +1,43 @@
 # FastAFD performance reproduction
 
+## Launcher consolidation (2026-09-04 PDT)
+
+The separate reproduction launchers were merged into
+`scripts/experiments/afd/oci_hsg/run_afd.sh` and removed. The canonical CLI
+expresses the former `nodes` argument as pmap ratio `nodes - 1` at FFN EP4:
+Qwen3 8K/16K use explicit `7:1`/`11:1`, and MiniMax uses the fail-closed
+`17:1`, TP1/EP4, 18-tray legacy layout. Pmap/reproduction defaults to
+`megamoe_m2n`; comprehensive legacy remains `deepep`; FMHA-only remains
+same-rank `megamoe`. Required persistent source/image/venv paths replace the
+obsolete home-directory defaults. Real merged-file tests are tracked in root
+project memory under task root `run_afd_canonical_validation_20260904`.
+
+The merged pmap default exposed a source-level M2N JIT regression before any
+measurement: job `6918910` failed because the scheduler's new
+`kRankReadyRecvCounts` boolean shifted `layout::WorkspaceM2N` into a boolean
+template slot. The canonical M2N instantiation now supplies explicit `false`
+values for both new scheduler booleans. CPU reproducer `6919340` captured the
+original NVCC diagnostics and recheck `6919396` compiled the exact generated
+Qwen specialization successfully. Real Qwen job `6919438` subsequently passed
+model initialization, inference, the 16-step trace contract, and 32-report
+capture; its postprocessor recovered 2517.283398103 tokens/s/active GPU from
+the durable artifacts. The enclosing shell failed only because its launcher
+file was updated while Bash was executing it, so launch worktrees must remain
+immutable until all jobs using them are terminal. Strict-manifest immutable
+rerun `6919706` completed `0:0` in 12:52 with the same contract, 32 Nsight
+reports, and 2514.683581706 tokens/s/active GPU; this is the canonical merged
+Qwen pmap launcher's end-to-end real-case gate.
+
+The remote source was subsequently consolidated to a single checkout at
+`users/shengjiel/github/FastAFD`, based on the exact `e00afda8` worktree used
+for those validations. The 81 linked historical worktrees, their common
+repository, one standalone FMHA checkout, and the superseded main checkout were
+removed only after nonempty scratch data was moved to visible
+`fastafd_reproduce/legacy_workspace_scratch_20260904/`. Pending MiniMax job
+`6919520` was canceled before allocation for this move and resubmitted unchanged
+from the sole canonical checkout as `6920969` (18 nodes, two-hour limit). Do not
+modify that checkout until the job is terminal.
+
 ## Status
 
 Goal achieved on OCI HSG. Qwen3-235B and MiniMax-M2.5 at both 8K and 16K now
@@ -24,16 +62,22 @@ no local MiniMax 16K AFD reproduction was run.
 Run on the `oci-hsg` login node:
 
 ```bash
-scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh [qwen3|minimax] [8k|16k]
+scripts/experiments/afd/oci_hsg/run_afd.sh qwen3 8k 96 7 1 4
+scripts/experiments/afd/oci_hsg/run_afd.sh qwen3 16k 48 11 1 4
+scripts/experiments/afd/oci_hsg/run_afd.sh minimax 8k
+scripts/experiments/afd/oci_hsg/run_afd.sh minimax 16k
 scripts/experiments/afd/oci_hsg/run_vllm.sh [qwen3|minimax] [8k|16k] [4|8|16|32|64]
 ```
 
-The launchers self-submit to `batch+short` with a one-hour limit, pin their
-runtime/model/prompt presets, validate clean GPU entry/exit, and write results
-beneath `~/scratch/fastafd_reproduce`. AFD rejects any concurrent `fastafd:`
-job; vLLM rejects a duplicate model/context/EP job. `FASTAFD_MODEL_PATH` may
-override the model snapshot. `FASTAFD_EXCLUDE_NODE` is an infrastructure-only
-escape hatch for a bad Slurm node.
+The launchers self-submit to `batch+short`, pin their runtime/model/prompt
+presets, and validate clean GPU entry/exit. For AFD, set the required absolute
+`FASTAFD_TASK_ROOT`, `FASTAFD_REPRO_ROOT`, `FASTAFD_SOURCE_REPO`,
+`FASTAFD_IMAGE`, `FASTAFD_EP_VENV_DIR`, and plan/metric paths as shown in the
+OCI-HSG README; results stay under the visible task workspace. AFD rejects any
+concurrent `fastafd:` job; vLLM rejects a duplicate model/context/EP job.
+`FASTAFD_MODEL_PATH` may override the model snapshot.
+`FASTAFD_EXCLUDE_NODE` is an infrastructure-only escape hatch for a bad Slurm
+node.
 
 `run_vllm.sh` defaults to Qwen3 8K EP4, so the original no-argument and
 two-argument forms are unchanged. Its optional third argument selects EP4, 8,

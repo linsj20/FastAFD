@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run a reproducible Qwen3 AFD parallel-mapping or comprehensive-sweep point.
-# Usage: ./run_afd.sh qwen3 [1k|...|128k] [input-batch/attention-DP-lane] [normalized-A:F-ratio] [attention-TP] [FFN-EP]
+# Run a reproducible AFD point or Qwen3 topology-sweep point.
+# Usage: ./run_afd.sh [qwen3|minimax] [context] [input-batch/attention-DP-lane] [normalized-A:F-ratio] [attention-TP] [FFN-EP]
 #
 # In the original pmap contract, the ratio is normalized by full FFN trays.
 # In the comprehensive contract, it is an active-GPU ratio:
@@ -78,8 +78,8 @@ NSYS_CAPTURE_DECODE_STEPS=${NSYS_CAPTURE_DECODE_STEPS:-15}
     echo "NSYS_CAPTURE_DECODE_STEPS must be exactly 15" >&2
     exit 2
 }
-OUTPUT_TOKENS=17
 TRACE_WARMUP_DECODE_STEPS=1
+OUTPUT_TOKENS=$((1 + TRACE_WARMUP_DECODE_STEPS + NSYS_CAPTURE_DECODE_STEPS))
 AFD_MEMORY_RATIO=${FASTAFD_AFD_MEMORY_RATIO:-0.82}
 [[ "$AFD_MEMORY_RATIO" =~ ^0\.[0-9]*[1-9][0-9]*$|^1(\.0+)?$ ]] || {
     echo "FASTAFD_AFD_MEMORY_RATIO must be greater than zero and at most one" >&2
@@ -147,9 +147,11 @@ else
     SHAPE_ID=$CONTEXT
 fi
 
-ROOT=${FASTAFD_REPRO_ROOT:-$HOME/scratch/fastafd_reproduce}
-RESULTS_ROOT=${FASTAFD_RESULTS_ROOT:-$ROOT}
-SOURCE_REPO=${FASTAFD_SOURCE_REPO:-$HOME/scratch/github/FastAFD}
+ROOT=${FASTAFD_REPRO_ROOT:-${ROOT:-}}
+: "${ROOT:?set FASTAFD_REPRO_ROOT to the persistent reproduction root}"
+RESULTS_ROOT=${FASTAFD_RESULTS_ROOT:-$TASK_ROOT/results}
+SOURCE_REPO=${FASTAFD_SOURCE_REPO:-${SOURCE_REPO:-}}
+: "${SOURCE_REPO:?set FASTAFD_SOURCE_REPO to the exact source checkout}"
 EXPECTED_HEAD=${FASTAFD_EXPECTED_HEAD:-$(git -C "$SOURCE_REPO" rev-parse HEAD)}
 EXPECTED_SOURCE_MANIFEST=${FASTAFD_EXPECTED_SOURCE_MANIFEST:-}
 ALLOW_DIRTY_SOURCE=${FASTAFD_ALLOW_DIRTY_SOURCE:-0}
@@ -170,8 +172,10 @@ EXPECTED_SOURCE_WORKER_BASE_SHA256=${FASTAFD_EXPECTED_SOURCE_WORKER_BASE_SHA256:
 EXPECTED_SOURCE_MEGAMOE_ADAPTER_SHA256=${FASTAFD_EXPECTED_SOURCE_MEGAMOE_ADAPTER_SHA256:-${EXPECTED_SOURCE_MEGAMOE_ADAPTER_SHA256:-}}
 EXPECTED_SOURCE_API_SHA256=${FASTAFD_EXPECTED_SOURCE_API_SHA256:-${EXPECTED_SOURCE_API_SHA256:-}}
 EXPECTED_SOURCE_ARGS_SHA256=${FASTAFD_EXPECTED_SOURCE_ARGS_SHA256:-${EXPECTED_SOURCE_ARGS_SHA256:-}}
-IMAGE=${FASTAFD_IMAGE:-$HOME/scratch/oci-hsg_onboarding/images/pytorch-25.10-py3-aarch64.sqsh}
-EP_VENV_DIR=${FASTAFD_EP_VENV_DIR:-$ROOT/envs/minisgl-${EXPECTED_HEAD:0:8}-cuda130-vllm-ep}
+IMAGE=${FASTAFD_IMAGE:-${IMAGE:-}}
+: "${IMAGE:?set FASTAFD_IMAGE to the persistent Lustre image path}"
+EP_VENV_DIR=${FASTAFD_EP_VENV_DIR:-${EP_VENV_DIR:-}}
+: "${EP_VENV_DIR:?set FASTAFD_EP_VENV_DIR to the pinned environment}"
 HF_CACHE=$ROOT/models/huggingface/hub
 
 validate_source_repo() {
@@ -284,7 +288,7 @@ case "$MODEL_KEY" in
         MODEL_REVISION=39eb2b067ea6b8e3e1dd97d3cd0c7ffeaf3e1a35
         MODEL_CACHE=models--Qwen--Qwen3-235B-A22B-FP8
         MODEL_SOURCE_CONFIG_SHA256=702c46d431bb984db9035a1225186bbfdb52c0d19c82104df4a37cd005e0369e
-        PRESET=scripts/experiments/afd/qwen3_235b/run_afd_qwen3_235b_a22b_fp8_8k_b96_dynamicnode_mb2_nsys_alignment.sh
+        MODEL_PRESET_DEFAULT=$(dirname "$(realpath "$0")")/run_afd_qwen3_parallel.sh
         PROMPT_SOURCE_CONTEXT=8192
         PROMPT_SHA256=26482bc14fe61372c30eed8731fae1103fe477cdf03c70e8a808c3723ede5fdb
         MAX_SEQ_LEN=$((CONTEXT_MAX + 64))
@@ -309,13 +313,13 @@ case "$MODEL_KEY" in
         8192)
         MODEL_REVISION=f710177d938eff80b684d42c5aa84b382612f21f
         MODEL_CACHE=models--MiniMaxAI--MiniMax-M2.5
-        PRESET=scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_8k_b72_dynamicnode_mb2_nsys_alignment.sh
+        MODEL_PRESET_DEFAULT=$SOURCE_REPO/scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_8k_b72_dynamicnode_mb2_nsys_alignment.sh
         PROMPT_SHA256=26482bc14fe61372c30eed8731fae1103fe477cdf03c70e8a808c3723ede5fdb
         DEFAULT_NODES=18; DEFAULT_BATCH=72; MAX_SEQ_LEN=8320 ;;
         16384)
         MODEL_REVISION=f710177d938eff80b684d42c5aa84b382612f21f
         MODEL_CACHE=models--MiniMaxAI--MiniMax-M2.5
-        PRESET=scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_16k_b36_dynamicnode_mb2_nsys_alignment.sh
+        MODEL_PRESET_DEFAULT=$SOURCE_REPO/scripts/experiments/afd/minimax_m25/run_afd_minimax_m25_fp8_16k_b36_dynamicnode_mb2_nsys_alignment.sh
         PROMPT_SHA256=918f24cde353525d62d7a0493912719ca97eafd9201157067d9ed29a93d29fca
         DEFAULT_NODES=18; DEFAULT_BATCH=36; MAX_SEQ_LEN=16640 ;;
         *) echo "MiniMax currently supports only the pinned 8K and 16K prompt contracts" >&2; exit 2 ;;
@@ -327,12 +331,14 @@ case "$MODEL_KEY" in
         ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=0 ;;
     *) echo "model must be qwen3 or minimax" >&2; exit 2 ;;
 esac
-[[ "$MODEL_KEY" == qwen3 ]] || {
-    echo "the parallel-mapping sweep supports only qwen3" >&2
+if [[ "$MODEL_KEY" == minimax && "$SWEEP_CONTRACT" != pmap ]]; then
+    echo "MiniMax supports only the published pmap contract" >&2
     exit 2
-}
+fi
 if (( IRREGULAR )); then
     CURRENT_BEST_RATIO=7
+elif [[ "$MODEL_KEY" == minimax ]]; then
+    CURRENT_BEST_RATIO=17
 else
     case "$CONTEXT" in
         1024) CURRENT_BEST_RATIO=1 ;;
@@ -346,7 +352,7 @@ else
         *) echo "unsupported context" >&2; exit 2 ;;
     esac
 fi
-PRESET=${FASTAFD_AFD_PRESET:-$(dirname "$(realpath "$0")")/run_afd_qwen3_parallel.sh}
+PRESET=${FASTAFD_AFD_PRESET:-$MODEL_PRESET_DEFAULT}
 PRESET=$(realpath "$PRESET")
 RATIO_ARG=${RATIO_ARG:-$CURRENT_BEST_RATIO}
 [[ "$RATIO_ARG" =~ ^([1-9][0-9]*)(:1)?$ ]] || {
@@ -414,7 +420,13 @@ CAPACITY_BATCH=$((
     (AFD_KV_CAPACITY_TOKENS - FRESH_REQUEST_ESTIMATED_TOKENS) /
     (RESIDENT_PROMPT_TOKENS + SCHEDULER_RUNNING_RESERVATION_TOKENS) + 1
 ))
-BATCH=${BATCH_ARG:-$CAPACITY_BATCH}
+if [[ -n "$BATCH_ARG" ]]; then
+    BATCH=$BATCH_ARG
+elif [[ "$MODEL_KEY" == minimax ]]; then
+    BATCH=$DEFAULT_BATCH
+else
+    BATCH=$CAPACITY_BATCH
+fi
 [[ "$BATCH" =~ ^[1-9][0-9]*$ ]] || {
     echo "batch/attention-DP-lane must be a positive integer" >&2
     exit 2
@@ -423,6 +435,16 @@ BATCH=${BATCH_ARG:-$CAPACITY_BATCH}
     echo "AFD_NUM_MB must not exceed batch/attention-DP-lane: $AFD_NUM_MB > $BATCH" >&2
     exit 2
 }
+if [[ "$MODEL_KEY" == minimax ]]; then
+    [[ "$ATTENTION_TP:$FFN_EP:$NORMALIZED_AF_RATIO" == 1:4:17 ]] || {
+        echo "MiniMax published topology requires attention TP1, FFN EP4, and ratio 17:1" >&2
+        exit 2
+    }
+    [[ "$AFD_MODEL_PLACEMENT" == legacy ]] || {
+        echo "MiniMax published topology requires legacy placement" >&2
+        exit 2
+    }
+fi
 if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
     ATTENTION_GPUS=$(( NORMALIZED_AF_RATIO * FFN_EP ))
     FFN_GPUS=$FFN_EP
@@ -442,7 +464,7 @@ else
     ALLOCATED_GPUS=$(( NODES * 4 ))
     SHARED_ROLE_TRAYS=0
 fi
-if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
+if [[ "$SWEEP_CONTRACT" == comprehensive || "$MODEL_KEY" == minimax ]]; then
     MAX_TOTAL_TRAYS=${FASTAFD_MAX_TOTAL_TRAYS:-18}
 else
     MAX_TOTAL_TRAYS=${FASTAFD_MAX_TOTAL_TRAYS:-17}
@@ -456,8 +478,8 @@ fi
     exit 2
 }
 if [[ "$SWEEP_CONTRACT" != comprehensive ]]; then
-    RATIO_MIN=$CURRENT_BEST_RATIO
-    RATIO_MAX=$(( CURRENT_BEST_RATIO * FFN_TRAYS ))
+    RATIO_MIN=1
+    RATIO_MAX=$(( MAX_TOTAL_TRAYS / FFN_TRAYS - 1 ))
     (( NORMALIZED_AF_RATIO >= RATIO_MIN && NORMALIZED_AF_RATIO <= RATIO_MAX )) || {
         echo "ratio $NORMALIZED_AF_RATIO:1 is outside ${RATIO_MIN}:1-${RATIO_MAX}:1 for ISL $CONTEXT and EP $FFN_EP under $SWEEP_CONTRACT" >&2
         exit 2
@@ -490,6 +512,8 @@ if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
 fi
 if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then
     DEFAULT_AFD_MOE_BACKEND=megamoe
+elif [[ "$SWEEP_CONTRACT" == pmap ]]; then
+    DEFAULT_AFD_MOE_BACKEND=megamoe_m2n
 else
     DEFAULT_AFD_MOE_BACKEND=deepep
 fi
@@ -506,12 +530,22 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != leg
     echo "MINISGL_AFD_MOE_BACKEND=megamoe_m2n requires legacy placement" >&2
     exit 2
 fi
+MINISGL_AFD_PERFECT_ROUTING=${MINISGL_AFD_PERFECT_ROUTING:-0}
+if [[ "$MINISGL_AFD_PERFECT_ROUTING" != 0 && "$MINISGL_AFD_PERFECT_ROUTING" != 1 ]]; then
+    echo "MINISGL_AFD_PERFECT_ROUTING must be 0 or 1" >&2
+    exit 2
+fi
+if [[ "$MINISGL_AFD_PERFECT_ROUTING" == 1 && "$MINISGL_AFD_MOE_BACKEND" != megamoe ]]; then
+    echo "MINISGL_AFD_PERFECT_ROUTING=1 requires MINISGL_AFD_MOE_BACKEND=megamoe" >&2
+    exit 2
+fi
 MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=${MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE:-fp4}
 if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" != fp4 ]]; then
     echo "FP8xFP4 MegaMoE requires MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp4" >&2
     exit 2
 fi
-export MINISGL_AFD_MOE_BACKEND MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
+export MINISGL_AFD_MOE_BACKEND MINISGL_AFD_PERFECT_ROUTING
+export MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
 if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 ]]; then
     echo "irregular prompt-length ranges are supported only for Qwen3" >&2
     exit 2
@@ -593,7 +627,11 @@ if [[ "$SWEEP_CONTRACT" == comprehensive ]] && (( ! IRREGULAR )); then
     }
 fi
 REFERENCE_TPS=0
-if [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == minimax:8192:72:18 ]]; then
+if [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == qwen3:8192:96:8 ]]; then
+    REFERENCE_TPS=2518
+elif [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == qwen3:16384:48:12 ]]; then
+    REFERENCE_TPS=1377
+elif [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == minimax:8192:72:18 ]]; then
     REFERENCE_TPS=2198
 elif [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == minimax:16384:36:18 ]]; then
     REFERENCE_TPS=1006
@@ -606,7 +644,7 @@ if [[ "$MODEL_PROFILE_ID" != native ]]; then
     MODEL_PROFILE_MANIFEST=$MODEL_PATH/fastafd-model-profile.json
 fi
 MODEL_PROFILE_SCRIPT=${FASTAFD_MODEL_PROFILE_SCRIPT:-$(dirname "$(realpath "$0")")/prepare_model_profile.py}
-PROMPT_BASE=$SOURCE_REPO/prompts/prompts_512x${PROMPT_SOURCE_CONTEXT}_seed20260527.txt
+PROMPT_BASE=${FASTAFD_PROMPT_BASE_FILE:-$SOURCE_REPO/prompts/prompts_512x${PROMPT_SOURCE_CONTEXT}_seed20260527.txt}
 NUM_PROMPTS=$(( ATTENTION_DP_SIZE * BATCH ))
 MICROBATCH_UPPER=$(( (BATCH + AFD_NUM_MB - 1) / AFD_NUM_MB ))
 MICROBATCH_BASE=$(( BATCH / AFD_NUM_MB ))
@@ -634,13 +672,13 @@ CASE_PORT_SLOT=${FASTAFD_CASE_PORT_SLOT:-$CASE_ORDINAL}
     echo "FASTAFD_CASE_PORT_SLOT must be single or a non-negative integer" >&2
     exit 2
 }
-CASE_ID=single
+if (( IRREGULAR )); then
+    DEFAULT_CASE_ID=r${CONTEXT_MIN}-${CONTEXT_MAX}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
+else
+    DEFAULT_CASE_ID=i${CONTEXT}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
+fi
+CASE_ID=$DEFAULT_CASE_ID
 if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
-    if (( IRREGULAR )); then
-        DEFAULT_CASE_ID=r${CONTEXT_MIN}-${CONTEXT_MAX}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
-    else
-        DEFAULT_CASE_ID=i${CONTEXT}-fep${FFN_EP}-r${NORMALIZED_AF_RATIO}-atp${ATTENTION_TP}-b${BATCH}
-    fi
     CASE_ID=${FASTAFD_CASE_ID:-$DEFAULT_CASE_ID}
     if [[ -n "${FASTAFD_CASE_ID:-}" ]]; then
         [[ "$CASE_ID" == "$DEFAULT_CASE_ID-$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" ]] || {

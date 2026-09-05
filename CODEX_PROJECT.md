@@ -1,5 +1,234 @@
 # Project Memory
 
+## Workspace consolidation and canonical AFD launcher (2026-09-04 PDT)
+
+Local `scratch/` is now visualization-only: 25 standalone HTML/PNG files,
+3.2 MiB total, organized under `scratch/visualizations/` by study. All local
+result trees, NSYS reports, source snapshots, scripts, docs, caches, temporary
+review directories, `.DS_Store`, and custom hidden directories were removed.
+Older memory entries retain their historical paths as provenance; they are not
+claims that those deleted scratch files still exist. Current visualization
+paths start at `scratch/visualizations/`.
+
+The complete perfect-routing sweep was archived remotely as
+`fastafd_reproduce/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst`.
+It contains exactly 1,599 result payloads / 1,473,202,820 uncompressed bytes:
+1,512 `.nsys-rep`, 42 `afd-result.json`, 42 metric JSON, and three audit/
+comparison data files. No scripts, docs, logs, or caches are members. Full
+`zstd -t`, exact member audit, external 1,599-row SHA manifest, and archive
+SHA-256 `3dc1842ba90410dc921103450ac45ad5eb1cbe6e2d6b4d13cbc6322350f52089`
+passed. The uncompressed sweep and completed archive staging were then removed;
+the `.manifest.tsv`, `.sha256`, and `.summary.json` sidecars remain beside the
+607 MiB archive.
+
+The older remote archive workspace is also consolidated. CPU data-mover job
+`6919189` completed `0:0`, deleted the last of 3,623 confirmed source targets,
+and revalidated all 42 protected sweep-14 cases. The canonical 14-archive set
+remains under `archives/sweeps_20260830/` with 5,219-row case and 15-row sweep
+indexes; its former `.work` is now visible `metadata/`, logs are under `logs/`,
+and the duplicate `.tools` scripts and empty rebuild/staging roots were removed.
+Job `6919354` then removed the superseded unfiltered rollback set: six payloads
+totaling 520,203,971,236 bytes, including the abandoned 9,763,782,656-byte
+`.partial`. The archive tree now has no custom hidden directories.
+
+`scripts/experiments/afd/oci_hsg/run_afd.sh` is now the only AFD launcher in
+main source. It absorbs the removed `run_afd_reproduce.sh` and remote
+`codex_scripts/reproduce_oci_hsg/run_afd.sh`: Qwen3 pmap/comprehensive and
+MiniMax 8K/16K published layouts, uniform/irregular prompts, explicit topology,
+legacy/FMHA/adaptive placement, DeepEP/MegaMoE/MegaMoE-M2N, production/perfect
+routing, direct/bundle execution, and strict NSYS extraction. Legacy pmap
+defaults to `megamoe_m2n`, legacy comprehensive to `deepep`, and FMHA-only to
+same-rank `megamoe`; incompatible combinations fail rather than fall back.
+Persistent reproduction/source/image/venv paths are required, eliminating the
+stale home-image default. The canonical launcher and M2N fix match locally and
+remotely; historical worktree copies are not launch sources. The remote was
+physically consolidated
+on 2026-09-04: the exact used `e00afda8af6e9fc6ad240ec0bd776b960066a53c`
+checkout, plus the validated M2N template fix and merged launcher, was promoted
+to `users/shengjiel/github/FastAFD`. All 81 linked experiment worktrees, their
+common Git repository, one standalone FMHA checkout, and the superseded former
+main checkout were removed after verification; the experiment root now has
+zero remaining Git roots. Nonempty `scratch/` trees were moved first, without
+compression, to visible
+`fastafd_reproduce/legacy_workspace_scratch_20260904/`. The temporary staging
+and rollback paths were removed. Standard `.git` in the sole canonical checkout
+is the only hidden repository directory intentionally retained.
+
+Real merged-launcher validation is under remote visible task root
+`run_afd_canonical_validation_20260904`. Qwen job `6918707` correctly exposed
+that a pmap `deepep` default was invalid on source `e00afda`: it failed before
+measurement with `DeepEPM2NDispatchOutput` lacking `expected_m_per_expert`.
+No fallback was attempted; the backend policy was corrected explicitly.
+Replacement Qwen M2N job `6918910` then failed before inference during JIT
+warmup, while pending MiniMax job `6918902` was canceled before allocation to
+avoid repeating the failure. CPU-only NVCC job `6919340` reproduced the exact
+cause: scheduler additions had shifted `layout::WorkspaceM2N` into the new
+boolean `kRankReadyRecvCounts` template slot. The M2N instantiation now passes
+explicit `false` values for both scheduler booleans; CPU recheck `6919396`
+compiled the same generated Qwen kernel to a 150 KiB cubin in 1:29. A focused
+source contract guards the template argument order. Real Qwen replacement job
+`6919438` then completed inference and made the 2,688-sample output, coordinator
+trace, capture marker, and all 32 Nsight reports durable, but failed in outer
+postprocessing because `run_afd.sh` was replaced in that worktree while Bash
+was still reading it. Reusing the stable launcher's exact embedded postprocessor
+against those artifacts passed: 17 tokens/sample, warmup step 1536 plus 15
+measured steps, 16 traced steps, 33.369306-ms median coordinator interval, and
+2517.283398103 tokens/s/active GPU (-0.028459% from the published reference).
+This was an operational live-file replacement failure, not a kernel or teardown
+hang. Immutable-file rerun `6919706` then completed `0:0` end to end in 12:52
+with the strict two-file source manifest: 2,688 samples, 17 tokens/sample,
+warmup 1536 plus 15 measured/16 traced steps, 32 Nsight reports, a
+33.403805-ms median coordinator interval, and 2514.683581706
+tokens/s/active GPU (-0.131708% from reference). MiniMax job `6919520` remained
+pending and was canceled before allocation at 16:49 PDT so its source could be
+consolidated safely. The identical published 8K/b72/17:1 real case was
+resubmitted as job `6920969` from the sole canonical checkout with an 18-node,
+two-hour request. It was pending on priority at 17:02 PDT. The exact source
+head, tracked status, and hashes of all existing tracked changes at submission
+are under `run_afd_canonical_validation_20260904/control/`. This submission
+uses explicit dirty-source mode because the removed duplicate launcher is a
+tracked deletion, which the current two-column SHA manifest cannot represent.
+Do not edit or resync the remote canonical checkout until `6920969` is terminal.
+
+After the Qwen evidence and result SHA were recorded, five superseded
+validation directories and the accepted Qwen payload were deleted. This
+reduced the temporary validation root from 15 GiB to 95 MiB. Only the shared
+prompt cache and `6920969`'s MiniMax run directory remain; remove that task root
+after the MiniMax result is recorded. The deleted validation payloads were
+temporary and are not recoverable; the completed 42-case sweep archive was not
+touched.
+
+The earlier apparent hang is now documented in the OCI-HSG README. In 17
+audited cases, capture/sample/coordinator artifacts were already durable and
+only Ray/process-tree teardown consumed another 210--214 seconds. The current
+runner terminates its allocation-scoped driver after those three durability
+gates; status 137 plus `post-capture-driver-termination.txt` is expected cleanup,
+not failure. An NSYS export is progressing while report/stream sizes or progress
+records advance; a ZMQ port collision is a separate exact-case retry condition.
+
+## Pareto filename correction (2026-09-04 PDT)
+
+The former seven-series `fastafd-128k-five-pareto.html` was preserved verbatim
+as `fastafd-128k-seven-pareto.html`, including its editable fragment. The
+five-series page was regenerated from the same data after removing only
+`FastAFD_FFN_Overheads_W4` and `Baseline_TRTLLM_MegaMoE_W4`; it now contains
+five sweeps, 374 measured points, and 86 sweep-local Pareto points, versus
+447/109 in the seven-series page. The five-series data is an exact ordered
+subset of the preserved seven-series data. Fragment JavaScript parses, all
+points fit the fixed chart domains, standalone titles/root IDs are correct, and
+the removed series names are absent from both five-series artifacts.
+
+## TRT-LLM perfect-router 128K comparison refresh (2026-09-01 PDT)
+
+The TensorRT-LLM perfect-router 31-case sweep is complete and accepted for
+GPU-side step-latency comparison. Jobs EP4 `6810988`, EP8 `6810989`, EP16
+`6810990`, EP32 `6810991`, and EP64 `6810992` all completed `0:0` under
+`qos=short`, one job per EP, with a two-hour limit. The exact matrix is EP4
+batches 1--5, EP8/EP16 batches 1--6, and EP32/EP64 batches 1--7. Every point
+has 15 accepted CUDA-event `gpuForwardTimeMS` samples after one full-batch
+warmup, `ENABLE_PERFECT_ROUTER=1`, validated global-expert/receiver balance,
+and the unchanged `MEGAMOE_DEEPGEMM`/`FUSED_COMM` backend. Attention-DP fans
+rank 0's CUDA-event duration into every rank row; this existing timing was
+explicitly accepted. Host `generate()` duration is not used.
+
+The strict source and comparison artifacts are under the TensorRT-LLM
+workspace at
+`scratch/trtllm_qwen3_128k_pareto_resweep/results/gpu-event-perfect-sweep-31-20260901/`.
+Relative to the prior 31-point Nsight CUDA-graph-span sweep, mean per-point
+latency changes are EP4 +9.206%, EP8 +5.671%, EP16 +2.727%, EP32 -0.013%, and
+EP64 -0.767%; 9/31 points improve and the unweighted overall mean is +2.934%.
+The best new throughput is EP32/batch 7 at 33.353011 ms and 209.876103
+TPS/GPU, versus 206.481802 TPS/GPU previously. Both metrics are GPU-side, but
+their mechanisms differ, so these deltas are directional rather than a clean
+router-only attribution.
+
+The seven-series Pareto page
+`scratch/afd_128k_optimized_attention_near_pareto_20260827/fastafd-128k-seven-pareto.html`
+preserves the prior TensorRT-LLM series and adds the new run as
+`TRTLLM_MegaMoE_Perfect_Balance_W4`. It contains seven sweeps, 447
+points, and 109 sweep-local Pareto points; the new TRT-LLM series has 31 points
+and seven Pareto points. The separately retained
+`fastafd-128k-five-pareto.html` omits `FastAFD_FFN_Overheads_W4` and
+`TRTLLM_MegaMoE_W4`, leaving five sweeps, 374 points, and 86
+sweep-local Pareto points. The EP comparison page
+`trtllm-qwen3-128k-user-tps-vs-tps-gpu-by-ep.html` now contains only the new
+31-point perfect-router run, grouped by EP4/8/16/32/64. Editable fragments are
+under `visualization-source/`; `build_128k_five_pareto.py` now accepts the
+strict TensorRT-LLM summary, and `build_trtllm_ep_comparison.py` reproducibly
+replaces the EP chart from that summary. Both extracted JavaScript programs
+pass `node --check`; structural audits prove exact rounded equality to the
+accepted summary, all points fit their chart domains, and both rendered
+standalone documents contain their expected data/provenance globals.
+
+The focused perfect-balance comparison is
+`afd-trtllm-perfect-balance-128k-pareto.html`, with its editable fragment under
+`visualization-source/`. It retains only the accepted 31-point TRT-LLM perfect
+router series and the accepted 42-point AFD perfect-routing series, displayed
+as `TRTLLM` and `AFD`. The two sweep-local
+frontiers contain 7 and 13 points respectively (73 measured / 20 Pareto total).
+The reusable `--series KEY[=DISPLAY_NAME]` builder option selects and renames
+series without forking the chart implementation. Exact-data audits pass for
+all 31 TRT-LLM summary rows and all 42 AFD metric JSONs, and the extracted
+JavaScript passes `node --check`. Two verified axis variants are retained for
+convenience: `afd-trtllm-perfect-balance-128k-pareto-zero-start.html` uses
+TPS/User `[0, 80]` and TPS/GPU `[0, 245]`, while
+`afd-trtllm-perfect-balance-128k-pareto-cropped.html` uses the original
+`[25, 80]` and `[25, 245]` domains. The unsuffixed page aliases the zero-start
+version. Both display the short labels `TRTLLM` and `AFD` and contain identical
+73-point data/frontiers. Both variants use more prominent 24px/weight-500 axis
+tick labels in the foreground color (black in the light theme), explicit 9px
+tick marks, and 1.75px foreground axis/tick strokes.
+
+## Completed perfect-routing 128K sweep (2026-09-01 PDT)
+
+The completed 42-case AFD 128K matrix was rerun with perfectly balanced
+expert IDs and the original gate GEMM/softmax/top-k cost retained.  Clean
+remote source `e00afda8af6e9fc6ad240ec0bd776b960066a53c` (based on repaired `bd1e3ca`) uses a compile-time final
+ID substitution with no added launch, graph node, synchronization, or copy.
+Fresh remote task root is `afd_128k_perfect_routing_e00afda_20260901`; its pool
+started at 42 pending cases.  Focused contracts pass 55/55.  Two prelaunch
+attempts ran no case: `6796806` used a stale home-directory image path and
+`6796939` carried a stale full SHA despite the correct short commit ID.  Both
+fail-fast checks preserved the untouched pool.  Corrected 2-tray job `6797102`
+and 3/4/8/12/16/18-tray jobs `6797854`--`6797859` use the original sweep's
+Lustre image and verified full source SHA, one short-queue/two-hour job per
+tray group. All seven final jobs completed `0:0`; the pool is 42 complete,
+zero claims/pending/failed. The strict audit passes all case/result hashes,
+topology and measurement contracts, 1,512 Nsight reports, and 42 metric JSONs;
+all 288 model logs contain exactly one FP8xFP4 perfect-routing marker, and all
+42 prompt transforms are cache hits on the original pinned source.
+
+The paired result contradicts the expected neutral-to-faster outcome: latency
+geometric mean is **+5.867545%** and TPS/GPU is **-5.542345%**, with 14/42
+cases faster and 28 slower. Topology latency geomeans are +18.570508% (2t),
++14.104891% (3t), +4.543148% (4t), +2.481296% (8t), +1.224520% (12t),
++0.926520% (16t), and +0.653234% (18t). The worst row is A1/EP4 batch 2 at
++35.846598%. Global count balance is therefore not performance-neutral; the
+deterministic per-token expert ordering is the leading follow-up. Detailed
+evidence is in `CODEX_PROJECT_qwen3_ffn_overheads.md` and the local verified
+copy `scratch/afd_128k_perfect_routing_e00afda_20260901/`.
+
+## Standalone 128K Pareto figures (2026-09-02 PDT)
+
+A full one-chart comparison is under
+`scratch/afd_128k_optimized_attention_near_pareto_20260827/fastafd-128k-seven-pareto.html`,
+with editable fragment in `visualization-source/fastafd-128k-seven-pareto.html`.
+It contains seven verified sweeps, 447 measured points, and 109 sweep-local
+Pareto points, including both perfect-balance sweeps. The companion
+`fastafd-128k-five-pareto.html` and its editable fragment retain the same chart
+but omit `FastAFD_FFN_Overheads_W4` and `TRTLLM_MegaMoE_W4`; the
+result is exactly five sweeps, 374 measured points, and 86 sweep-local Pareto
+points. All vLLM and TRT-LLM display names in both variants omit the
+`Baseline_` prefix. Both variants are reproducible with
+`build_128k_five_pareto.py` and
+its `--series` selection. The separate focused comparison
+`afd-trtllm-perfect-balance-128k-pareto.html` uses exactly the same formatting
+but only the renamed TRT-LLM and AFD perfect-balance series (73/20). Both use a
+1600x960 SVG viewBox, exact hover/selection details, sweep-local frontier lines,
+EP marker shapes, translucent measured non-Pareto points, and one combined axis
+pair. Their extracted JavaScript passes `node --check`, and exact source-data
+audits prove all perfect-balance rows and Pareto memberships.
+
 ## A2 fan-in correctness repair (2026-08-31 PDT)
 
 A2 output corruption is localized to the FMHA O single-edge publisher, not the
@@ -32,6 +261,109 @@ the perfectly aligned A2 sample.  Unchanged A3 scorer job `6744025` completed
 average/max rank 1, and inspected attention/model ranks each retain exactly 16
 graph launches.  This validates the repair at source count three as well as two.
 See `CODEX_PROJECT_qwen3_ffn_overheads.md` for exact evidence.
+
+## MegaMoE FP8xFP4 kernel-only decomposition (2026-08-31 PDT)
+
+An opt-in diagnostic specialization now records kernel, dispatch, compute, and
+combine start/end points for the fused FP8xFP4 MegaMoE kernel.  It uses private
+per-warp `clock64()` rows, CTA-local normalization, per-rank CUDA-event
+calibration, and a queued GPU-side launch barrier; production specialization
+compiles all timing code out.  The standalone runner uses perfect deterministic
+routing and excludes route preparation from the event.  Final A8:F1, EP8,
+batch-6 job `6740199` passed on one NVL72 block: control/instrumented medians
+are 119.296/126.304 us (5.874% diagnostic overhead), dispatch/compute/combine
+durations are 22.122/70.516/102.569 us, and compute hides 70.200 us of the
+124.808-us communication envelope (56.320%), leaving 53.910 us exposed.
+Final remote descendant `7d59050` is clean; the prebuild passed and focused
+contracts are 6/6.  Code, logs, report, interpretation, and reproduction notes
+are local under `scratch/megamoe_fp8_fp4_decomposition_20260831/`.  Detailed
+history is in `CODEX_PROJECT_qwen3_ffn_overheads.md`.
+
+## Local Nsight traces copied for the latest sweep selections (2026-08-31/09-01 PDT)
+
+The complete `.nsys-rep` sets for the latest 42-case 128K near-Pareto sweep's
+highest-TPS/GPU and highest-TPS/user cases are local under
+`scratch/afd_128k_optimized_attention_near_pareto_cleanup_9a84a5a_20260829/nsys_winners/`.
+The TPS/GPU winner is `i131072-fep8-r8-atp1-b7-fp4` at 232.300866904
+TPS/active GPU (37.334067895 TPS/user), with 72 reports totaling 66,549,491
+bytes.  The TPS/user winner is `i131072-fep8-r1-atp1-b2-fp4` at
+61.133830322 TPS/user, with 16 reports totaling 18,516,911 bytes.  TPS/user is
+computed as `1000 / cuda_wall_time_mean_ms`, so the latter is the global
+minimum-latency case at 16.357555133 ms.  Both transfers passed `rsync -acni`
+content verification with exit zero and no itemized differences, and exact
+local/remote counts and byte totals match.  The local macOS rsync rejects
+`--info=stats2`; use its supported `--stats` flag for future copies.  Selection
+and verification details are in `nsys_winners/README.md`.  The additionally
+requested 128K EP8 batch-6 ratio series is also local for every ratio present
+in the sweep: A:F 1:1, 3:1, 5:1, 7:1, and 8:1.  The manifest has no EP8 2:1,
+4:1, or 6:1 rows.  These five sets contain respectively 16/32/48/64/72
+reports, 232 total, and 225,820,541 bytes.  All five `rsync -rcni` checksum
+dry runs exited zero with no report-file differences, and local/remote counts
+and bytes match.  The A8 set is the successful retry, so the earlier failed
+control-port attempt is not mixed into the local traces.
+
+## Remote sweep archive cleanup completed (2026-08-31--09-04 PDT)
+
+The remote Lustre cleanup produced a complete filtered archive set and promoted
+it to the canonical root
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/fastafd_reproduce/archives/sweeps_20260830`.
+CPU-data-mover job `6729950` completed `0:0` in `04:03:34` and produced exactly
+14 numbered `.tar.zst` sweep files, no `.partial`, a 14-row
+`SWEEP_INDEX.tsv`, and a 5,218-row `CASE_INDEX.tsv`.  Every payload archive
+excludes any directory subtree named exactly `tmp`; all other case content,
+including nsys reports/SQLite exports, configs, result JSON, TPS/GPU metrics,
+CSV/text stats, and logs, is retained.  Sweep 07 is intentionally a
+metadata-only 1,935-case tombstone.  Per explicit user direction, expensive
+full `zstd -t` rereads were skipped; every tar/zstd pipeline exited zero,
+zstd frame checksums were enabled, and final names were created atomically
+from `.partial` files.  The lightweight final audit found 14 archives, no
+partial, 15 sweep-index lines including header, 5,219 case-index lines
+including header, and all 14 summaries record the `tmp` exclusion.
+
+### Extract one archived case
+
+Use `CASE_INDEX.tsv` to find the archive filename (column 2) and internal case
+path (column 4), then extract only that case:
+
+```bash
+cd /lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/fastafd_reproduce/archives/sweeps_20260830
+rg -F 'CASE_NAME_OR_FRAGMENT' CASE_INDEX.tsv
+mkdir -p /path/to/extract
+tar --use-compress-program=unzstd -xf ARCHIVE_FILE.tar.zst -C /path/to/extract INTERNAL_CASE_PATH
+```
+
+Only the selected case is written to the destination; it contains the retained
+nsys traces/SQLite exports, configs, result JSON, TPS/GPU and other perf data.
+`tmp` subtrees were deliberately excluded, and sweep 07 has no payload.  Since
+`.tar.zst` is a sequential compressed stream, selective extraction still scans
+and decompresses the stream internally; it does not unpack the other cases to
+disk.
+
+The user explicitly confirmed source deletion while retaining the latest 42
+sweep-14 case directories uncompressed.  Promotion moved the superseded
+unfiltered archives 01--05 and canceled archive-06 partial to rollback root
+`.../archives/sweeps_20260830_superseded_unfiltered_20260831`.  The fixed
+deletion plan contains 3,623 exact targets: archived payload cases from sweeps
+01--06 and 08--13, the 94/82/163 wrong-timing AFD directories from sweeps
+02/03/04, the whole sweep-07 root, and 42 named `tmp` subtrees under the kept
+sweep-14 cases.  CPU data-mover job `6737940` logged 3,600 deletions before its
+progress stopped advancing for one minute; per the user's instruction to stop
+if the tail would take long, it was canceled at `00:17:57`. CPU data-mover job
+`6919189` resumed the exact plan on 2026-09-04, deleted the one remaining target,
+and completed `0:0`; all 42 protected cases remained present and the canonical
+14 archives/indexes were unchanged. Job `6919354` then deleted the verified
+superseded unfiltered archives and abandoned partial. The filtered-rebuild and
+archive staging roots are gone; canonical metadata/logs now use visible
+`metadata/` and `logs/` directories, with no custom hidden directory.
+
+Earlier job `6729317` was canceled when the user narrowed payloads to useful
+result artifacts; job `6729316` never ran because its original unlimited time
+limit violated the data-mover QoS.
+
+The reusable archiver is now only in main source as
+`codex_scripts/archive_sweep_cases.py`; the old scratch and remote `.tools`
+copies were removed. Filtered result mode writes payload-only tar members and
+keeps manifest/SHA/summary metadata as external sidecars.
 
 ## Completed FP8xFP4 MegaMoE cleanup (2026-08-29 PDT)
 

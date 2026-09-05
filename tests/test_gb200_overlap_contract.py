@@ -174,7 +174,7 @@ class GB200OverlapContractTests(unittest.TestCase):
 
     def test_reproduction_window_retains_warmup_and_all_measured_steps(self) -> None:
         source = (
-            ROOT / "scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh"
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
         ).read_text()
         self.assertIn("TRACE_WARMUP_DECODE_STEPS=1", source)
         self.assertIn(
@@ -185,17 +185,14 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("MAX_TOKENS=$OUTPUT_TOKENS", source)
         self.assertIn("set(lengths) != {output_tokens}", source)
         self.assertIn(
-            'r"target_batch_per_dp=(\\d+) warmup_step_id=(\\d+) "', source
+            'r"nsys profiler:target_decode_window target_batch_per_dp=(\\d+) "',
+            source,
         )
-        self.assertIn('r"step_ids=([0-9,]+) count=(\\d+) trace_count=(\\d+)"', source)
-        self.assertIn("int(trace_count) != 16", source)
-        self.assertIn("int(captured_warmup) != steps[0] - 1", source)
-        self.assertIn('capture = json.loads((run / "capture-complete.json").read_text())', source)
-        self.assertIn('capture.get("trace_decode_step_ids") != expected_trace_steps', source)
-        self.assertIn('capture.get("gpu_worker_profiler_stop_logs", -1)', source)
-        self.assertIn('worker_log.count("nsys profiler:start sync=1") != 1', source)
-        self.assertIn('worker_log.count("nsys profiler:stop sync=1") != 1', source)
-        self.assertNotIn("afd_ag_decode_graph:replay step_id=", source)
+        self.assertIn('r"warmup_step_id=(\\d+) step_ids=([0-9,]+) "', source)
+        self.assertIn("int(trace_count_text) != 16", source)
+        self.assertIn("steps[0] != warmup_step + 1", source)
+        self.assertIn('"trace_decode_step_ids": trace_steps', source)
+        self.assertIn("trace first exact full-resident decode as warmup", source)
         self.assertNotIn("MAX_TOKENS=16", source)
 
     def test_fmha_campaign_uses_launch_safe_prefill_and_shared_builds(self) -> None:
@@ -809,6 +806,17 @@ class GB200OverlapContractTests(unittest.TestCase):
         ).read_text()
         self.assertIn("def requant_qwen_fp8_weights_to_fp4(", weight_source)
 
+        m2n_kernel_source = (
+            ROOT / "python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/"
+            "deep_gemm/impls/sm100_mega_moe_m2n.cuh"
+        ).read_text()
+        self.assertIn(
+            "/* kAcquireRecvCounts = */ false,\n"
+            "        /* kRankReadyRecvCounts = */ false,\n"
+            "        layout::WorkspaceM2N>(workspace)",
+            m2n_kernel_source,
+        )
+
         runtime_source = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()
         create_start = runtime_source.index("    def _create_megamoe")
         create_end = runtime_source.index("    def _run_model_moe", create_start)
@@ -832,28 +840,21 @@ class GB200OverlapContractTests(unittest.TestCase):
             'backend == "megamoe_m2n" and placement != "legacy"', support_source
         )
 
-        runner = (
-            ROOT / "scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh"
-        ).read_text()
-        self.assertIn("legacy) DEFAULT_AFD_MOE_BACKEND=megamoe_m2n", runner)
-        self.assertIn("fmha-only) DEFAULT_AFD_MOE_BACKEND=megamoe", runner)
-        self.assertIn(
-            "MINISGL_AFD_MOE_BACKEND=${MINISGL_AFD_MOE_BACKEND:-$DEFAULT_AFD_MOE_BACKEND}",
-            runner,
-        )
-        self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", runner)
-        self.assertIn('FASTAFD_JOB_TIME_LIMIT:-01:00:00', runner)
-
         campaign = (
             ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
         ).read_text()
         self.assertIn('if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then', campaign)
         self.assertIn("DEFAULT_AFD_MOE_BACKEND=megamoe", campaign)
+        self.assertIn("DEFAULT_AFD_MOE_BACKEND=megamoe_m2n", campaign)
         self.assertIn("DEFAULT_AFD_MOE_BACKEND=deepep", campaign)
+        self.assertIn("deepep|megamoe|megamoe_m2n", campaign)
+        self.assertIn("megamoe_m2n requires legacy placement", campaign)
         self.assertIn("afd_moe_backend=%s", campaign)
         self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", campaign)
         self.assertIn("FASTAFD_CASE_ID must identify the shape", campaign)
         self.assertIn('--case-id "$CASE_ID"', campaign)
+        self.assertNotIn("CASE_ID=single", campaign)
+        self.assertIn("CASE_ID=$DEFAULT_CASE_ID", campaign)
 
     def test_model_lazy_setup_finishes_before_transport_ready_barrier(self) -> None:
         runtime_source = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()

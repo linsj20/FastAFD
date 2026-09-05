@@ -128,9 +128,11 @@ under the shared local root, and local/remote report counts match.  A8 bundle
 
 ## Consolidated controls and shutdown fix
 
-The reusable ratio/EP behavior is merged into the two major launchers:
+The reusable ratio/EP behavior was merged into the two major launchers. The
+former reproduction launcher named below has since been absorbed by canonical
+`run_afd.sh`:
 
-- `scripts/experiments/afd/oci_hsg/run_afd_reproduce.sh` supports A:F topology metadata,
+- `scripts/experiments/afd/oci_hsg/run_afd.sh` supports A:F topology metadata,
   nominal and observed scheduler-admissible capacity maxima, a pre-sample
   all-attention-worker capacity gate, task-scoped result roots, and precise
   validation of a single patched coordinator file.
