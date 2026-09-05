@@ -300,10 +300,23 @@ was enabled.
   accelerated the transfer but triggered Hugging Face 429/queue errors; a
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
+- Corrected normal-routing 397B attn-only A1 job `6937369` completed `0:0` in
+  11:44 at 8K, batch four per attention-DP lane, MB2, and 17 generated tokens.
+  It produced a validated 16-prompt sample and `SUCCESS`. All 272 generated
+  token IDs are exactly equal to the durable same-source legacy A1 sample from
+  job `6936281`; 16/16 complete sequences and first tokens match. Unchanged
+  score job `6937561` completed `0:0` in 9:58: top-1/top-10/top-100 are all
+  1.0, mean and maximum rank are 1.0, and all 272 generated tokens were scored.
+  This is the accepted small normal-routing A1 attn-only alignment proof.
+- The successful reference branch retains Qwen3.5's legacy algorithm but has
+  no split attn-only placement. Current GDN/convolution/state math remains
+  inherited from that implementation. Full attention preserves its ordering:
+  attention, output-gate multiply, then BF16 O projection. Attn-only splits
+  that exact sequence only at the worker boundary: the attention worker runs
+  attention and gate, transports BF16, and the model worker runs O projection.
+  The exact legacy/attn-only generated stream is the end-to-end confirmation.
 
-Next: repeat only the normal-routing 397B attn-only A1 8K/batch-four inference
-and unchanged score. Score the already
-durable legacy 8K sample only after attn-only passes. If both pass, repeat the
-same small alignment proof for A3. Only after correctness passes, capture
+Next: run the same normal-routing 397B attn-only 8K/batch-four alignment proof
+for A3:F1/EP4, then apply the unchanged scorer. Only after it passes, capture
 perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
 into the local workspace scratch tree.
