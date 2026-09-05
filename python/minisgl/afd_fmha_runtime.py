@@ -1319,6 +1319,7 @@ class AfdFmhaRuntime:
             f"[{self.role} rank={self.worker.tp_rank}] fmha_megamoe_buffers "
             f"precision={adapter.precision} lanes={len(adapter.buffers)} "
             f"group_ranks={adapter.group_size} group_experts={adapter.num_experts} "
+            f"perfect_routing={int(adapter.perfect_routing)} "
             f"compute_sms={compute_sms} reserved_sms={reserved_sms}",
             flush=True,
         )

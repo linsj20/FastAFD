@@ -1,5 +1,122 @@
 # Project Memory
 
+## Active 1K perfect-routing maximum-batch search (2026-09-04 PDT)
+
+The user requested the real maximum 1K batch for A1:F1/EP4 using the accepted
+FMHA-only FFN-overhead configuration plus cost-preserving perfect routing.  The
+old corrected baseline's batch 761 was tied to the conservative 0.82 KV-memory
+setting and is only a lower bound.  The first high-information probe, Slurm
+job `6921834`, completed `0:0` in 19:48: two trays/eight active GB200 GPUs,
+attention DP4, FFN EP4,
+MB2 `450+450`, uniform ISL 1,024, 3,600 prompts, FP8-activation/FP4-weight
+same-rank MegaMoE, and `MINISGL_AFD_PERFECT_ROUTING=1`.  It requests exactly
+15,300 KV pages / 979,200 KV tokens per attention GPU at memory ratio 0.97,
+which makes batch 900 the raw KV ceiling and is four requests above `7*128`.
+The launch deliberately uses the pmap contract because the comprehensive
+launcher's scheduler-admission bound is conservative at short ISL; runtime
+still must prove a full-resident warmup plus 15 measured target-batch graph
+steps.  No fallback backend or routing mode is permitted.
+
+The remote task root is
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/afd_1k_max_batch_perfect_ffn_ep4_20260904`;
+the run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b900_n2_20260904_175401_manual_na`.
+Dry-run topology/capacity resolution and login-host validation both passed.
+The task control directory records full source head
+`e00afda8af6e9fc6ad240ec0bd776b960066a53c`, tracked status/diff, and hashes
+of the launcher and relevant FMHA/perfect-routing files.  The remote canonical
+checkout remains immutable while MiniMax validation job `6920969` is live.
+Job `6921834` ran on same-fabric trays `nvl72106-T[05,18]`.  All four attention
+workers reported 15,516 pages at
+ratio 0.97 (993,024 KV tokens), revealing that current AFD runtime sizing does
+not honor the launcher's nominal 15,300-page override even though
+`ServerArgs.num_page_override=15300`; it remains memory-ratio-bound.  The
+central scheduler admitted exactly 900 requests at the observed capacity.  The
+run produced 3,600/3,600 samples with exactly 17 output tokens, one full-resident
+warmup plus the required 15 batch-900 graph replays, eight nonempty `.nsys-rep`
+files, `capture-complete.json`, and `FASTAFD_AFD_SUCCESS`, with no OOM or
+traceback.  Its result distinguishes the 912-request raw page-count ceiling
+from the scheduler-admissible ceiling of 900, so a batch-912 ratio-0.97 run
+would be invalid rather than a useful probe.
+
+Ratio-0.98 boundary probe `6922185`, run directory
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b910_n2_20260904_181701_manual_na`,
+used the same configuration with nominal 15,683 pages / 1,003,712 KV tokens and
+batch 910 (`455+455`).  It failed the intentional observed-capacity gate in
+3:27, before graph build or inference: all four attention workers measured
+15,676 pages / 1,003,264 tokens, whose exact scheduler ceiling is 909; batch
+910 needs 1,003,668 tokens.  This seven-page estimate error consumed only model
+initialization time and was not retried unchanged.  Corrected exact-boundary
+job `6922262` uses the observed tuple, batch 909, and MB2 `454+455`; dry-run and
+login validation passed with `FASTAFD_REQUIRE_CAPACITY_MAX=1`, and it was
+submitted at 18:23 PDT.  Its run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b909_n2_20260904_182355_manual_na`.
+It started at 18:24 PDT on same-fabric trays `nvl72129-T[13,16]`; all four
+attention workers reproduced 15,676 pages, the observed gate admitted exactly
+batch 909, all eight workers reached runtime-ready and captured the padded
+910-slot graph, and all four model workers confirmed FP8xFP4 perfect routing.
+Job `6922262` completed `0:0` in 21:58 with all 3,636 samples at 17 output
+tokens, one warmup plus exactly 15 batch-909 decode replays, eight nonempty
+Nsight reports, and durable capture/result artifacts.  Ratio-0.99 exact-boundary
+job `6922514` was then submitted after dry-run and login validation: predicted
+15,836 pages / 1,013,504 tokens, batch 918, and MB2 `459+459`, with every other
+contract unchanged.  Its run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b918_n2_20260904_184828_manual_na`.
+Job `6922514` reproduced exactly 15,836 pages on all attention workers and
+completed `0:0` in 19:50: exact scheduler batch 918, MB2 `459+459`, 3,672
+samples with 17 output tokens, one warmup plus 15 target replays, eight nonempty
+Nsight reports, and durable result/capture artifacts.  The final legal ratio
+probe is job `6922758`: memory ratio 1.0, predicted 15,996 pages / 1,023,744
+tokens, exact nominal batch 928, and MB2 `464+464`.  Dry-run and validation
+passed before submission at 19:09 PDT; the run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b928_n2_20260904_190950_manual_na`.
+Job `6922758` reproduced exactly 15,996 pages and the batch-928 admission
+ceiling, then failed in 4:11 on all attention ranks while allocating the FMHA
+fabric arena: ratio 1.0 consumes the entire measured free-memory budget with KV,
+but the arena also contains one extra KV page plus Q transport storage.  It did
+not reach attention runtime-ready or graph build.  Midpoint job `6922844` was
+submitted after dry-run and validation at ratio 0.995: predicted 15,916 pages /
+1,018,624 tokens, exact scheduler batch 923, and MB2 `461+462`.  Its run
+directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b923_n2_20260904_191724_manual_na`.
+Use graph success/failure to narrow the 0.99--1.0 interval; only the final
+boundary point needs a complete target-window run.
+Job `6922844` ran on the same trays as the ratio-1.0 failure, reproduced 15,916
+pages and exact batch-923 admission, reached runtime-ready on all eight workers,
+and captured the padded 924-slot graph on all eight with perfect routing.  It
+was intentionally canceled at 7:53 before prefill to conserve GPU time.
+Upper-midpoint job `6922965` was submitted after dry-run and validation at ratio
+0.9975: 15,956 predicted pages / 1,021,184 tokens, exact batch 925, and MB2
+`462+463` with padded graph 926.  Its run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b925_n2_20260904_192846_manual_na`.
+It reproduced all 15,956 pages and passed exact admission, but failed in 3:24
+on every attention rank after runtime-ready and before graph capture: each had
+only 17.44 MiB free when a 20.00 MiB allocation was requested.  Because batch
+925 needs only 15,941 pages, this establishes that the probe overallocated 15
+KV pages rather than that batch 925 is impossible.  Batch 926 needs at least
+15,959 pages and has the same padded-926 graph, so its memory demand is strictly
+higher than the failed probe; batch 926 and above are impossible under this
+execution contract.  Final boundary job `6923008` was submitted after dry-run
+and validate-only checks at ratio 0.9965625, exactly 15,941 pages / 1,020,224
+tokens and exact scheduler batch 925.  Its run directory is
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b925_n2_20260904_193524_manual_na`.
+It failed before container creation in 0:22 because its submitted image path
+mistyped `oci-hsg_onboarding` as `oci_hsg_onboarding`; no model or GPU workload
+ran.  Identical corrected replacement job `6923092` uses run directory
+`results/afd_qwen3_1024_r1_ag4_fg4_atp1_fep4_adp4_b925_n2_20260904_193848_manual_na`.
+Replacement job `6923092` completed `0:0` in 19:58 on same-fabric trays
+`nvl72093-T[08,14]`.  All four attention ranks reproduced 15,941 pages, the
+coordinator admitted exactly 925 requests per lane with only 11 scheduler
+tokens unused, and all eight workers captured the padded-926 graph.  All four
+model ranks confirmed FP8xFP4 MegaMoE and `perfect_routing=1`.  The real
+3,700-prompt prefill completed, followed by full-resident warmup step 1837 and
+exactly 15 batch-925 decode steps 1838--1852.  All 3,700 samples contain 17
+output tokens, all eight Nsight reports are nonempty, result/capture artifacts
+are durable, and `FASTAFD_AFD_SUCCESS` is present.  Therefore batch 925 is the
+proven maximum under this A1:F1/EP4 contract: batch 926 needs at least 15,959
+pages, already more than the failed 15,956-page same-graph footprint.  Per the
+user's decision, no lower boundary points were rerun after this full success.
+
 ## Workspace consolidation and canonical AFD launcher (2026-09-04 PDT)
 
 Local `scratch/` is now visualization-only: 25 standalone HTML/PNG files,

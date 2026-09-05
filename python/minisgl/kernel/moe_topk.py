@@ -116,6 +116,7 @@ def gate_topk(
     route_prepare: tuple[
         torch.Tensor, torch.Tensor, int, int, int, int, bool
     ] | None = None,
+    perfect_balance: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
     16-way K-split) + softmax + top-k (+ optional renormalize) in ONE kernel
@@ -129,7 +130,13 @@ def gate_topk(
 
     ``route_prepare`` = (symmetric buffer, device buffer-pointer table, rank,
     ranks, aligned token capacity, MegaMoE SMs, rank-ready publication) groups
-    and remotely publishes the selected routes before MegaMoE starts."""
+    and remotely publishes the selected routes before MegaMoE starts.
+
+    ``perfect_balance`` preserves the normal gate GEMM, softmax, and top-k work
+    but compile-time-substitutes a deterministic global sequence for the final
+    expert-id assignment. It adds no kernel, graph node, synchronization, copy,
+    or device-side runtime branch. It is valid only with route preparation,
+    whose rank identifies each source in that sequence."""
     assert hidden.is_cuda and hidden.dtype == torch.bfloat16
     assert gate_weight.is_cuda and gate_weight.dtype == torch.bfloat16
     n = hidden.shape[0]
@@ -243,6 +250,7 @@ def gate_topk(
         int(route_rank), int(route_num_ranks),
         int(route_bucket), int(route_num_sms),
         bool(route_rank_ready),
+        bool(perfect_balance),
     )
     return ids, weights
 

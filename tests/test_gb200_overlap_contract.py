@@ -11,6 +11,48 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GB200OverlapContractTests(unittest.TestCase):
+    def test_perfect_routing_preserves_router_work_and_balances_ids(self) -> None:
+        kernel = (
+            ROOT / "python/minisgl/kernel/csrc/jit/gate_topk_fused.cu"
+        ).read_text()
+        select = kernel[kernel.index("gate_topk_select_kernel") :]
+        self.assertIn("if constexpr (kPerfectBalance)", select)
+        self.assertIn(
+            "gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>",
+            select,
+        )
+        perfect_start = select.index("if constexpr (kPerfectBalance)")
+        normal_start = select.index("float logit[kMaxExpertsPerLane]")
+        topk_start = select.index("for (int j = 0; j < topk; ++j)")
+        self.assertLess(normal_start, topk_start)
+        self.assertLess(topk_start, perfect_start)
+        self.assertIn("GEMM, softmax, and top-k work above remains unchanged", select)
+        self.assertIn("perfect balance requires route preparation", kernel)
+
+        for ranks in (4, 8):
+            for valid_tokens in range(1, 33):
+                counts = [0] * 128
+                for rank in range(ranks):
+                    for token in range(valid_tokens):
+                        for slot in range(8):
+                            expert = ((rank * valid_tokens + token) * 8 + slot) % 128
+                            counts[expert] += 1
+                self.assertLessEqual(max(counts) - min(counts), 1)
+
+        adapter = (ROOT / "python/minisgl/moe/megamoe_afd.py").read_text()
+        self.assertIn('"MINISGL_AFD_PERFECT_ROUTING", "0"', adapter)
+        self.assertIn("perfect_balance=self.perfect_routing", adapter)
+
+        campaign = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
+        ).read_text()
+        self.assertIn("FASTAFD_PROMPT_BASE_FILE:-$SOURCE_REPO/prompts/", campaign)
+        bundle = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd_bundle.sh"
+        ).read_text()
+        self.assertEqual(bundle.count('FASTAFD_PROMPT_BASE_FILE="$PROMPT_BASE_FILE"'), 2)
+        self.assertEqual(bundle.count('FASTAFD_PROMPT_CACHE_ROOT="$PROMPT_CACHE_ROOT"'), 2)
+
     def test_bundle_pool_accepts_fp4_qualified_case_ids(self) -> None:
         path = (
             ROOT

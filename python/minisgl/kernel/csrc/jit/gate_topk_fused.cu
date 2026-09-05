@@ -262,7 +262,8 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
 // Second kernel: top-k over the assembled logits (one block per token tile,
 // one warp per token).  The kernel boundary is the cheapest device-wide
 // barrier — much faster than an in-kernel ticket + memory fence round.
-template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes, bool kRankReadyRoutePublish>
+template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
+          bool kRankReadyRoutePublish, bool kPerfectBalance>
 __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_kernel(
     const float* __restrict__ logits_gmem,  // [mtiles, 16, kMaxExperts]
     float* __restrict__ topk_weights,
@@ -316,7 +317,8 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
 
     float m_all = -FLT_MAX;
     #pragma unroll
-    for (int i = 0; i < kMaxExpertsPerLane; ++i) m_all = fmaxf(m_all, logit[i]);
+    for (int i = 0; i < kMaxExpertsPerLane; ++i)
+      m_all = fmaxf(m_all, logit[i]);
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       m_all = fmaxf(m_all, __shfl_xor_sync(0xffffffffu, m_all, off));
@@ -358,7 +360,20 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
       if (j == 0) top0 = v;
       if (lane == j) {
         my_logit = v;
-        my_expert = wbi * kWarpSize + static_cast<int>(src);
+        if constexpr (kPerfectBalance) {
+          const int valid_tokens = valid_count_size == 0
+                                       ? num_tokens
+                                       : min(static_cast<int>(valid_token_count[0]),
+                                             num_tokens);
+          // Replace the original expert-id finalization in place. The normal
+          // GEMM, softmax, and top-k work above remains unchanged, and there is
+          // no extra kernel, graph node, synchronization, copy, or runtime branch.
+          my_expert = static_cast<int>(
+              ((static_cast<int64_t>(route_rank) * valid_tokens + token) * topk +
+               lane) % num_experts);
+        } else {
+          my_expert = wbi * kWarpSize + static_cast<int>(src);
+        }
       }
     }
 
@@ -498,7 +513,8 @@ struct GateTopkFusedKernel {
       int route_num_ranks,
       int route_bucket,
       int route_num_sms,
-      bool route_rank_ready) {
+      bool route_rank_ready,
+      bool perfect_balance) {
     using namespace host;
     auto num_tokens = SymbolicSize{"M"};
     auto topk = SymbolicSize{"K"};
@@ -562,6 +578,8 @@ struct GateTopkFusedKernel {
         "route_workspace and route_buffer_ptrs must be provided together");
     RuntimeCheck(prepare_routes || !route_rank_ready,
                  "rank-ready publication requires route preparation");
+    RuntimeCheck(prepare_routes || !perfect_balance,
+                 "perfect balance requires route preparation");
     if (prepare_routes) {
       TensorMatcher({-1})
           .with_device<kDLCUDA>(device_ref)
@@ -639,10 +657,12 @@ struct GateTopkFusedKernel {
       const auto* route_buffer_ptrs_ptr = prepare_routes
           ? static_cast<const int64_t*>(route_buffer_ptrs.value().data_ptr())
           : nullptr;
-      const auto launch = [&](auto prepare_tag, auto rank_ready_tag) {
+      const auto launch = [&](auto prepare_tag, auto rank_ready_tag,
+                              auto perfect_tag) {
         constexpr bool kPrepareRoutes = decltype(prepare_tag)::value;
         constexpr bool kRankReady = decltype(rank_ready_tag)::value;
-        gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady>
+        constexpr bool kPerfect = decltype(perfect_tag)::value;
+        gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>
             <<<num_mtiles,
                std::min(kTokensPerBlock, rows) * kWarpSize,
                0, stream>>>(
@@ -655,12 +675,19 @@ struct GateTopkFusedKernel {
                 rows, experts, topk_value, renormalize);
       };
       if (prepare_routes) {
-        if (route_rank_ready)
-          launch(std::true_type{}, std::true_type{});
-        else
-          launch(std::true_type{}, std::false_type{});
+        if (route_rank_ready) {
+          if (perfect_balance)
+            launch(std::true_type{}, std::true_type{}, std::true_type{});
+          else
+            launch(std::true_type{}, std::true_type{}, std::false_type{});
+        } else {
+          if (perfect_balance)
+            launch(std::true_type{}, std::false_type{}, std::true_type{});
+          else
+            launch(std::true_type{}, std::false_type{}, std::false_type{});
+        }
       } else {
-        launch(std::false_type{}, std::false_type{});
+        launch(std::false_type{}, std::false_type{}, std::false_type{});
       }
     };
     if (use_int32_indices && use_int32_map) {

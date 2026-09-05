@@ -52,6 +52,15 @@ class MegaMoEAfdAdapter:
         self.bucket = int(num_max_tokens_per_rank)
         self.num_lanes = max(1, int(num_lanes))
         self.gate_renormalize = bool(gate_renormalize)
+        perfect_routing = os.environ.get(
+            "MINISGL_AFD_PERFECT_ROUTING", "0"
+        ).strip()
+        if perfect_routing not in ("0", "1"):
+            raise RuntimeError(
+                "MINISGL_AFD_PERFECT_ROUTING must be 0 or 1, "
+                f"got {perfect_routing!r}"
+            )
+        self.perfect_routing = perfect_routing == "1"
         self.tp_size = int(tp_size)
         self.tp_rank = int(tp_rank)
         self.expert_weight_dtype = os.environ.get(
@@ -173,6 +182,7 @@ class MegaMoEAfdAdapter:
             quant_out=(buffer.x[:num_tokens], buffer.x_sf[:num_tokens], None),
             out=(ids, weights),
             route_prepare=(buffer.route_prepare_args(rank_ready=True) if routes_prepared else None),
+            perfect_balance=self.perfect_routing,
         )
         y = buffer.y[:num_tokens]
         self._run_mega_moe(
