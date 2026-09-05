@@ -175,6 +175,7 @@ class AfdRuntimeConfig(SchedulerConfig):
     afd_moe_runner_backend: str = "auto"
     afd_model_placement: str = "legacy"
     afd_max_comm_tokens: int = 1
+    afd_perf_mode: bool = False
 
     @property
     def distributed_addr(self) -> str:

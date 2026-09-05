@@ -133,9 +133,10 @@ def gate_topk(
 
     ``perfect_balance`` preserves the normal gate GEMM, softmax, and top-k work
     but compile-time-substitutes a deterministic global sequence for the final
-    expert-id assignment. It adds no kernel, graph node, synchronization, copy,
-    or device-side runtime branch. It is valid only with route preparation,
-    whose rank identifies each source in that sequence."""
+    expert-id assignment with 32-bit multiply/add/mask arithmetic. It adds no
+    kernel, graph node, synchronization, copy, division, or device-side runtime
+    branch. It is valid only with route preparation and a power-of-two expert
+    count; the route rank identifies each source in that sequence."""
     assert hidden.is_cuda and hidden.dtype == torch.bfloat16
     assert gate_weight.is_cuda and gate_weight.dtype == torch.bfloat16
     n = hidden.shape[0]

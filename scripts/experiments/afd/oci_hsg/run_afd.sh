@@ -88,6 +88,15 @@ if [[ "$NSYS" == 1 && "$NSYS_CUDA_GRAPH_TRACE" != node ]]; then
     exit 2
 fi
 export NSYS
+AFD_PERF_MODE=${FASTAFD_AFD_PERF_MODE:-${AFD_PERF_MODE:-0}}
+[[ "$AFD_PERF_MODE" == 0 || "$AFD_PERF_MODE" == 1 ]] || {
+    echo "FASTAFD_AFD_PERF_MODE must be 0 or 1" >&2
+    exit 2
+}
+if [[ "$AFD_PERF_MODE" == 1 && "$NSYS" != 1 ]]; then
+    echo "AFD perf mode is profiling-only and requires NSYS=1" >&2
+    exit 2
+fi
 NSYS_CAPTURE_DECODE_STEPS=${NSYS_CAPTURE_DECODE_STEPS:-15}
 [[ "$NSYS_CAPTURE_DECODE_STEPS" == 15 ]] || {
     echo "NSYS_CAPTURE_DECODE_STEPS must be exactly 15" >&2
@@ -156,6 +165,12 @@ case "$PROMPT_MODE" in
         IRREGULAR=1 ;;
     *) echo "prompt mode must be uniform or irregular" >&2; exit 2 ;;
 esac
+if [[ "$AFD_PERF_MODE" == 1 && "$IRREGULAR" != 0 ]]; then
+    echo "AFD perf mode requires a uniform logical context" >&2
+    exit 2
+fi
+AFD_PERF_CONTEXT_LEN=$CONTEXT
+export AFD_PERF_MODE AFD_PERF_CONTEXT_LEN
 if (( IRREGULAR )); then
     SHAPE_ID=r${CONTEXT_MIN}-${CONTEXT_MAX}
 else
@@ -568,7 +583,15 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != leg
     echo "MINISGL_AFD_MOE_BACKEND=megamoe_m2n requires legacy placement" >&2
     exit 2
 fi
-MINISGL_AFD_PERFECT_ROUTING=${MINISGL_AFD_PERFECT_ROUTING:-0}
+if [[ "$AFD_PERF_MODE" == 1 ]]; then
+    [[ "$AFD_MODEL_PLACEMENT" == attn-only && "$MINISGL_AFD_MOE_BACKEND" == megamoe ]] || {
+        echo "AFD perf mode requires attn-only placement with same-rank MegaMoE" >&2
+        exit 2
+    }
+    MINISGL_AFD_PERFECT_ROUTING=1
+else
+    MINISGL_AFD_PERFECT_ROUTING=${MINISGL_AFD_PERFECT_ROUTING:-0}
+fi
 if [[ "$MINISGL_AFD_PERFECT_ROUTING" != 0 && "$MINISGL_AFD_PERFECT_ROUTING" != 1 ]]; then
     echo "MINISGL_AFD_PERFECT_ROUTING must be 0 or 1" >&2
     exit 2
@@ -729,8 +752,8 @@ if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
 fi
 
 if [[ "${FASTAFD_DRY_RUN:-0}" == 1 && -z "${SLURM_JOB_ID:-}" ]]; then
-    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s afd_model_placement=%s afd_moe_backend=%s megamoe_expert_weight_dtype=%s case_id=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
-        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$MINISGL_AFD_MOE_BACKEND" \
+    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s afd_model_placement=%s afd_perf_mode=%s perfect_routing=%s afd_moe_backend=%s megamoe_expert_weight_dtype=%s case_id=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
+        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$AFD_PERF_MODE" "$MINISGL_AFD_PERFECT_ROUTING" "$MINISGL_AFD_MOE_BACKEND" \
         "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" "$CASE_ID" \
         "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
         "$BATCH" "$CAPACITY_MAX_BATCH" "$RAW_KV_MAX_BATCH" "$REQUIRE_CAPACITY_MAX" \
@@ -813,7 +836,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     JOB=$(sbatch "${SBATCH_ARGS[@]}" \
         --job-name="$JOB_NAME" \
         --output="$RUN_DIR/slurm-%j.out" --error="$RUN_DIR/slurm-%j.err" \
-        --export="ALL,FASTAFD_SUBMIT_QOS=$SUBMIT_QOS,FASTAFD_SWEEP_CONTRACT=$SWEEP_CONTRACT,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,AFD_ATTENTION_TO_FFN_TRAY_RATIO=$NORMALIZED_AF_RATIO,AFD_ATTN_TP_SIZE=$ATTENTION_TP,AFD_MLP_EP_SIZE=$FFN_EP,NORMALIZED_AF_RATIO=$NORMALIZED_AF_RATIO,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_TP=$ATTENTION_TP,FFN_EP=$FFN_EP,ATTENTION_GPUS=$ATTENTION_GPUS,FFN_GPUS=$FFN_GPUS,ACTIVE_GPUS=$ACTIVE_GPUS,ALLOCATED_GPUS=$ALLOCATED_GPUS,SHARED_ROLE_TRAYS=$SHARED_ROLE_TRAYS,ATTENTION_DP_SIZE=$ATTENTION_DP_SIZE,ATTENTION_WORKERS=$ATTENTION_WORKERS,MLP_DP_SIZE=$MLP_DP_SIZE,MLP_TP_SIZE=$MLP_TP_SIZE,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,EXPECTED_SOURCE_COORDINATOR_SHA256=$EXPECTED_SOURCE_COORDINATOR_SHA256,EXPECTED_SOURCE_PROFILER_SHA256=$EXPECTED_SOURCE_PROFILER_SHA256,EXPECTED_SOURCE_PROTOCOL_SHA256=$EXPECTED_SOURCE_PROTOCOL_SHA256,EXPECTED_SOURCE_PLACEMENT_SHA256=$EXPECTED_SOURCE_PLACEMENT_SHA256,EXPECTED_SOURCE_API_SHA256=$EXPECTED_SOURCE_API_SHA256,EXPECTED_SOURCE_ARGS_SHA256=$EXPECTED_SOURCE_ARGS_SHA256,CUDA_EXTRACT_SCRIPT=$CUDA_EXTRACT_SCRIPT,CUDA_METRIC_PLAN=$CUDA_METRIC_PLAN,CUDA_SPAN_MODULE=$CUDA_SPAN_MODULE,CUDA_METRICS_ROOT=$CUDA_METRICS_ROOT,CUDA_EXTRACT_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
+        --export="ALL,FASTAFD_SUBMIT_QOS=$SUBMIT_QOS,FASTAFD_SWEEP_CONTRACT=$SWEEP_CONTRACT,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_PERF_MODE=$AFD_PERF_MODE,AFD_PERF_CONTEXT_LEN=$AFD_PERF_CONTEXT_LEN,MINISGL_AFD_PERFECT_ROUTING=$MINISGL_AFD_PERFECT_ROUTING,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,AFD_ATTENTION_TO_FFN_TRAY_RATIO=$NORMALIZED_AF_RATIO,AFD_ATTN_TP_SIZE=$ATTENTION_TP,AFD_MLP_EP_SIZE=$FFN_EP,NORMALIZED_AF_RATIO=$NORMALIZED_AF_RATIO,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_TP=$ATTENTION_TP,FFN_EP=$FFN_EP,ATTENTION_GPUS=$ATTENTION_GPUS,FFN_GPUS=$FFN_GPUS,ACTIVE_GPUS=$ACTIVE_GPUS,ALLOCATED_GPUS=$ALLOCATED_GPUS,SHARED_ROLE_TRAYS=$SHARED_ROLE_TRAYS,ATTENTION_DP_SIZE=$ATTENTION_DP_SIZE,ATTENTION_WORKERS=$ATTENTION_WORKERS,MLP_DP_SIZE=$MLP_DP_SIZE,MLP_TP_SIZE=$MLP_TP_SIZE,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,EXPECTED_SOURCE_COORDINATOR_SHA256=$EXPECTED_SOURCE_COORDINATOR_SHA256,EXPECTED_SOURCE_PROFILER_SHA256=$EXPECTED_SOURCE_PROFILER_SHA256,EXPECTED_SOURCE_PROTOCOL_SHA256=$EXPECTED_SOURCE_PROTOCOL_SHA256,EXPECTED_SOURCE_PLACEMENT_SHA256=$EXPECTED_SOURCE_PLACEMENT_SHA256,EXPECTED_SOURCE_API_SHA256=$EXPECTED_SOURCE_API_SHA256,EXPECTED_SOURCE_ARGS_SHA256=$EXPECTED_SOURCE_ARGS_SHA256,CUDA_EXTRACT_SCRIPT=$CUDA_EXTRACT_SCRIPT,CUDA_METRIC_PLAN=$CUDA_METRIC_PLAN,CUDA_SPAN_MODULE=$CUDA_SPAN_MODULE,CUDA_METRICS_ROOT=$CUDA_METRICS_ROOT,CUDA_EXTRACT_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
         "$(realpath "$0")")
     printf 'submitted job=%s model=%s context=%s batch=%s normalized_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s active_gpus=%s allocated_gpus=%s shared_role_trays=%s nodes=%s run_dir=%s\n' \
         "$JOB" "$MODEL_KEY" "$CONTEXT" "$BATCH" "$NORMALIZED_AF_RATIO" \
@@ -858,8 +881,10 @@ if [[ "${FASTAFD_IN_CONTAINER:-0}" != 1 ]]; then
         ALLOW_OBSERVED_CAPACITY_PROBE="$ALLOW_OBSERVED_CAPACITY_PROBE" \
         MAX_SEQ_LEN="$MAX_SEQ_LEN" NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE" \
         NSYS_CAPTURE_DECODE_STEPS="$NSYS_CAPTURE_DECODE_STEPS" \
+        AFD_PERF_MODE="$AFD_PERF_MODE" AFD_PERF_CONTEXT_LEN="$AFD_PERF_CONTEXT_LEN" \
         AFD_MODEL_PLACEMENT="$AFD_MODEL_PLACEMENT" \
         MINISGL_AFD_MOE_BACKEND="$MINISGL_AFD_MOE_BACKEND" \
+        MINISGL_AFD_PERFECT_ROUTING="$MINISGL_AFD_PERFECT_ROUTING" \
         MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" \
         MODEL_PATH="$MODEL_PATH" \
         MODEL_SOURCE_PATH="$MODEL_SOURCE_PATH" MODEL_CONFIG_SHA256="$MODEL_CONFIG_SHA256" \
@@ -1124,7 +1149,8 @@ PROMPT_CACHE_ROOT=${FASTAFD_PROMPT_CACHE_ROOT:-$RESULTS_ROOT/prompt-cache}
 "$PYTHON" - "$PROMPT_BASE_FILE" "$PROMPT_FILE" "$PROMPT_MANIFEST" \
     "$PROMPT_CACHE_ROOT" "$NUM_PROMPTS" "$CONTEXT_MIN" "$CONTEXT_MAX" \
     "$MODEL_KEY" "$MODEL_PATH" "$MODEL_REVISION" "$PROMPT_MODE" \
-    "$PROMPT_SOURCE_CONTEXT" "$ATTENTION_DP_SIZE" "$PROMPT_LENGTHS_CSV" <<'PY'
+    "$PROMPT_SOURCE_CONTEXT" "$ATTENTION_DP_SIZE" "$PROMPT_LENGTHS_CSV" \
+    "$AFD_PERF_MODE" <<'PY'
 from pathlib import Path
 import fcntl
 import hashlib
@@ -1139,6 +1165,7 @@ count, context_min, context_max = int(sys.argv[5]), int(sys.argv[6]), int(sys.ar
 model_key, model_path, model_revision, prompt_mode = sys.argv[8:12]
 source_context, attention_dp_size = int(sys.argv[12]), int(sys.argv[13])
 prompt_lengths = [int(value) for value in sys.argv[14].split(",")]
+perf_mode = bool(int(sys.argv[15]))
 if count != attention_dp_size * len(prompt_lengths):
     raise RuntimeError((count, attention_dp_size, len(prompt_lengths)))
 if prompt_lengths[0] != context_min or prompt_lengths[-1] != context_max:
@@ -1182,6 +1209,7 @@ cache_spec = {
     "target_context_min_tokens": context_min,
     "target_context_max_tokens": context_max,
     "prompt_layout": prompt_layout,
+    "afd_perf_mode": perf_mode,
 }
 cache_key = hashlib.sha256(
     json.dumps(cache_spec, sort_keys=True, separators=(",", ":")).encode()
@@ -1270,7 +1298,12 @@ def build_record(output_file):
     token_digest = hashlib.sha256()
     source_token_lengths = set()
     merge_gap_repairs = []
-    if model_key in {"qwen3", "qwen35"}:
+    if perf_mode:
+        output_file.write_text("hello\n" * count, encoding="utf-8")
+        transform = "profiling_stub_prompt; logical context is randomized resident KV state"
+        observed = None
+        prompt_token_sha256 = None
+    elif model_key in {"qwen3", "qwen35"}:
         from minisgl.hf_support import load_tokenizer
 
         tokenizer = load_tokenizer(model_path)
@@ -1340,6 +1373,7 @@ def build_record(output_file):
         "source_content_token_lengths": sorted(source_token_lengths),
         "exact_length_merge_gap_repairs": merge_gap_repairs,
         "prefix_caching": "not present: AFD uses cache-type=naive",
+        "afd_perf_mode": perf_mode,
         "prompt_cache_key": cache_key,
         "prompt_cache_spec": cache_spec,
     }
@@ -1409,6 +1443,7 @@ else
 fi
 export AFD_ATTN_DP_SIZE=$ATTENTION_DP_SIZE MLP_DP_SIZE MLP_TP_SIZE
 export PROMPT_LEN=$CONTEXT_MAX PER_ATTN_GPU_BSZ=$BATCH MAX_TOKENS=$OUTPUT_TOKENS
+export AFD_PERF_MODE AFD_PERF_CONTEXT_LEN
 export MINISGL_MAX_SEQ_LEN=$MAX_SEQ_LEN VLLM_MAX_MODEL_LEN=$MAX_SEQ_LEN
 export AFD_DECODE_GRAPH_BS=$GRAPH_BATCH
 export AFD_MEMORY_RATIO
@@ -1668,6 +1703,7 @@ if [[ "${NSYS:-0}" == 1 ]]; then
 fi
 
 RUN_DIR=$RUN_DIR SWEEP_CONTRACT=$SWEEP_CONTRACT NUM_PROMPTS=$NUM_PROMPTS BATCH=$BATCH \
+AFD_PERF_MODE=$AFD_PERF_MODE AFD_PERF_CONTEXT_LEN=$AFD_PERF_CONTEXT_LEN \
 AFD_MODEL_PLACEMENT_REQUESTED=$AFD_MODEL_PLACEMENT_REQUESTED \
 AFD_MODEL_PLACEMENT_POLICY=$AFD_MODEL_PLACEMENT_POLICY \
 AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT AFD_NUM_MB=$AFD_NUM_MB \
@@ -1731,6 +1767,8 @@ moe_backend = os.environ["MINISGL_AFD_MOE_BACKEND"]
 megamoe_expert_weight_dtype = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"]
 num_mb = int(os.environ["AFD_NUM_MB"])
 nsys_enabled = bool(int(os.environ.get("NSYS", "0")))
+perf_mode = bool(int(os.environ["AFD_PERF_MODE"]))
+perfect_routing = bool(int(os.environ["MINISGL_AFD_PERFECT_ROUTING"]))
 mb_base, mb_remainder = divmod(batch, num_mb)
 if model_placement == "attn-only":
     microbatch_real_sizes = [
@@ -1922,6 +1960,15 @@ result = {
     "afd_model_placement": model_placement,
     "afd_model_placement_requested": model_placement_requested,
     "afd_model_placement_policy": model_placement_policy,
+    "afd_perf_mode": perf_mode,
+    "afd_perf_context_len": int(os.environ["AFD_PERF_CONTEXT_LEN"]),
+    "perfect_routing_forced_by_perf_mode": perf_mode,
+    "perfect_routing": perfect_routing,
+    "perfect_routing_cost_contract": (
+        "normal fused gate GEMM, softmax, and top-k retained; only final expert IDs "
+        "are compile-time substituted; dispatch, expert, and combine work unchanged"
+        if perf_mode else None
+    ),
     "afd_moe_backend": moe_backend,
     "megamoe_expert_weight_dtype": megamoe_expert_weight_dtype,
     "model_key": os.environ.get("MODEL_KEY"),

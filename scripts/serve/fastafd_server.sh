@@ -23,6 +23,8 @@ Options:
   --afd-mlp-tp-size N            Default: 4
   --afd-mlp-ep-size N            Default: 1
   --afd-model-placement NAME     legacy or attn-only. Default: legacy
+  --afd-perf-mode                Skip prefill and seed decode from randomized state
+  --afd-perf-context-len N       Logical resident context for perf mode
   --afd-moe-a2a-backend NAME     Default: none
   --afd-moe-runner-backend NAME  Default: auto
   --afd-batch-size N             Default: 8
@@ -56,6 +58,8 @@ AFD_ATTN_TP_SIZE="4"
 AFD_MLP_TP_SIZE="4"
 AFD_MLP_EP_SIZE="1"
 AFD_MODEL_PLACEMENT="legacy"
+AFD_PERF_MODE=0
+AFD_PERF_CONTEXT_LEN=0
 AFD_MOE_A2A_BACKEND="${AFD_MOE_A2A_BACKEND:-none}"
 AFD_MOE_RUNNER_BACKEND="${AFD_MOE_RUNNER_BACKEND:-auto}"
 AFD_BATCH_SIZE="8"
@@ -89,6 +93,8 @@ while [[ $# -gt 0 ]]; do
     --afd-mlp-tp-size) AFD_MLP_TP_SIZE="$2"; shift 2 ;;
     --afd-mlp-ep-size) AFD_MLP_EP_SIZE="$2"; shift 2 ;;
     --afd-model-placement) AFD_MODEL_PLACEMENT="$2"; shift 2 ;;
+    --afd-perf-mode) AFD_PERF_MODE=1; shift ;;
+    --afd-perf-context-len) AFD_PERF_CONTEXT_LEN="$2"; shift 2 ;;
     --afd-moe-a2a-backend) AFD_MOE_A2A_BACKEND="$2"; shift 2 ;;
     --afd-moe-runner-backend) AFD_MOE_RUNNER_BACKEND="$2"; shift 2 ;;
     --afd-batch-size) AFD_BATCH_SIZE="$2"; shift 2 ;;
@@ -160,6 +166,10 @@ cmd=(
   --afd-device-comm-num-sms "$AFD_DEVICE_COMM_NUM_SMS"
   --page-size "$PAGE_SIZE"
 )
+
+if [[ "$AFD_PERF_MODE" -eq 1 ]]; then
+  cmd+=(--afd-perf-mode --afd-perf-context-len "$AFD_PERF_CONTEXT_LEN")
+fi
 
 if [[ -n "$RAY_LOG_DIR" ]]; then
   cmd+=(--ray-log-dir "$RAY_LOG_DIR")

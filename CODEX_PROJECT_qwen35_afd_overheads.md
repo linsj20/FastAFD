@@ -16,9 +16,10 @@ retain both report sets locally. Use HSG `short`, one-hour jobs, with
 5/15-minute monitoring. Keep plans, results, metrics, and traces isolated by
 purpose and placement so repeated shape IDs cannot overwrite one another.
 
-The primary local checkout must remain untouched. The editable source is
-`scratch/qwen35_afd_overheads_20260904/source_mirror`. The isolated remote task
-root is
+The primary local checkout remains untouched while the candidate is under
+validation; once both requested traces pass, copy the final validated source
+back to that current branch without switching branches. The editable source is
+`scratch/qwen35_afd_overheads_20260904/source_mirror`. The isolated remote task root is
 `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/qwen35_afd_overheads_20260904`;
 its `source` checkout is a test/launch copy synchronized from the local mirror.
 Do not modify the canonical remote FastAFD checkout.
@@ -322,7 +323,36 @@ was enabled.
   `0:0` in 10:17: top-10/top-100 are 1.0, top-1 is 0.9791667, average rank is
   1.0318627, and maximum rank is 5. A1 and A3 attn-only therefore both pass
   the unchanged all-generated-token top-10=1.0 alignment standard.
+- The first real-prefill 128K A1 trace attempt, job `6938071`, was canceled
+  before inference after the user rejected spending the trace budget on slow
+  128K prefill. No trace result from that job is accepted. Profiling now has an
+  explicit opt-in perf mode which bypasses the prefill scheduler, atomically
+  allocates the exact logical 128K request/page state, starts every request at
+  the final resident-context token, and fills MHA KV plus convolution/recurrent
+  GDN state with random GPU values before graph warmup/capture. Normal serving
+  and both alignment paths are unchanged; perf mode is rejected unless Nsight,
+  uniform context, `attn-only`, and same-rank MegaMoE are selected.
+- Perf mode always forces `MINISGL_AFD_PERFECT_ROUTING=1` through the campaign,
+  Slurm, container, coordinator, and Ray worker environment. Perfect routing
+  retains the normal fused gate GEMM, softmax, top-k comparisons/weights, route
+  preparation, dispatch, expert, and combine work. It changes only final IDs
+  through the existing compile-time kernel specialization, with no extra
+  kernel, graph node, synchronization, copy, or device runtime branch. The
+  397B 512-expert mapping now uses 32-bit multiply/add/power-of-two-mask
+  arithmetic instead of the prior 64-bit remainder; unsupported expert counts
+  and route ranges fail before execution so the routing mechanism itself does
+  not add a division to the measured path.
+- Remote focused perf/protocol/perfect-routing contracts pass 19/19, including
+  duplicate-UID and KV-capacity atomicity; shell syntax and `git diff --check`
+  pass. Zero-GPU A1 and A3 launcher rehearsals independently report
+  `afd_perf_mode=1 perfect_routing=1` even with an incoming explicit routing
+  value of zero. Both retain batch 37 per attention lane, MB2 `18+19`, exact
+  128K logical context, capacity 4,970,176, and one warmup plus exactly 15
+  measured decode launches.
 
-Next: capture perfect-balanced FP4 attn-only A1/A3 Nsight reports at the
-planned 128K/batch-37 maximum-capacity point and copy both report sets into the
-local workspace scratch tree.
+Next: rerun the focused contracts including duplicate-UID atomicity, then run
+zero-GPU source/model validation. Submit only the FP4 perf-mode A1 trace first;
+monitor manually at 5/15-minute intervals and treat a 50-minute execution as
+suspicious. Submit A3 only after A1 completes the exact 15-step trace contract.
+Copy both report sets into the local workspace scratch tree, then propagate the
+validated candidate source to the untouched primary current branch.

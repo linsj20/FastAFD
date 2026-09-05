@@ -107,6 +107,8 @@ class AfdAttentionState:
             dtype=self.dtype,
             storage=self._allocate_kv_storage(config),
         )
+        if bool(getattr(config, "afd_perf_mode", False)):
+            self._randomize_perf_state()
         # One attention backend per microbatch because each wrapper owns mutable
         # decode metadata and workspace. FMHA-only MB2 decode launches these
         # wrappers concurrently on distinct graph streams.
@@ -131,6 +133,24 @@ class AfdAttentionState:
                     if fi_backend is not None:
                         fi_backend.last_event = shared_event
         self.ctx.attn_backend = self.attn_backends[0]
+
+    def _randomize_perf_state(self) -> None:
+        """Populate profiling-only resident state before graph warmup/capture."""
+        kv_buffer = getattr(self.ctx.kv_cache, "_kv_buffer", None)
+        if kv_buffer is None:
+            raise RuntimeError("AFD perf mode requires a materialized MHA KV buffer")
+        with torch.no_grad():
+            kv_buffer.uniform_(-0.01, 0.01)
+            gdn_state = self.ctx.gdn_state_pool
+            if gdn_state is not None:
+                gdn_state.conv_state.uniform_(-0.01, 0.01)
+                gdn_state.recurrent_state.uniform_(-0.01, 0.01)
+        torch.cuda.synchronize(self.device)
+        logger.info_rank0(
+            "AFD perf mode randomized resident state: kv_elements=%d gdn=%s",
+            int(kv_buffer.numel()),
+            self.ctx.gdn_state_pool is not None,
+        )
 
     def _allocate_kv_storage(self, config: EngineConfig) -> torch.Tensor | None:
         if getattr(config, "afd_model_placement", "legacy") != "attn-only":

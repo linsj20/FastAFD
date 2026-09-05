@@ -30,6 +30,8 @@ AFD_MLP_EP_SIZE="${AFD_MLP_EP_SIZE:-4}"
 AFD_MOE_A2A_BACKEND="${AFD_MOE_A2A_BACKEND:-deepep}"
 AFD_MOE_RUNNER_BACKEND="${AFD_MOE_RUNNER_BACKEND:-deep_gemm}"
 AFD_MODEL_PLACEMENT="${AFD_MODEL_PLACEMENT:-legacy}"
+AFD_PERF_MODE="${AFD_PERF_MODE:-0}"
+AFD_PERF_CONTEXT_LEN="${AFD_PERF_CONTEXT_LEN:-$PROMPT_LEN}"
 
 AFD_BATCH_SIZE="${AFD_BATCH_SIZE:-$NUM_PROMPTS}"
 MINISGL_MAX_RUNNING_REQUESTS="${MINISGL_MAX_RUNNING_REQUESTS:-$NUM_PROMPTS}"
@@ -73,6 +75,21 @@ CAPTURE_WORKER_STOP_TIMEOUT_S="${CAPTURE_WORKER_STOP_TIMEOUT_S:-60}"
 CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S="${CAPTURE_SAMPLE_DURABILITY_TIMEOUT_S:-600}"
 
 [[ "$CAPTURE_EXIT_AFTER_WINDOW" == 0 || "$CAPTURE_EXIT_AFTER_WINDOW" == 1 ]]
+[[ "$AFD_PERF_MODE" == 0 || "$AFD_PERF_MODE" == 1 ]]
+if [[ "$AFD_PERF_MODE" == 1 ]]; then
+  [[ "$NSYS" == 1 ]] || {
+    echo "AFD_PERF_MODE=1 is profiling-only and requires NSYS=1" >&2
+    exit 2
+  }
+  [[ "$RUN_VLLM_ALIGNMENT" == 0 ]] || {
+    echo "AFD_PERF_MODE=1 cannot be used for alignment" >&2
+    exit 2
+  }
+  [[ "$AFD_PERF_CONTEXT_LEN" =~ ^[1-9][0-9]*$ ]] || {
+    echo "AFD_PERF_CONTEXT_LEN must be a positive integer" >&2
+    exit 2
+  }
+fi
 if [[ "$CAPTURE_EXIT_AFTER_WINDOW" == 1 ]]; then
   [[ "$NSYS" == 1 ]] || {
     echo "CAPTURE_EXIT_AFTER_WINDOW=1 requires NSYS=1" >&2
@@ -270,6 +287,8 @@ echo "  attn_dp/tp: $ATTN_DP_SIZE/$ATTN_TP_SIZE"
 echo "  mlp_dp/tp/ep: $MLP_DP_SIZE/$MLP_TP_SIZE/$AFD_MLP_EP_SIZE"
 echo "  graph_bs: $AFD_DECODE_GRAPH_BS"
 echo "  afd_num_mb: $AFD_NUM_MB"
+echo "  afd_perf_mode: $AFD_PERF_MODE"
+echo "  afd_perf_context_len: $AFD_PERF_CONTEXT_LEN"
 echo "  max_batched_tokens: $AFD_MAX_BATCHED_TOKENS"
 echo "  max_comm_tokens: ${MINISGL_AFD_MAX_COMM_TOKENS:-<auto>}"
 echo "  deepep_cpu_sync_disabled: ${MINISGL_AFD_DISABLE_DEEPEP_CPU_SYNC:-0}"
@@ -352,6 +371,9 @@ start_cmd=(
   --max-seq-len-override "$MINISGL_MAX_SEQ_LEN"
   --extra-args "$AFD_SERVER_EXTRA_ARGS"
 )
+if [[ "$AFD_PERF_MODE" == 1 ]]; then
+  start_cmd+=(--afd-perf-mode --afd-perf-context-len "$AFD_PERF_CONTEXT_LEN")
+fi
 if [[ "$NSYS" == "1" ]]; then
   export MINISGL_RAY_NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE"
   export MINISGL_RAY_NSYS_TARGET_BATCH_PER_DP="$NSYS_TARGET_BATCH_PER_ATTN_DP"
@@ -380,11 +402,24 @@ until curl -fsS "http://${SERVER_HOST}:${MINISGL_PORT}/v1/models" >/dev/null 2>&
 done
 echo "AFD ready: http://${SERVER_HOST}:${MINISGL_PORT}"
 
+SAMPLE_PROMPT_FILE="$PROMPT_FILE"
+if [[ "$AFD_PERF_MODE" == 1 ]]; then
+  SAMPLE_PROMPT_FILE="$RUN_DIR/perf_prompts.txt"
+  python - "$SAMPLE_PROMPT_FILE" "$NUM_PROMPTS" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+count = int(sys.argv[2])
+path.write_text("hello\n" * count, encoding="utf-8")
+PY
+fi
+
 sample_cmd=(
   python "$SCRIPT_ROOT/validate/compare_minisgl_vllm.py" sample
   --model "$MODEL_PATH"
   --minisgl-url "http://${SERVER_HOST}:${MINISGL_PORT}"
-  --prompt-file "$PROMPT_FILE"
+  --prompt-file "$SAMPLE_PROMPT_FILE"
   --prompt-repeat 1
   --max-tokens "$MAX_TOKENS"
   --temperature 0

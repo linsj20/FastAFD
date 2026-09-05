@@ -138,6 +138,7 @@ def startup_afd_workers(coord: Any) -> None:
         "async_pending_steps": int(coord.async_pending_steps),
         "afd_num_mb": coord.afd_num_mb,
         "model_placement": coord.server_args.afd_model_placement,
+        "perf_mode": bool(coord.server_args.afd_perf_mode),
         "rpc_timeout_ms": coord._rpc_timeout_ms,
         "moe_a2a_backend": coord.server_args.afd_moe_a2a_backend,
         "moe_runner_backend": coord.server_args.afd_moe_runner_backend,

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 import torch
+
+from minisgl.core import SamplingParams
+from minisgl.message import UserMsg
+from minisgl.afd_attention_runtime import AfdAttentionRuntime
 
 from minisgl.afd_fmha_protocol import (
     AfdTpSliceTable,
@@ -19,7 +24,113 @@ from minisgl.afd_protocol import (
     AfdTopology,
     build_two_lane_pipeline_actions,
 )
-from minisgl.afd_scheduler import _balanced_microbatch_counts
+from minisgl.afd_scheduler import CentralizedAfdDpScheduler, _balanced_microbatch_counts
+
+
+class AfdPerfModeTest(unittest.TestCase):
+    @staticmethod
+    def _scheduler(*, num_pages: int = 20) -> CentralizedAfdDpScheduler:
+        return CentralizedAfdDpScheduler(
+            dp_rank=0,
+            max_running_req=4,
+            max_seq_len=256,
+            num_pages=num_pages,
+            page_size=64,
+            prefill_budget=32,
+            decode_graph_bs=(2,),
+            cuda_graph_max_bs=2,
+            afd_num_mb=1,
+            mlp_fanout=1,
+            eos_token_id=1,
+        )
+
+    @staticmethod
+    def _messages() -> list[UserMsg]:
+        return [
+            UserMsg(
+                uid=uid,
+                input_ids=torch.tensor([11, 12], dtype=torch.int32),
+                sampling_params=SamplingParams(ignore_eos=True, max_tokens=17),
+            )
+            for uid in (10, 11)
+        ]
+
+    def test_perf_requests_start_in_decode_at_logical_context(self) -> None:
+        scheduler = self._scheduler()
+
+        scheduler.add_perf_reqs(self._messages(), context_len=128)
+
+        self.assertFalse(scheduler.prefill_manager.runnable)
+        self.assertEqual(scheduler.live_request_count(), 2)
+        self.assertEqual(len(scheduler.cache_manager.free_slots), 16)
+        scheduled = scheduler.schedule_step(1, phase="decode")
+        self.assertIsNotNone(scheduled)
+        plan, batch = scheduled
+        self.assertEqual([req.cached_len for req in batch.reqs], [127, 127])
+        self.assertEqual([req.device_len for req in batch.reqs], [128, 128])
+        self.assertEqual([req.max_device_len for req in batch.reqs], [145, 145])
+        self.assertEqual(plan.exec_start_positions, (127, 127))
+        self.assertEqual(plan.exec_extend_lens, (1, 1))
+
+    def test_perf_request_capacity_check_is_atomic(self) -> None:
+        scheduler = self._scheduler(num_pages=4)
+
+        with self.assertRaisesRegex(RuntimeError, "including generation"):
+            scheduler.add_perf_reqs(self._messages(), context_len=128)
+
+        self.assertEqual(scheduler.table_manager.available_size, 4)
+        self.assertEqual(len(scheduler.cache_manager.free_slots), 4)
+        self.assertFalse(scheduler.decode_manager.runnable)
+
+    def test_perf_duplicate_uid_check_is_atomic(self) -> None:
+        scheduler = self._scheduler()
+        messages = self._messages()
+        messages[1].uid = messages[0].uid
+
+        with self.assertRaisesRegex(RuntimeError, "already resident"):
+            scheduler.add_perf_reqs(messages, context_len=128)
+
+        self.assertEqual(scheduler.table_manager.available_size, 4)
+        self.assertEqual(len(scheduler.cache_manager.free_slots), 20)
+        self.assertFalse(scheduler.decode_manager.runnable)
+
+    def test_worker_materializes_nonzero_history_once(self) -> None:
+        runtime = object.__new__(AfdAttentionRuntime)
+        runtime._table_cached_len = {}
+        runtime._table_reqs = {}
+        runtime._req_input_ids = torch.empty(1, dtype=torch.int32)
+        allocations = []
+        runtime._allocate_req_pages = lambda req: allocations.append(
+            (int(req.cached_len), int(req.device_len))
+        )
+
+        first = runtime._make_stateful_req(3, 1, 127)
+        second = runtime._make_stateful_req(3, 1, 128)
+
+        self.assertIs(first, second)
+        self.assertEqual(allocations, [(0, 128), (128, 129)])
+        self.assertEqual((second.cached_len, second.device_len), (128, 129))
+        with self.assertRaisesRegex(RuntimeError, "diverged"):
+            runtime._make_stateful_req(3, 1, 130)
+
+    def test_plan_sample_indices_map_real_request_start_positions(self) -> None:
+        runtime = object.__new__(AfdAttentionRuntime)
+        calls = []
+        runtime._make_stateful_req = lambda table, length, start: calls.append(
+            (table, length, start)
+        ) or SimpleNamespace(table_idx=table)
+        runtime._build_padded_reqs = lambda plan, real: list(real)
+        plan = SimpleNamespace(
+            real_size=2,
+            table_indices=(4, 5),
+            extend_lens=(1, 1),
+            exec_start_positions=(23, 999, 17),
+            exec_sample_indices=(1, -1, 0),
+        )
+
+        runtime._materialize_reqs(plan)
+
+        self.assertEqual(calls, [(4, 1, 17), (5, 1, 23)])
 
 
 class AfdFmhaProtocolTest(unittest.TestCase):

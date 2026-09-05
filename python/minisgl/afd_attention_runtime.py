@@ -320,11 +320,26 @@ class AfdAttentionRuntime:
         return batch
 
     def _materialize_reqs(self, plan: AfdAGStepPlan) -> tuple[list[Req], list[Req]]:
+        start_positions: list[int | None] = [None] * int(plan.real_size)
+        for start_pos, sample_index in zip(
+            plan.exec_start_positions,
+            plan.exec_sample_indices,
+            strict=True,
+        ):
+            sample_index = int(sample_index)
+            if sample_index >= 0:
+                start_positions[sample_index] = int(start_pos)
+        if any(start is None for start in start_positions):
+            raise RuntimeError(
+                "AFD plan is missing a start position for a real request: "
+                f"real_size={int(plan.real_size)} starts={start_positions}"
+            )
         real_reqs = [
-            self._make_stateful_req(table_idx, extend_len)
-            for table_idx, extend_len in zip(
+            self._make_stateful_req(table_idx, extend_len, int(start_pos))
+            for table_idx, extend_len, start_pos in zip(
                 plan.table_indices,
                 plan.extend_lens,
+                start_positions,
                 strict=True,
             )
         ]
@@ -458,10 +473,23 @@ class AfdAttentionRuntime:
             return padded_reqs
         return None
 
-    def _make_stateful_req(self, table_idx: int, extend_len: int) -> Req:
+    def _make_stateful_req(
+        self,
+        table_idx: int,
+        extend_len: int,
+        expected_start: int,
+    ) -> Req:
         table_idx = int(table_idx)
         extend_len = int(extend_len)
-        cached_len = self._table_cached_len.get(table_idx, 0)
+        expected_start = int(expected_start)
+        cached_len = self._table_cached_len.get(table_idx)
+        if cached_len is not None and cached_len != expected_start:
+            raise RuntimeError(
+                "AFD worker request state diverged from the coordinator plan: "
+                f"table_idx={table_idx} local_cached_len={cached_len} "
+                f"plan_start={expected_start}"
+            )
+        cached_len = expected_start
         device_len = cached_len + extend_len
         req = self._table_reqs.get(table_idx)
         if req is None:
@@ -475,10 +503,21 @@ class AfdAttentionRuntime:
                 cache_handle=NaiveCacheHandle(),
             )
             self._table_reqs[table_idx] = req
-        req.cached_len = cached_len
+            # A perf-mode request first appears at a nonzero logical position.
+            # Allocate its complete resident history before restoring the
+            # one-token decode extent represented by the plan.
+            req.cached_len = 0
+            req.device_len = device_len
+            req.max_device_len = device_len + 1
+            self._allocate_req_pages(req)
+        else:
+            req.cached_len = expected_start
+            req.device_len = device_len
+            req.max_device_len = device_len + 1
+            self._allocate_req_pages(req)
+        req.cached_len = expected_start
         req.device_len = device_len
         req.max_device_len = device_len + 1
-        self._allocate_req_pages(req)
         self._table_cached_len[table_idx] = device_len
         return req
 

@@ -27,7 +27,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertLess(normal_start, topk_start)
         self.assertLess(topk_start, perfect_start)
         self.assertIn("GEMM, softmax, and top-k work above remains unchanged", select)
+        self.assertIn("(num_experts - 1)", select)
+        self.assertNotIn("lane) % num_experts", select)
         self.assertIn("perfect balance requires route preparation", kernel)
+        self.assertIn(
+            "perfect balance requires a power-of-two expert count", kernel
+        )
         self.assertIn("inline constexpr int kMaxExperts = 512", kernel)
         self.assertIn("num_mtiles * num_expert_splits", kernel)
 

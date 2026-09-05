@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace {
@@ -367,12 +368,14 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
                                        ? num_tokens
                                        : min(static_cast<int>(valid_token_count[0]),
                                              num_tokens);
-          // Replace the original expert-id finalization in place. The normal
-          // GEMM, softmax, and top-k work above remains unchanged, and there is
-          // no extra kernel, graph node, synchronization, copy, or runtime branch.
-          my_expert = static_cast<int>(
-              ((static_cast<int64_t>(route_rank) * valid_tokens + token) * topk +
-               lane) % num_experts);
+          // Replace the original expert-id finalization in place. Perfect mode
+          // admits only power-of-two expert counts, so the balanced sequence
+          // uses 32-bit multiply/add/mask arithmetic rather than a division.
+          // The normal GEMM, softmax, and top-k work above remains unchanged,
+          // with no extra kernel, graph node, synchronization, copy, or
+          // device-side runtime branch.
+          my_expert = ((route_rank * valid_tokens + token) * topk + lane) &
+                      (num_experts - 1);
         } else {
           my_expert = wbi * kWarpSize + static_cast<int>(src);
         }
@@ -582,6 +585,13 @@ struct GateTopkFusedKernel {
                  "rank-ready publication requires route preparation");
     RuntimeCheck(prepare_routes || !perfect_balance,
                  "perfect balance requires route preparation");
+    RuntimeCheck(!perfect_balance ||
+                     (experts > 0 && (experts & (experts - 1)) == 0),
+                 "perfect balance requires a power-of-two expert count");
+    RuntimeCheck(!perfect_balance ||
+                     static_cast<int64_t>(route_num_ranks) * rows * topk_value <=
+                         std::numeric_limits<int>::max(),
+                 "perfect balance route sequence exceeds int32 range");
     if (prepare_routes) {
       TensorMatcher({-1})
           .with_device<kDLCUDA>(device_ref)

@@ -240,6 +240,68 @@ class CentralizedAfdDpScheduler:
     def add_reqs(self, msgs: list[UserMsg]) -> None:
         self.prefill_manager.add_reqs(msgs)
 
+    def add_perf_reqs(self, msgs: list[UserMsg], *, context_len: int) -> None:
+        """Install profiling requests directly in decode with resident KV pages."""
+        context_len = int(context_len)
+        if context_len <= 0 or context_len >= self.max_seq_len:
+            raise RuntimeError(
+                "AFD perf context must be within the scheduler sequence limit: "
+                f"context={context_len} max_seq_len={self.max_seq_len}"
+            )
+        if len(msgs) > self.table_manager.available_size:
+            raise RuntimeError(
+                "AFD perf request batch exceeds the free request-table capacity: "
+                f"requested={len(msgs)} free={self.table_manager.available_size}"
+            )
+        existing_uids = self.decode_manager.running_reqs
+        incoming_uids: set[int] = set()
+        for msg in msgs:
+            uid = int(msg.uid)
+            output_len = int(msg.sampling_params.max_tokens)
+            if uid in existing_uids or uid in incoming_uids:
+                raise RuntimeError(f"AFD perf request uid is already resident: {uid}")
+            incoming_uids.add(uid)
+            if output_len <= 0 or context_len + output_len > self.max_seq_len:
+                raise RuntimeError(
+                    "AFD perf request does not fit the configured sequence length: "
+                    f"uid={uid} context={context_len} "
+                    f"output={output_len} max_seq_len={self.max_seq_len}"
+                )
+        required_pages = sum(
+            div_ceil(
+                context_len + int(msg.sampling_params.max_tokens),
+                self.cache_manager.page_size,
+            )
+            for msg in msgs
+        )
+        if required_pages > len(self.cache_manager.free_slots):
+            raise RuntimeError(
+                "AFD perf request batch exceeds KV capacity including generation: "
+                f"required_pages={required_pages} "
+                f"free_pages={len(self.cache_manager.free_slots)}"
+            )
+
+        reqs: list[Req] = []
+        for msg in msgs:
+            output_len = int(msg.sampling_params.max_tokens)
+            table_idx = self.table_manager.allocate()
+            req = Req(
+                input_ids=torch.tensor([0], dtype=torch.int32),
+                table_idx=table_idx,
+                cached_len=0,
+                output_len=output_len,
+                uid=int(msg.uid),
+                sampling_params=msg.sampling_params,
+                cache_handle=NaiveCacheHandle(),
+            )
+            req.device_len = context_len
+            req.max_device_len = context_len + output_len
+            self.cache_manager.allocate_paged([req])
+            req.cached_len = context_len - 1
+            req.afd_completed_device_len = context_len
+            reqs.append(req)
+        self.decode_manager.filter_reqs(reqs)
+
     def abort_req(self, uid: int) -> tuple[int, ...]:
         req_to_free = self.prefill_manager.abort_req(int(uid))
         req_to_free = req_to_free or self.decode_manager.abort_req(int(uid))

@@ -124,6 +124,7 @@ class BaseAfdWorker:
         async_pending_steps: int = 3,
         afd_num_mb: int = 1,
         model_placement: str = "legacy",
+        perf_mode: bool = False,
         rpc_timeout_ms: int = 300_000,
         attn_dp_rank: int = 0,
         attn_dp_size: int = 1,
@@ -223,6 +224,7 @@ class BaseAfdWorker:
             self.model_placement = "attn-only"
         if self.model_placement not in ("legacy", "attn-only"):
             raise ValueError(f"unsupported AFD model placement {self.model_placement!r}")
+        self.perf_mode = bool(perf_mode)
         self._control_profile_start_step = int(
             os.environ.get("MINISGL_AFD_CONTROL_PROFILE_START_STEP", "0") or 0
         )
@@ -317,6 +319,7 @@ class BaseAfdWorker:
             afd_moe_runner_backend=str(moe_runner_backend),
             afd_model_placement=self.model_placement,
             afd_max_comm_tokens=self.max_comm_tokens,
+            afd_perf_mode=self.perf_mode,
         )
         self.runtime = self._create_runtime(config)
         self.runtime_state = getattr(self.runtime, "state", self.runtime)
@@ -349,6 +352,7 @@ class BaseAfdWorker:
             f"device_comm_num_sms={self.device_comm_num_sms} "
             f"afd_num_mb={self.afd_num_mb} "
             f"model_placement={self.model_placement} "
+            f"perf_mode={int(self.perf_mode)} "
             f"disable_overlap={self.disable_overlap} "
             f"async_pending_steps={self.async_pending_steps} "
             f"async_retire_depth={self.async_retire_depth} "

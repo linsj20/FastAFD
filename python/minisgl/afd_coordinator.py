@@ -63,6 +63,7 @@ from .afd_support import (
     flush_log_lines,
     log_line,
     normalize_attention_backend_page_size,
+    resolve_afd_moe_backend,
 )
 from .afd_profiler import (
     finish_nsys_runtime_capture_step_launch,
@@ -137,6 +138,18 @@ class AfdCoordinator:
         self.async_pending_steps = max(
             2, int(server_args.afd_async_pending_steps)
         )
+        self.perf_mode = bool(server_args.afd_perf_mode)
+        self.perf_context_len = int(server_args.afd_perf_context_len)
+        if self.perf_mode:
+            if server_args.afd_model_placement != "attn-only":
+                raise RuntimeError("AFD perf mode requires attn-only placement")
+            if resolve_afd_moe_backend(server_args.afd_model_placement) != "megamoe":
+                raise RuntimeError("AFD perf mode requires the same-rank MegaMoE backend")
+            # Perfect routing is a compile-time expert-ID substitution inside
+            # the normal fused gate kernel. Its 32-bit multiply/add/mask ID
+            # arithmetic adds no division or execution stage; gate GEMM/top-k
+            # and every downstream dispatch/expert/combine kernel remain.
+            os.environ["MINISGL_AFD_PERFECT_ROUTING"] = "1"
         if str(server_args.cache_type) != "naive":
             raise RuntimeError(
                 "AFD serve uses the centralized scheduler and currently supports only cache_type='naive'"
@@ -530,6 +543,8 @@ class AfdCoordinator:
             f"decode_graph_bs={list(self.decode_graph_bs)} "
             f"disable_overlap={bool(self.server_args.afd_disable_overlap)} "
             f"async_pending_steps={self.async_pending_steps} "
+            f"perf_mode={int(self.perf_mode)} "
+            f"perf_context_len={self.perf_context_len} "
             f"centralized_scheduler=True",
             flush=True,
         )
@@ -829,19 +844,43 @@ class AfdCoordinator:
     def _process_user_msgs(self, msgs: list[UserMsg]) -> None:
         by_dp: dict[int, list[UserMsg]] = {}
         for msg in msgs:
-            if not _prepare_user_msg(
-                msg=msg,
-                max_seq_len=self.max_seq_len,
-                warn=logger.warning,
-            ):
-                continue
+            if self.perf_mode:
+                output_len = int(msg.sampling_params.max_tokens)
+                if self.perf_context_len + output_len > self.max_seq_len:
+                    raise RuntimeError(
+                        "AFD perf request exceeds the runtime sequence limit: "
+                        f"uid={int(msg.uid)} context={self.perf_context_len} "
+                        f"output={output_len} max_seq_len={self.max_seq_len}"
+                    )
+            else:
+                if not _prepare_user_msg(
+                    msg=msg,
+                    max_seq_len=self.max_seq_len,
+                    warn=logger.warning,
+                ):
+                    continue
             dp_rank = self._next_attn_dp_rr % self._layout.attn_dp_size
             self._next_attn_dp_rr += 1
             self._uid_to_attn_dp[int(msg.uid)] = int(dp_rank)
             by_dp.setdefault(int(dp_rank), []).append(msg)
 
         for dp_rank in sorted(by_dp):
-            self._central_schedulers[dp_rank].add_reqs(by_dp[dp_rank])
+            scheduler = self._central_schedulers[dp_rank]
+            if self.perf_mode:
+                scheduler.add_perf_reqs(
+                    by_dp[dp_rank],
+                    context_len=self.perf_context_len,
+                )
+                log_line(
+                    self.log_path,
+                    "[afd-coordinator] perf_decode_seeded "
+                    f"dp_rank={dp_rank} added={len(by_dp[dp_rank])} "
+                    f"resident={scheduler.live_request_count()} "
+                    f"context_len={self.perf_context_len}",
+                    flush=True,
+                )
+            else:
+                scheduler.add_reqs(by_dp[dp_rank])
 
     def _process_abort_msg(
         self,

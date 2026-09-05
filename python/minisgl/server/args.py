@@ -68,6 +68,8 @@ class ServerArgs(SchedulerConfig):
     afd_force_multi_mb_graph_overlap: bool = False
     afd_num_mb: int = 1
     afd_model_placement: str = "legacy"
+    afd_perf_mode: bool = False
+    afd_perf_context_len: int = 0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -732,6 +734,27 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         ),
     )
 
+    parser.add_argument(
+        "--afd-perf-mode",
+        action="store_true",
+        default=ServerArgs.afd_perf_mode,
+        help=(
+            "Skip AFD prefill and materialize incoming requests directly as "
+            "decode requests backed by randomized KV/GDN state. This is an "
+            "opt-in profiling mode; normal serving and alignment are unchanged."
+        ),
+    )
+
+    parser.add_argument(
+        "--afd-perf-context-len",
+        type=int,
+        default=ServerArgs.afd_perf_context_len,
+        help=(
+            "Logical resident context length used by --afd-perf-mode. Must be "
+            "positive in perf mode and leave room for --afd-max-new-tokens."
+        ),
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
     if kwargs["afd_model_placement"] == "fmha-only":
@@ -797,6 +820,25 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
                 "flashinfer_nvfp4"
                 if _hf_config_uses_modelopt_nvfp4(hf_config)
                 else "deep_gemm"
+            )
+    if bool(kwargs["afd_perf_mode"]):
+        if kwargs["mode"] != "afd-serve":
+            parser.error("--afd-perf-mode requires --mode afd-serve")
+        perf_context_len = int(kwargs["afd_perf_context_len"])
+        if perf_context_len <= 0:
+            parser.error("--afd-perf-context-len must be positive in AFD perf mode")
+        max_seq_len_override = int(kwargs["max_seq_len_override"] or 0)
+        if (
+            max_seq_len_override > 0
+            and perf_context_len + int(kwargs["afd_max_new_tokens"])
+            > max_seq_len_override
+        ):
+            parser.error(
+                "AFD perf context plus generated tokens exceeds the configured "
+                "maximum sequence length: "
+                f"context={perf_context_len} "
+                f"output={int(kwargs['afd_max_new_tokens'])} "
+                f"max_seq_len={max_seq_len_override}"
             )
     if kwargs["cuda_graph_max_bs"] is None and not kwargs["afd_decode_graph_bs"]:
         cap = (
