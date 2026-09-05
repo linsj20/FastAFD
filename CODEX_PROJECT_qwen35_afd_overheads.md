@@ -193,6 +193,11 @@ was enabled.
   EP4 rank but only the first 32 of Qwen3.5's 128. The warp now strides by 32
   across every local expert while retaining the same shared-memory layout,
   kernel specialization, and launch count.
+- Corrected production-shape job `6932099` completed `0:0` in 2:39. Ordinary
+  and route-prepared/rank-ready batch-19/512-expert/top-k-10 FP8 paths now both
+  match the explicit reference at cosine 0.999913871 and maximum absolute
+  error 22.537384; the exact graph case exercised 103 active experts and
+  finite output. This is the required kernel-level proof before repeating A1.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
