@@ -223,7 +223,9 @@ was enabled.
   layers. The explicit graph-safe kernel now mirrors the generated production
   specialization. The existing gate graph smoke compares it bitwise against
   `torch.compile` at the actual decode shape `[19,64,128]` before and after
-  CUDA-graph capture; run this focused proof before another full model.
+  CUDA-graph capture. HSG job `6934956` completed `0:0` in 1:26 and passed that
+  exact check, including graph replay. This validates the arithmetic-preserving
+  graph-safe replacement before the current-source full-model reruns.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
@@ -241,8 +243,8 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: run the gated-RMSNorm bitwise/graph smoke, then rerun strict normal-routing
-legacy and attn-only A1 alignment at exact batch 37 from the same corrected
-source. If both pass, complete normal-routing legacy and attn-only A3 alignment.
-Only after correctness passes, capture perfect-balanced FP4 attn-only A1/A3
-Nsight reports and copy both report sets into the local workspace scratch tree.
+Next: rerun strict normal-routing legacy and attn-only A1 alignment at exact
+batch 37 from the same corrected source. If both pass, complete normal-routing
+legacy and attn-only A3 alignment. Only after correctness passes, capture
+perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
+into the local workspace scratch tree.
