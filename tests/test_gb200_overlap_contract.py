@@ -865,6 +865,8 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("MEGAMOE_SMOKE_SPECIALIZATION_MODES", smoke_source)
         self.assertIn("MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES", smoke_source)
         self.assertIn("MEGAMOE_SMOKE_NUM_EXPERTS", smoke_source)
+        self.assertIn("MEGAMOE_NUMERIC_NUM_EXPERTS", smoke_source)
+        self.assertIn("MEGAMOE_NUMERIC_TOP_K", smoke_source)
         self.assertIn("world_size not in (4, 8)", smoke_source)
         self.assertIn("MegaMoE specialization is not bitwise equal", smoke_source)
         self.assertIn("hidden_views", smoke_source)

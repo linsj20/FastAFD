@@ -329,9 +329,27 @@ def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]
             "MEGAMOE_NUMERIC_BUCKETS must all cover the largest numeric row count"
         )
 
-    hidden, intermediate = 1024, 512
-    local_experts, top_k = 2, 2
-    num_experts = local_experts * world_size
+    hidden = int(os.environ.get("MEGAMOE_NUMERIC_HIDDEN", "1024"))
+    intermediate = int(os.environ.get("MEGAMOE_NUMERIC_INTERMEDIATE", "512"))
+    num_experts = int(os.environ.get(
+        "MEGAMOE_NUMERIC_NUM_EXPERTS", str(2 * world_size)
+    ))
+    top_k = int(os.environ.get("MEGAMOE_NUMERIC_TOP_K", "2"))
+    if hidden % 512 or intermediate % 512:
+        raise RuntimeError(
+            "MegaMoE numeric dimensions must be divisible by 512: "
+            f"hidden={hidden} intermediate={intermediate}"
+        )
+    if num_experts <= 0 or num_experts % world_size:
+        raise RuntimeError(
+            "MEGAMOE_NUMERIC_NUM_EXPERTS must be positive and divisible by "
+            f"world_size={world_size}, got {num_experts}"
+        )
+    if not 0 < top_k <= num_experts:
+        raise RuntimeError(
+            f"MEGAMOE_NUMERIC_TOP_K must be in [1, {num_experts}], got {top_k}"
+        )
+    local_experts = num_experts // world_size
     l1, l2, transformed = _make_weights(local_experts, hidden, intermediate)
     hidden_states = torch.randn(
         (max(row_counts), hidden), dtype=torch.bfloat16, device="cuda"

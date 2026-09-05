@@ -175,6 +175,16 @@ was enabled.
   0.999747--0.999896; the exact target case produced finite output with 14
   active experts. This validates the selectable FP8 kernel and weight layout
   before another full 397B run.
+- Full FP8 attn-only A1 sample job `6931009` captured its graphs and produced
+  all 148x17 tokens at exact batch 37; its exit 3 again followed sample
+  publication and reflects only the absent optional coordinator CPU trace.
+  Unchanged strict score job `6931595` failed at top-1 0.15382, top-10
+  0.50437, and top-100 0.68005. This is close to the FP4 failure and disproves
+  expert precision as the primary cause. FP4 and FP8 attn-only streams agree
+  on 22.06% of generated IDs but neither agrees with legacy at token zero.
+  The reusable same-rank smoke is therefore parameterized to reference-check
+  the actual batch-19/512-expert/top-k-10 production specialization next;
+  its earlier target-shape check only established routing reach and finiteness.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
