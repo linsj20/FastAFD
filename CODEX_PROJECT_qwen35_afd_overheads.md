@@ -100,12 +100,18 @@ was enabled.
   0.127328 ms for its single timing iteration. The failed parent allocation
   from `6925717` lingered after its step failure and was explicitly canceled
   before the corrected job ran.
+- Normal-routing HSG job `6925879` completed `0:0` in 1:49 with the same
+  target shape. Its controlled monotonic gate first selected expert IDs
+  511--502, proving the fused selector covers the full 512-expert range, then
+  the route-prepared FP8xFP4 graph case completed with finite output.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
-  A direct-launch dry run resolves the provisional A1 point to 45 requests per
-  attention-DP lane, 180 prompts, 22+23 MB2 split, four attention plus four
-  EP4 model GPUs on two trays. This is only the planning estimate; the runtime
-  page-count gate remains the maximum-batch authority.
+  Direct-launch dry runs resolve the provisional A1 point to 45 requests per
+  attention-DP lane, 180 prompts, four attention plus four EP4 model GPUs on
+  two trays, normal routing, and the unchanged strict vLLM scorer. Legacy uses
+  its established 23+22 MB2 order; attn-only uses 22+23. This is only the
+  planning estimate; the runtime page-count gate remains the placement-specific
+  maximum-batch authority.
 - The earlier 122B snapshot completed but was superseded by the user's 397B
   selection and remains intact. The pinned 397B repository contains
   406,125,181,280 bytes of model tensors across 94 shards (406,198,638,888
