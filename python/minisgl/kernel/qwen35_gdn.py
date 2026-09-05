@@ -375,17 +375,23 @@ def _qwen35_rmsnorm_gated_kernel(
     weight_ptr,
     out_ptr,
     eps: tl.constexpr,
+    rows: tl.constexpr,
     width: tl.constexpr,
+    row_block: tl.constexpr,
     block: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, block)
-    mask = offsets < width
+    row = tl.program_id(0) * row_block + tl.arange(0, row_block)[:, None]
+    offsets = tl.arange(0, block)[None, :]
+    mask = (row < rows) & (offsets < width)
     x = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
     z = tl.load(z_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / width + eps)
-    out = x * inv_rms * weight * z * tl.sigmoid(z)
+    weight = tl.load(weight_ptr + offsets, mask=offsets < width, other=0.0).to(
+        tl.float32
+    )
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1)[:, None] / width + eps)
+    normalized = x * inv_rms * weight
+    gate = z * tl.sigmoid(z)
+    out = normalized * gate
     tl.store(
         out_ptr + row * width + offsets,
         out.to(out_ptr.dtype.element_ty),
@@ -416,15 +422,19 @@ def qwen35_rmsnorm_gated(
         raise ValueError("Qwen3.5 gated RMSNorm requires contiguous inputs")
     out = torch.empty_like(x)
     width = int(x.shape[-1])
-    _qwen35_rmsnorm_gated_kernel[(x.numel() // width,)](
+    rows = x.numel() // width
+    row_block = 2
+    _qwen35_rmsnorm_gated_kernel[(triton.cdiv(rows, row_block),)](
         x,
         z,
         weight,
         out,
         eps=float(eps),
+        rows=rows,
         width=width,
+        row_block=row_block,
         block=triton.next_power_of_2(width),
-        num_warps=4,
+        num_warps=2,
     )
     return out
 

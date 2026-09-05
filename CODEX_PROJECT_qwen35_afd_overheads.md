@@ -208,6 +208,22 @@ was enabled.
   Strict attn-only alignment therefore uses normal-routing DeepEP with the
   checkpoint FP8 arithmetic, while requested perfect-balanced Nsight traces
   retain same-rank FP4 MegaMoE.
+- Normal-routing DeepEP attn-only sample job `6933383` produced all 148x17
+  tokens and improved exact sequence agreement with the passing legacy sample
+  to 139/148. Its unchanged strict scorer job `6934407` still failed: top-1
+  0.9888712, top-10 0.9968203, top-100 0.9992051, mean rank 1.28537, and
+  maximum rank 315 across all 2,516 generated tokens. This leaves eight top-10
+  misses and proves the residual is backend-independent; the top-10=1.0 gate
+  remains unchanged.
+- The passing legacy sample predates the explicit Qwen3.5 gated-RMSNorm Triton
+  kernel. The retained Inductor artifact from failed graph-capture job
+  `6928456` shows its old fused kernel used a two-row reduction tile with two
+  warps and formed the SiLU gate separately. The replacement used one row and
+  four warps, changing FP32 reduction and multiply order in all 45 linear
+  layers. The explicit graph-safe kernel now mirrors the generated production
+  specialization. The existing gate graph smoke compares it bitwise against
+  `torch.compile` at the actual decode shape `[19,64,128]` before and after
+  CUDA-graph capture; run this focused proof before another full model.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
@@ -225,8 +241,8 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: validate target-shape FP8 same-rank MegaMoE, rerun strict normal-routing
-attn-only A1 alignment at exact batch 37, then complete normal-routing legacy
-and attn-only A3 alignment. Only after correctness passes, capture
-perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
-into the local workspace scratch tree.
+Next: run the gated-RMSNorm bitwise/graph smoke, then rerun strict normal-routing
+legacy and attn-only A1 alignment at exact batch 37 from the same corrected
+source. If both pass, complete normal-routing legacy and attn-only A3 alignment.
+Only after correctness passes, capture perfect-balanced FP4 attn-only A1/A3
+Nsight reports and copy both report sets into the local workspace scratch tree.
