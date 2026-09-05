@@ -104,6 +104,15 @@ was enabled.
   target shape. Its controlled monotonic gate first selected expert IDs
   511--502, proving the fused selector covers the full 512-expert range, then
   the route-prepared FP8xFP4 graph case completed with finite output.
+- Normal-routing A1 capacity probes `6927848` (legacy) and `6927850`
+  (`attn-only`) independently measured the same conservative allocation
+  minimum: 4,970,176 KV tokens per attention-DP worker and exact 128K batch 37.
+  The first exact reruns `6927904`/`6927907` exposed that runtime sizing dropped
+  the explicit 77,659-page override, allowing a different allocation to create
+  78,440 pages and demand batch 38. `build_runtime_sizing` now carries
+  `ServerArgs.num_page_override` into each attention worker; a pinned-environment
+  targeted check confirms that 77,659 is retained. This is capacity plumbing
+  only and does not alter prompts, model computation, or alignment scoring.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per

@@ -311,6 +311,7 @@ class AfdCoordinator:
             afd_max_running_req=int(self.server_args.afd_max_running_req),
             max_batched_tokens=self.max_batched_tokens,
             afd_num_mb=int(self.server_args.afd_num_mb),
+            num_page_override=self.server_args.num_page_override,
         )
         self.decode_graph_bs = sizing.decode_graph_bs
         if sizing.requested_graph_bs and not self.decode_graph_bs:

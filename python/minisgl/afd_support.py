@@ -667,6 +667,7 @@ def build_runtime_sizing(
     afd_max_running_req: int,
     max_batched_tokens: int,
     afd_num_mb: int,
+    num_page_override: int | None,
 ) -> AfdRuntimeSizing:
     num_mb = max(1, int(afd_num_mb))
     requested_graph_bs = _normalize_decode_graph_bs(
@@ -694,7 +695,6 @@ def build_runtime_sizing(
     )
     # vLLM-aligned: leave KV cache memory-bound by default. Explicit
     # `--num-pages` still flows through EngineConfig.num_page_override.
-    num_page_override = None
     # max_comm_tokens sizes the AFD n2m staging buffer in tokens. Prefill can
     # send up to max_batched_tokens; decode graph can send up to max_graph_bs
     # one-token requests. Some grouped-routing models can send more route copies
