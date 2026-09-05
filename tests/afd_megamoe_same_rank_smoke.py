@@ -587,6 +587,33 @@ def _exact_qwen_case(
             "MEGAMOE_SMOKE_NUM_EXPERTS must be positive and divisible by "
             f"world_size={world_size}, got {num_experts}"
         )
+    if not 0 < top_k <= num_experts:
+        raise RuntimeError(
+            f"MEGAMOE_SMOKE_TOP_K must be in [1, {num_experts}], got {top_k}"
+        )
+    probe_hidden = torch.ones((1, hidden), dtype=torch.bfloat16, device="cuda")
+    probe_gate = (
+        torch.exp2(
+            torch.arange(num_experts, dtype=torch.float32, device="cuda") / 64
+        )
+        .to(torch.bfloat16)[:, None]
+        .expand(num_experts, hidden)
+        .contiguous()
+    )
+    probe_ids, _ = gate_topk(probe_hidden, probe_gate, top_k, renormalize=True)
+    expected_probe_ids = torch.arange(
+        num_experts - 1,
+        num_experts - top_k - 1,
+        -1,
+        dtype=probe_ids.dtype,
+        device=probe_ids.device,
+    )[None]
+    if not torch.equal(probe_ids, expected_probe_ids):
+        raise RuntimeError(
+            "normal fused router did not select the controlled highest experts: "
+            f"got={probe_ids.tolist()} expected={expected_probe_ids.tolist()}"
+        )
+    del probe_hidden, probe_gate, probe_ids, expected_probe_ids
     local_experts = num_experts // world_size
     _l1, _l2, transformed = _make_weights(local_experts, hidden, intermediate)
     del _l1, _l2
