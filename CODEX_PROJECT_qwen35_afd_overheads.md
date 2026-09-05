@@ -349,10 +349,19 @@ was enabled.
   value of zero. Both retain batch 37 per attention lane, MB2 `18+19`, exact
   128K logical context, capacity 4,970,176, and one warmup plus exactly 15
   measured decode launches.
+- One-tray router smoke `6938500` compiled the modified CUDA extension, then
+  failed before its exact case because the submission over-reduced an unrelated
+  numeric helper to hidden size 512 although fused quantization requires a
+  multiple of 1,024. Corrected job `6938580` used the exact 397B router shape
+  (hidden 4,096, intermediate 1,024, 512 experts, top-k 10, EP4), perfect
+  routing, FP4 expert weights, and prepared/rank-ready execution. It completed
+  `0:0` in 1:21: both compact numeric controls passed at cosine
+  0.999939--0.999986, and the exact batch-19 case produced finite output with
+  all 128 local experts active. The CUDA/JIT and balanced-ID paths are therefore
+  validated before any multi-node full-model trace.
 
-Next: rerun the focused contracts including duplicate-UID atomicity, then run
-zero-GPU source/model validation. Submit only the FP4 perf-mode A1 trace first;
-monitor manually at 5/15-minute intervals and treat a 50-minute execution as
-suspicious. Submit A3 only after A1 completes the exact 15-step trace contract.
+Next: submit only the FP4 perf-mode A1 trace first; monitor manually at
+5/15-minute intervals and treat a 50-minute execution as suspicious. Submit A3
+only after A1 completes the exact 15-step trace contract.
 Copy both report sets into the local workspace scratch tree, then propagate the
 validated candidate source to the untouched primary current branch.
