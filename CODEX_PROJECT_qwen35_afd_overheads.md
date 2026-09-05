@@ -226,6 +226,25 @@ was enabled.
   CUDA-graph capture. HSG job `6934956` completed `0:0` in 1:26 and passed that
   exact check, including graph replay. This validates the arithmetic-preserving
   graph-safe replacement before the current-source full-model reruns.
+- Same-source normal-routing DeepEP A1 jobs `6935143` (legacy) and `6935160`
+  (`attn-only`) both completed all 148x17 tokens at 128K before their outer job
+  statuses became non-successful. Legacy made its 88 MB sample durable at 58
+  minutes, then failed only because `NSYS_CUDA_GRAPH_TRACE=none` still left
+  Nsight enabled and the postprocessor demanded a deliberately absent graph
+  trace. Attn-only made its sample, result, and `SUCCESS` marker durable by 59
+  minutes, then crossed the one-hour Slurm teardown boundary. The new legacy
+  sample matches 146/148 sequences from the previously passing legacy sample;
+  the new attn-only sample matches 139/148 sequences from both legacy samples.
+  Do not repeat these expensive 128K inference runs.
+- The user selected 8K with a small batch for the remaining alignment proof.
+  Keep the 397B model, normal routing, all generated tokens, unchanged vLLM
+  scorer, and top-10=1.0 gate. `NSYS=0` must be a real alignment-only path:
+  sample shape/token count remain validated, while coordinator/worker trace
+  artifacts, trace-window auditing, and performance fields are not required.
+  The general launcher now terminates after the alignment sample is durable and
+  records null/empty trace metrics rather than collecting hundreds of MB of
+  trace data. Perfect-balanced `NSYS=1` runs retain the complete strict trace
+  contract unchanged.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
@@ -243,8 +262,9 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: rerun strict normal-routing legacy and attn-only A1 alignment at exact
-batch 37 from the same corrected source. If both pass, complete normal-routing
-legacy and attn-only A3 alignment. Only after correctness passes, capture
+Next: run a source-contract check for the alignment-only launcher, then run
+normal-routing 397B legacy and attn-only A1 at 8K/small MB2 batch and score all
+generated tokens with the unchanged top-10=1.0 gate. If both pass, repeat the
+same small alignment proof for A3. Only after correctness passes, capture
 perfect-balanced FP4 attn-only A1/A3 Nsight reports and copy both report sets
 into the local workspace scratch tree.

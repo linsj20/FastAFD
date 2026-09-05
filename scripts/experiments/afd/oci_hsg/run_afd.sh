@@ -69,11 +69,25 @@ RATIO_ARG=${AFD_ATTENTION_TO_FFN_TRAY_RATIO:-${NORMALIZED_AF_RATIO:-${4:-}}}
 ATTENTION_TP_ARG=${AFD_ATTN_TP_SIZE:-${ATTENTION_TP:-${5:-1}}}
 FFN_EP_ARG=${AFD_MLP_EP_SIZE:-${FFN_EP:-${6:-4}}}
 PROMPT_MODE=${PROMPT_MODE:-uniform}
+NSYS=${NSYS:-1}
+[[ "$NSYS" == 0 || "$NSYS" == 1 ]] || {
+    echo "NSYS must be 0 or 1" >&2
+    exit 2
+}
 NSYS_CUDA_GRAPH_TRACE=${NSYS_CUDA_GRAPH_TRACE:-node}
 case "$NSYS_CUDA_GRAPH_TRACE" in
     node|none) ;;
     *) echo "NSYS_CUDA_GRAPH_TRACE must be node or none" >&2; exit 2 ;;
 esac
+if [[ "$NSYS" == 0 && "$NSYS_CUDA_GRAPH_TRACE" != none ]]; then
+    echo "alignment-only NSYS=0 requires NSYS_CUDA_GRAPH_TRACE=none" >&2
+    exit 2
+fi
+if [[ "$NSYS" == 1 && "$NSYS_CUDA_GRAPH_TRACE" != node ]]; then
+    echo "trace NSYS=1 requires NSYS_CUDA_GRAPH_TRACE=node" >&2
+    exit 2
+fi
+export NSYS
 NSYS_CAPTURE_DECODE_STEPS=${NSYS_CAPTURE_DECODE_STEPS:-15}
 [[ "$NSYS_CAPTURE_DECODE_STEPS" == 15 ]] || {
     echo "NSYS_CAPTURE_DECODE_STEPS must be exactly 15" >&2
@@ -1495,9 +1509,11 @@ POST_CAPTURE_DRIVER_TERMINATION_MARKER=$RUN_DIR/post-capture-driver-termination.
             if (( capture_exit_deadline == 0 )); then
                 capture_exit_deadline=$((SECONDS + POST_CAPTURE_DRIVER_EXIT_TIMEOUT_SECONDS))
             fi
-            if [[ -s "$RUN_DIR/sample.json" && -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]]; then
-                printf 'terminating allocation-scoped driver immediately after capture, sample, and coordinator trace became durable; pid=%s detected_at=%s\n' \
+            if [[ -s "$RUN_DIR/sample.json" && \
+                  ( "${NSYS:-0}" != 1 || -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ) ]]; then
+                printf 'terminating allocation-scoped driver immediately after required capture artifacts became durable; pid=%s nsys=%s detected_at=%s\n' \
                     "$DRIVER_PID" \
+                    "${NSYS:-0}" \
                     "$(date --iso-8601=seconds)" \
                     > "$POST_CAPTURE_DRIVER_TERMINATION_MARKER"
                 kill -TERM "$DRIVER_PID" 2>/dev/null || true
@@ -1644,10 +1660,12 @@ fi
     echo "AFD driver completed without a nonempty sample.json" >&2
     exit 3
 }
-[[ -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]] || {
-    echo "AFD driver completed without a nonempty coordinator CPU trace; graceful shutdown may have timed out" >&2
-    exit 3
-}
+if [[ "${NSYS:-0}" == 1 ]]; then
+    [[ -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]] || {
+        echo "AFD driver completed without a nonempty coordinator CPU trace; graceful shutdown may have timed out" >&2
+        exit 3
+    }
+fi
 
 RUN_DIR=$RUN_DIR SWEEP_CONTRACT=$SWEEP_CONTRACT NUM_PROMPTS=$NUM_PROMPTS BATCH=$BATCH \
 AFD_MODEL_PLACEMENT_REQUESTED=$AFD_MODEL_PLACEMENT_REQUESTED \
@@ -1792,103 +1810,113 @@ samples = json.loads((run / "sample.json").read_text()).get("samples", [])
 lengths = [len(x.get("generated_token_ids", [])) for x in samples]
 if len(samples) != count or set(lengths) != {output_tokens}:
     raise RuntimeError((len(samples), sorted(set(lengths))))
-if model_placement == "attn-only":
-    attention_trace_pattern = (
-        "attention_dp*_rank*_nvtx_cpu.json"
-        if attention_dp > 1
-        else "attention_rank*_nvtx_cpu.json"
-    )
-    attention_traces = sorted((run / "ray_logs").glob(attention_trace_pattern))
-    if len(attention_traces) != workers:
-        raise RuntimeError(("attention CPU traces", len(attention_traces), workers))
-    worker_steps = []
-    for path in attention_traces:
-        events = json.loads(path.read_text()).get("events", [])
-        worker_steps.append([
-            int(event["step_id"])
-            for event in events
-            if str(event.get("name", "")).startswith("AFD_AG_Materialize")
-            and isinstance(event.get("step_id"), int)
-        ])
-else:
-    attention_log_pattern = (
-        "attention_dp*_rank*.log" if attention_dp > 1 else "attention_rank*.log"
-    )
-    logs = sorted((run / "ray_logs").glob(attention_log_pattern))
-    if len(logs) != workers:
-        raise RuntimeError((len(logs), workers))
-    pattern = re.compile(
-        r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)"
-    )
-    worker_steps = []
-    for path in logs:
-        captured = [
-            int(s)
-            for s, b, marker in pattern.findall(path.read_text(errors="replace"))
-            if int(b) == padded_batch and int(marker) == num_mb
-        ]
-        worker_steps.append(captured)
-coordinator_log = run / "ray_logs/afd_coordinator.log"
-if not coordinator_log.is_file():
-    raise RuntimeError("missing AFD coordinator log")
-window_pattern = re.compile(
-    r"nsys profiler:target_decode_window target_batch_per_dp=(\d+) "
-    r"warmup_step_id=(\d+) step_ids=([0-9,]+) "
-    r"count=(\d+) trace_count=(\d+)"
-)
-window_matches = window_pattern.findall(coordinator_log.read_text(errors="replace"))
-if len(window_matches) != 1:
-    raise RuntimeError(("expected one target decode-window marker", window_matches))
-(
-    target_batch_text,
-    warmup_step_text,
-    step_ids_text,
-    step_count_text,
-    trace_count_text,
-) = window_matches[0]
-warmup_step = int(warmup_step_text)
-steps = [int(value) for value in step_ids_text.split(",")]
-if (
-    int(target_batch_text) != batch
-    or int(step_count_text) != 15
-    or int(trace_count_text) != 16
-    or trace_warmup_steps != 1
-):
-    raise RuntimeError(("target decode-window contract", window_matches[0], batch))
-if len(steps) != 15 or steps != list(range(steps[0], steps[0] + 15)):
-    raise RuntimeError(("target decode steps are not exactly consecutive", steps))
-trace_steps = [warmup_step, *steps]
-if model_placement == "attn-only":
-    trace_step_set = set(trace_steps)
-    worker_trace_steps = [
-        [step for step in captured if step in trace_step_set]
-        for captured in worker_steps
-    ]
-else:
-    worker_trace_steps = worker_steps
-if steps[0] != warmup_step + 1 or any(
-    captured != trace_steps for captured in worker_trace_steps
-):
-    raise RuntimeError(
-        (
-            "attention worker trace differs from warmup+target window",
-            worker_trace_steps,
-            trace_steps,
-        )
-    )
-full_windows = [steps]
+steps = []
+warmup_step = None
+trace_steps = []
+full_windows = []
 partial_windows = []
-trace = json.loads((run / "ray_logs/coordinator_nvtx_cpu.json").read_text())
-complete = {
-    e["step_id"]: e["end_perf_ns"] for e in trace["events"]
-    if str(e.get("name", "")).startswith("AFD_Coordinator_CompleteCollect")
-    and isinstance(e.get("step_id"), int)
-}
-ends = [complete[s] for s in steps]
-intervals = [(b - a) / 1e6 for a, b in zip(ends, ends[1:])]
-median_ms, mean_ms = statistics.median(intervals), statistics.fmean(intervals)
-tps = count * 1000 / (active_gpus * median_ms)
-allocated_tps = count * 1000 / (allocated_gpus * median_ms)
+intervals = []
+median_ms = None
+mean_ms = None
+tps = None
+allocated_tps = None
+if nsys_enabled:
+    if model_placement == "attn-only":
+        attention_trace_pattern = (
+            "attention_dp*_rank*_nvtx_cpu.json"
+            if attention_dp > 1
+            else "attention_rank*_nvtx_cpu.json"
+        )
+        attention_traces = sorted((run / "ray_logs").glob(attention_trace_pattern))
+        if len(attention_traces) != workers:
+            raise RuntimeError(("attention CPU traces", len(attention_traces), workers))
+        worker_steps = []
+        for path in attention_traces:
+            events = json.loads(path.read_text()).get("events", [])
+            worker_steps.append([
+                int(event["step_id"])
+                for event in events
+                if str(event.get("name", "")).startswith("AFD_AG_Materialize")
+                and isinstance(event.get("step_id"), int)
+            ])
+    else:
+        attention_log_pattern = (
+            "attention_dp*_rank*.log" if attention_dp > 1 else "attention_rank*.log"
+        )
+        logs = sorted((run / "ray_logs").glob(attention_log_pattern))
+        if len(logs) != workers:
+            raise RuntimeError((len(logs), workers))
+        pattern = re.compile(
+            r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)"
+        )
+        worker_steps = []
+        for path in logs:
+            captured = [
+                int(s)
+                for s, b, marker in pattern.findall(path.read_text(errors="replace"))
+                if int(b) == padded_batch and int(marker) == num_mb
+            ]
+            worker_steps.append(captured)
+    coordinator_log = run / "ray_logs/afd_coordinator.log"
+    if not coordinator_log.is_file():
+        raise RuntimeError("missing AFD coordinator log")
+    window_pattern = re.compile(
+        r"nsys profiler:target_decode_window target_batch_per_dp=(\d+) "
+        r"warmup_step_id=(\d+) step_ids=([0-9,]+) "
+        r"count=(\d+) trace_count=(\d+)"
+    )
+    window_matches = window_pattern.findall(coordinator_log.read_text(errors="replace"))
+    if len(window_matches) != 1:
+        raise RuntimeError(("expected one target decode-window marker", window_matches))
+    (
+        target_batch_text,
+        warmup_step_text,
+        step_ids_text,
+        step_count_text,
+        trace_count_text,
+    ) = window_matches[0]
+    warmup_step = int(warmup_step_text)
+    steps = [int(value) for value in step_ids_text.split(",")]
+    if (
+        int(target_batch_text) != batch
+        or int(step_count_text) != 15
+        or int(trace_count_text) != 16
+        or trace_warmup_steps != 1
+    ):
+        raise RuntimeError(("target decode-window contract", window_matches[0], batch))
+    if len(steps) != 15 or steps != list(range(steps[0], steps[0] + 15)):
+        raise RuntimeError(("target decode steps are not exactly consecutive", steps))
+    trace_steps = [warmup_step, *steps]
+    if model_placement == "attn-only":
+        trace_step_set = set(trace_steps)
+        worker_trace_steps = [
+            [step for step in captured if step in trace_step_set]
+            for captured in worker_steps
+        ]
+    else:
+        worker_trace_steps = worker_steps
+    if steps[0] != warmup_step + 1 or any(
+        captured != trace_steps for captured in worker_trace_steps
+    ):
+        raise RuntimeError(
+            (
+                "attention worker trace differs from warmup+target window",
+                worker_trace_steps,
+                trace_steps,
+            )
+        )
+    full_windows = [steps]
+    trace = json.loads((run / "ray_logs/coordinator_nvtx_cpu.json").read_text())
+    complete = {
+        e["step_id"]: e["end_perf_ns"] for e in trace["events"]
+        if str(e.get("name", "")).startswith("AFD_Coordinator_CompleteCollect")
+        and isinstance(e.get("step_id"), int)
+    }
+    ends = [complete[s] for s in steps]
+    intervals = [(b - a) / 1e6 for a, b in zip(ends, ends[1:])]
+    median_ms, mean_ms = statistics.median(intervals), statistics.fmean(intervals)
+    tps = count * 1000 / (active_gpus * median_ms)
+    allocated_tps = count * 1000 / (allocated_gpus * median_ms)
 result = {
     "sweep_contract": os.environ["SWEEP_CONTRACT"],
     "afd_model_placement": model_placement,
@@ -1962,7 +1990,10 @@ result = {
     "decode_step_ids": steps,
     "warmup_decode_step_id": warmup_step,
     "trace_decode_step_ids": trace_steps,
-    "selected_window_policy": "trace first exact full-resident decode as warmup, then measure the next exact 15-step decode window",
+    "selected_window_policy": (
+        "trace first exact full-resident decode as warmup, then measure the next exact 15-step decode window"
+        if nsys_enabled else "alignment-only; no performance trace window"
+    ),
     "completion_interval_ms": intervals,
     "mean_interval_ms": mean_ms, "median_interval_ms": median_ms,
     "median_tokens_per_second_per_gpu": tps,
@@ -1980,7 +2011,10 @@ result = {
         "nsys_capture_decode_steps": int(os.environ["NSYS_CAPTURE_DECODE_STEPS"]),
         "nsys_trace_warmup_decode_steps": trace_warmup_steps,
         "nsys_trace_decode_launches": len(trace_steps),
-        "proof": "the coordinator emitted one exact warmup-plus-target_decode_window marker and every attention-worker log contains the first full-resident warmup followed by exactly the same 15 measured decode-graph replay steps",
+        "proof": (
+            "the coordinator emitted one exact warmup-plus-target_decode_window marker and every attention-worker log contains the first full-resident warmup followed by exactly the same 15 measured decode-graph replay steps"
+            if nsys_enabled else "alignment-only; sample shape and token count validated"
+        ),
     },
     "measurement": (
         "coordinator completion interval diagnostic only; final latency and "
@@ -1988,6 +2022,7 @@ result = {
         "target-batch post-warmup critical CUDA spans, with its median also "
         "reported; attention-only placement takes the maximum complete graph span "
         "across one attention and one model representative"
+        if nsys_enabled else "alignment-only; performance measurement disabled"
     ),
     "primary_performance_metric": {
         "status": "pending_postprocess" if nsys_enabled else "alignment_only",
@@ -2010,7 +2045,7 @@ result = {
         "tps_denominator": "active_gpus",
     },
 }
-if reference > 0:
+if reference > 0 and tps is not None:
     result["reference_tokens_per_second_per_gpu"] = reference
     result["reference_delta_percent"] = (tps / reference - 1) * 100
 (run / "afd-result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

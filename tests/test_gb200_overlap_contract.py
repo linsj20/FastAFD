@@ -242,6 +242,26 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("trace first exact full-resident decode as warmup", source)
         self.assertNotIn("MAX_TOKENS=16", source)
 
+    def test_alignment_only_run_does_not_require_trace_artifacts(self) -> None:
+        source = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
+        ).read_text()
+        self.assertIn("NSYS=${NSYS:-1}", source)
+        self.assertIn(
+            'if [[ "${NSYS:-0}" == 1 ]]; then\n'
+            '    [[ -s "$RUN_DIR/ray_logs/coordinator_nvtx_cpu.json" ]]',
+            source,
+        )
+        self.assertIn("if nsys_enabled:\n    if model_placement", source)
+        self.assertIn(
+            'else "alignment-only; sample shape and token count validated"',
+            source,
+        )
+        self.assertIn(
+            '"status": "pending_postprocess" if nsys_enabled else "alignment_only"',
+            source,
+        )
+
     def test_fmha_campaign_uses_launch_safe_prefill_and_shared_builds(self) -> None:
         runner = (
             ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
