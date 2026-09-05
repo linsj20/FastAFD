@@ -87,13 +87,12 @@ _MINIMAX_ROUTE_LOGITS_WS: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
 def _gate_topk_workspace(device: torch.device, num_mtiles: int):
-    """Persistent (graph-stable) K-split partial buffer + self-resetting
-    ticket counters for the fused gate kernel."""
+    """Persistent graph-stable logits and route-finalization counters."""
     key = (device.type, device.index)
     ws = _GATE_TOPK_WS.get(key)
-    if ws is None or ws[0].shape[1] < num_mtiles:
+    if ws is None or ws[0].shape[0] < num_mtiles:
         cap = max(num_mtiles, 32)
-        partials = torch.empty((16, cap, 16, 128), dtype=torch.float32, device=device)
+        partials = torch.empty((cap, 16, 512), dtype=torch.float32, device=device)
         counters = torch.zeros((cap,), dtype=torch.int32, device=device)
         _GATE_TOPK_WS[key] = (partials, counters)
         ws = _GATE_TOPK_WS[key]

@@ -2,7 +2,7 @@
 
 ## Goal and constraints
 
-Support `Qwen/Qwen3.5-122B-A10B-FP8` in AFD using
+Support `Qwen/Qwen3.5-397B-A17B-FP8` in AFD using
 `hao-ai-lab/FastAFD:feat/qwen35-integration` only as a reference. Preserve the
 current `fmha_only` branch's two-lane schedule and optimizations. Linear
 attention, its convolution state, and its recurrent GDN state must remain on
@@ -38,8 +38,8 @@ post-attention norm. They publish normalized hidden states for linear layers
 and Q/K/V plus output gate for full layers. Attention workers own all GDN
 weights/state and execute linear layers; they return BF16 linear output. For
 full layers they own only KV state and FMHA execution, apply the output gate,
-and return the existing packed-UE8M0 FP8 payload. All 48 layers remain rounds
-in the existing MB2/two-slot wavefront; only the 12 full-attention layers occupy
+and return the existing packed-UE8M0 FP8 payload. All 60 layers remain rounds
+in the existing MB2/two-slot wavefront; only the 15 full-attention layers occupy
 KV storage. Qwen3.5 currently fails fast unless attention TP and model TP are
 both one, matching A1/A3 with FFN EP4.
 
@@ -67,25 +67,38 @@ was enabled.
   overlap, metric-validation, and Qwen3.5 ownership tests pass. A regression
   test covers the hybrid MB2 graph schedule publishing normalized linear-layer
   hidden states without entering the full-attention QKV splitter.
-- Actual pinned config parses as 48 layers = 36 linear + 12 full, hidden 3072,
-  head dim 256, Q/KV heads 32/2, 256 experts, top-k 8, FP8 block 128x128.
-  Meta materialization of that exact config gives 64 local experts per EP4
-  model worker in FP8 and an attention stage containing 432 GDN tensors, with
-  recurrent `A_log` retained as FP32.
+- The selected 397B FP8 config is pinned at revision `ea5b4f8` and config SHA256
+  `9a142fc6...d6e5db8`. It parses as 60 layers = 45 linear + 15 full, hidden
+  4096, head dim 256, Q/KV heads 32/2, 512 experts, top-k 10, MoE/shared
+  intermediate 1024, and FP8 block 128x128. EP4 therefore owns 128 routed
+  experts per model worker.
+- The same-rank MegaMoE fused gate/router used by `attn-only` previously fixed
+  one token-tile grid to 128 experts. It now scales that grid to 64 eight-expert
+  blocks for 512 experts while retaining the same two kernel launches and
+  in-kernel perfect-ID specialization. Only the first 16 expert blocks own the
+  existing disjoint FP8 hidden quantization slices, preventing duplicate work.
 - HSG job `6925193` (`short`, one tray, one-hour limit) compiled transport
   specializations for head dimensions 128 and 256 and passed three repeated
   fabric iterations with Qwen3.5 shape 32Q/2KV/256 across two independent
   pairs. Output is `logs/transport-smoke-6925193.out` under the task root.
+- The pinned environment parses the actual 397B config, and targeted meta
+  construction of the `attn-only` model stage succeeds with 813 tensors and
+  routed expert shape `[128, 2048, 4096]` in FP8. A first diagnostic that kept
+  all four full stage state dictionaries live together exhausted login-host
+  thread-local memory; the isolated construction with one BLAS thread passed,
+  so subsequent stage checks must remain isolated.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   A direct-launch dry run resolves the provisional A1 point to 45 requests per
   attention-DP lane, 180 prompts, 22+23 MB2 split, four attention plus four
   EP4 model GPUs on two trays. This is only the planning estimate; the runtime
   page-count gate remains the maximum-batch authority.
-- The 127,195,718,583-byte pinned model snapshot is downloading into the task
-  model cache. The first 8-worker Xet attempt failed a 67 MB allocation on the
-  login host; the resumed standard HTTP path uses `HF_HUB_DISABLE_XET=1` and
-  two workers and is progressing. Do not repeat the failed mode.
+- The earlier 122B snapshot completed but was superseded by the user's 397B
+  selection and remains intact. The pinned 397B repository contains
+  406,125,181,280 bytes of model tensors across 94 shards (406,198,638,888
+  bytes / 107 repository files including metadata). Its standard HTTP download
+  uses `HF_HUB_DISABLE_XET=1` and two workers; do not repeat the failed
+  high-worker Xet mode used for the earlier snapshot.
 
 Next: finish the snapshot, reconcile and commit the isolated remote source,
 discover the placement-specific exact A1 128K capacities from post-init page

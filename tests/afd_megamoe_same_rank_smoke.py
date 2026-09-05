@@ -573,9 +573,15 @@ def _exact_qwen_case(
             "MEGAMOE_SMOKE_DEBUG_TIMINGS requires exactly one row and SM configuration"
         )
 
-    hidden, intermediate = 4096, 1536
+    hidden = int(os.environ.get("MEGAMOE_SMOKE_HIDDEN", "4096"))
+    intermediate = int(os.environ.get("MEGAMOE_SMOKE_INTERMEDIATE", "1536"))
     num_experts = int(os.environ.get("MEGAMOE_SMOKE_NUM_EXPERTS", "128"))
-    top_k = 8
+    top_k = int(os.environ.get("MEGAMOE_SMOKE_TOP_K", "8"))
+    perfect_routing = int(os.environ.get("MEGAMOE_SMOKE_PERFECT_ROUTING", "0"))
+    if perfect_routing not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_PERFECT_ROUTING must be 0 or 1")
+    if perfect_routing and any(not mode[0] for mode in specialization_modes):
+        raise RuntimeError("perfect routing requires route-prepared specialization modes")
     if num_experts <= 0 or num_experts % world_size:
         raise RuntimeError(
             "MEGAMOE_SMOKE_NUM_EXPERTS must be positive and divisible by "
@@ -632,7 +638,20 @@ def _exact_qwen_case(
                         rank_ready=bool(rank_ready_route_publish_mode)
                     ) if route_prepare_mode else None
                 ),
+                perfect_balance=bool(perfect_routing),
             )
+            if perfect_routing:
+                expected_ids = (
+                    torch.arange(
+                        rows * top_k, dtype=ids.dtype, device=ids.device
+                    ).view(rows, top_k)
+                    + rank * rows * top_k
+                ) % num_experts
+                if not torch.equal(ids, expected_ids):
+                    raise RuntimeError(
+                        "perfect-routing IDs do not match the deterministic "
+                        f"global sequence on rank={rank}"
+                    )
 
         def run_stage() -> None:
             prepare_input()

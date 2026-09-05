@@ -28,16 +28,21 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertLess(topk_start, perfect_start)
         self.assertIn("GEMM, softmax, and top-k work above remains unchanged", select)
         self.assertIn("perfect balance requires route preparation", kernel)
+        self.assertIn("inline constexpr int kMaxExperts = 512", kernel)
+        self.assertIn("num_mtiles * num_expert_splits", kernel)
 
-        for ranks in (4, 8):
-            for valid_tokens in range(1, 33):
-                counts = [0] * 128
-                for rank in range(ranks):
-                    for token in range(valid_tokens):
-                        for slot in range(8):
-                            expert = ((rank * valid_tokens + token) * 8 + slot) % 128
-                            counts[expert] += 1
-                self.assertLessEqual(max(counts) - min(counts), 1)
+        for experts, topk in ((128, 8), (512, 10)):
+            for ranks in (4, 8):
+                for valid_tokens in range(1, 33):
+                    counts = [0] * experts
+                    for rank in range(ranks):
+                        for token in range(valid_tokens):
+                            for slot in range(topk):
+                                expert = (
+                                    (rank * valid_tokens + token) * topk + slot
+                                ) % experts
+                                counts[expert] += 1
+                    self.assertLessEqual(max(counts) - min(counts), 1)
 
         adapter = (ROOT / "python/minisgl/moe/megamoe_afd.py").read_text()
         self.assertIn('"MINISGL_AFD_PERFECT_ROUTING", "0"', adapter)

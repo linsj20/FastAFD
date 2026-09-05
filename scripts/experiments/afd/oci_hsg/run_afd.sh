@@ -310,9 +310,9 @@ case "$MODEL_KEY" in
             *) DEFAULT_NODES=8 ;;
         esac ;;
     qwen35)
-        MODEL_REVISION=a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9
-        MODEL_CACHE=models--Qwen--Qwen3.5-122B-A10B-FP8
-        MODEL_SOURCE_CONFIG_SHA256=""
+        MODEL_REVISION=ea5b4f81096f3901c91dea97f81324302495781d
+        MODEL_CACHE=models--Qwen--Qwen3.5-397B-A17B-FP8
+        MODEL_SOURCE_CONFIG_SHA256=9a142fc6c2d67703255ce6120ee04c4c720ec58dba6ae44bebb29c4a2d6e5db8
         MODEL_PRESET_DEFAULT=$(dirname "$(realpath "$0")")/run_afd_qwen3_parallel.sh
         PROMPT_SOURCE_CONTEXT=8192
         PROMPT_SHA256=26482bc14fe61372c30eed8731fae1103fe477cdf03c70e8a808c3723ede5fdb

@@ -33,9 +33,8 @@ inline constexpr int kWarpSize = 32;
 inline constexpr int kTokensPerBlock = 16;  // MMA M
 inline constexpr int kKChunk = 64;          // K tile per stage
 inline constexpr int kRowPad = 72;         // chunk + 8 pad
-inline constexpr int kMaxExperts = 128;     // one block owns all experts
+inline constexpr int kMaxExperts = 512;     // one token-tile grid owns all experts
 inline constexpr int kTPB = 256;            // 8 warps
-inline constexpr int kNTilesPerWarp = kMaxExperts / 8 / (kTPB / kWarpSize);
 
 template <typename T>
 struct TypeTag {
@@ -76,7 +75,7 @@ __device__ __forceinline__ int atom_add_acqrel_gpu(int* p, int v) {
   return old;
 }
 
-inline constexpr int kNSplit = 16;  // expert-parallel blocks per token tile (8 experts each)
+inline constexpr int kQuantSplits = 16;
 inline constexpr int kStages = 4;   // cp.async pipeline depth (latency-bound kernel)
 
 
@@ -90,8 +89,9 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
     uint8_t* __restrict__ x_q,                 // optional [num_tokens, hidden] e4m3
     uint8_t* __restrict__ x_sf,                // optional [num_tokens, hidden/32] ue8m0
     const int num_tokens, const int num_experts, const int hidden_size,
+    const int num_expert_splits,
     const int topk, const bool renormalize) {
-  // v3 layout: grid = mtiles x kNSplit blocks.  A block owns 8 experts with
+  // v3 layout: grid = mtiles x num_expert_splits blocks. A block owns 8 experts with
   // the FULL K (no cross-block reduction); its 8 warps split K and run
   // fully independent per-warp cp.async pipelines (cp.async groups are
   // per-thread state, so the main loop needs no __syncthreads at all),
@@ -114,8 +114,8 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
   float* red_smem = reinterpret_cast<float*>(
       smem_raw + kNumWarps * (kWarpABytes + kWarpBBytes));  // [kNumWarps][16][8]
 
-  const int mtile = blockIdx.x / kNSplit;
-  const int nsplit = blockIdx.x % kNSplit;
+  const int mtile = blockIdx.x / num_expert_splits;
+  const int nsplit = blockIdx.x % num_expert_splits;
   const int m0 = mtile * kTokensPerBlock;
   const int n_base = nsplit * 8;  // this block's 8 experts
   const int tid = threadIdx.x;
@@ -155,11 +155,12 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
 
   // Optional fused per-32 FP8 quant of the hidden states (the gate GEMV
   // streams every token row through smem anyway).  Block `nsplit` owns the
-  // k-slice [nsplit*hidden/kNSplit, ...), which lives entirely inside warp
-  // nsplit/2's pipeline; lane <-> (token, 32-group) inside each 64-wide
-  // chunk.  Bit-identical to the AG mega kernel's phase-0 quant.
-  const int q_size = hidden_size / kNSplit;                  // bytes of K per block
-  const bool q_on = (x_q != nullptr) && (warp == nsplit / 2);
+  // The first kQuantSplits expert blocks also partition and quantize K. This
+  // remains exactly one owner per hidden value when the expert grid grows for
+  // Qwen3.5-397B's 512 experts.
+  const int q_size = hidden_size / kQuantSplits;             // bytes of K per block
+  const bool q_on = (x_q != nullptr) && (nsplit < kQuantSplits) &&
+                    (warp == nsplit / 2);
   const int q_chunk_begin = (nsplit % 2) * (q_size / kKChunk);
   const int q_chunk_end = q_chunk_begin + q_size / kKChunk;
   const auto quant_chunk = [&](int stage, int c) {
@@ -285,7 +286,7 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
   const float* block_logits =
       logits_gmem + static_cast<size_t>(mtile) * kTokensPerBlock * kMaxExperts;
 
-  constexpr int kMaxExpertsPerLane = kMaxExperts / kWarpSize;  // 4
+  constexpr int kMaxExpertsPerLane = kMaxExperts / kWarpSize;  // 16
   const int per_lane = (num_experts + kWarpSize - 1) / kWarpSize;
   {
     const int t = warp;
@@ -562,7 +563,7 @@ struct GateTopkFusedKernel {
     if (rows == 0) return;
     RuntimeCheck(hsize % (kKChunk * (kTPB / kWarpSize)) == 0, "hidden_size must be divisible by 512");
     RuntimeCheck(experts % 8 == 0 && experts <= kMaxExperts,
-                 "num_experts must be a multiple of 8 and <= 128");
+                 "num_experts must be a multiple of 8 and <= 512");
     RuntimeCheck(topk_value <= 32, "topk must be <= 32");
     RuntimeCheck(expert_map.size(0) == 0 || expert_map.size(0) == experts,
                  "expert_map must be empty or have num_experts entries, got ",
@@ -607,6 +608,7 @@ struct GateTopkFusedKernel {
 
     const auto stream = LaunchKernel::resolve_device(device_ref.unwrap());
     const int num_mtiles = (rows + kTokensPerBlock - 1) / kTokensPerBlock;
+    const int num_expert_splits = experts / 8;
     constexpr int kNumWarps = kTPB / kWarpSize;
     constexpr int kSmemBytes =
         kNumWarps * kStages * (kTokensPerBlock + 8) * kRowPad * 2 +
@@ -622,14 +624,14 @@ struct GateTopkFusedKernel {
     float* w_stage_ptr = nullptr;
     if (x_q.has_value()) {
       RuntimeCheck(x_sf.has_value(), "x_sf required with x_q");
-      RuntimeCheck(hsize % (kNSplit * kKChunk) == 0,
+      RuntimeCheck(hsize % (kQuantSplits * kKChunk) == 0,
                    "fused quant needs hidden_size % 1024 == 0");
       x_q_ptr = static_cast<uint8_t*>(x_q.value().data_ptr());
       x_sf_ptr = static_cast<uint8_t*>(x_sf.value().data_ptr());
     }
     if (w_stage.has_value())
       w_stage_ptr = static_cast<float*>(w_stage.value().data_ptr());
-    gate_topk_fused_tc_kernel<<<num_mtiles * kNSplit, kTPB, kSmemBytes, stream>>>(
+    gate_topk_fused_tc_kernel<<<num_mtiles * num_expert_splits, kTPB, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(hidden.data_ptr()),
         static_cast<const __nv_bfloat16*>(gate_w_ptr(gate_weight)),
         static_cast<float*>(topk_weights.data_ptr()),
@@ -637,7 +639,7 @@ struct GateTopkFusedKernel {
         static_cast<float*>(partials.data_ptr()),
         static_cast<int*>(counters.data_ptr()),
         x_q_ptr, x_sf_ptr,
-        rows, experts, hsize, topk_value, renormalize);
+        rows, experts, hsize, num_expert_splits, topk_value, renormalize);
     const auto* count_ptr = valid_token_count.size(0) == 0
                                 ? nullptr
                                 : static_cast<const int64_t*>(
