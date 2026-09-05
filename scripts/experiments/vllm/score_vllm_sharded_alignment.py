@@ -180,7 +180,12 @@ export DG_JIT_CACHE_DIR="${{DG_JIT_CACHE_DIR:-{self.calib_dir}/cache/vllm_deepge
 export EP_JIT_CACHE_DIR="${{EP_JIT_CACHE_DIR:-{self.calib_dir}/cache/vllm_deepep_epv2_jit/${{HOSTNAME_SAFE}}}}"
 export VLLM_CACHE_ROOT="${{VLLM_CACHE_ROOT:-{self.calib_dir}/cache/vllm/${{HOSTNAME_SAFE}}}}"
 export FLASHINFER_WORKSPACE_BASE="${{FLASHINFER_WORKSPACE_BASE:-{self.calib_dir}/cache/flashinfer/${{HOSTNAME_SAFE}}}}"
-mkdir -p "$DG_JIT_CACHE_DIR" "$EP_JIT_CACHE_DIR" "$VLLM_CACHE_ROOT" "$FLASHINFER_WORKSPACE_BASE"
+# Keep the Unix-domain socket spelling below sockaddr_un's 107-byte ceiling.
+# This is relative to calib_dir, so the socket still lives in the ignored
+# workspace cache even when the absolute experiment path is very long.
+export VLLM_RPC_BASE_PATH="${{VLLM_RPC_BASE_PATH:-cache/vllm_rpc/${{HOSTNAME_SAFE}}}}"
+mkdir -p "$DG_JIT_CACHE_DIR" "$EP_JIT_CACHE_DIR" "$VLLM_CACHE_ROOT" \
+  "$FLASHINFER_WORKSPACE_BASE" "$VLLM_RPC_BASE_PATH"
 
 export EP_SUPPRESS_NCCL_CHECK="${{EP_SUPPRESS_NCCL_CHECK:-1}}"
 export VLLM_USE_DEEP_GEMM="${{VLLM_USE_DEEP_GEMM:-1}}"

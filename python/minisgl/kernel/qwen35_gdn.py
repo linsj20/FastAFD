@@ -368,14 +368,29 @@ def _qwen35_rmsnorm_gated(
     return gated.to(original_dtype)
 
 
-# Eager, this is ~13 ATen launches per linear-attention layer -- 36 of them per
-# decode step, each materializing an fp32 intermediate the size of the value
-# tensor. vLLM gets the same arithmetic as a single inductor kernel because its
-# decoder carries `@support_torch_compile`; minisgl already uses this same local
-# pattern for the MiniMax QK norm in `layers/norm.py`.
-_qwen35_rmsnorm_gated_compiled = torch.compile(
-    _qwen35_rmsnorm_gated, dynamic=True, fullgraph=True
-)
+@triton.jit
+def _qwen35_rmsnorm_gated_kernel(
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    eps: tl.constexpr,
+    width: tl.constexpr,
+    block: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block)
+    mask = offsets < width
+    x = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
+    z = tl.load(z_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / width + eps)
+    out = x * inv_rms * weight * z * tl.sigmoid(z)
+    tl.store(
+        out_ptr + row * width + offsets,
+        out.to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def qwen35_rmsnorm_gated(
@@ -386,13 +401,32 @@ def qwen35_rmsnorm_gated(
 ) -> torch.Tensor:
     """Per-value-head RMSNorm followed by the Qwen3.5 SiLU output gate."""
 
-    # MINISGL_QWEN35_GATE_EAGER=1 selects the pre-compile path so an A/B can be
+    # MINISGL_QWEN35_GATE_EAGER=1 selects the eager path so an A/B can be
     # interleaved without editing or checking out source between runs, matching
-    # MINISGL_QWEN35_CONV1D_EAGER above. Needed because the compiled reduction is
+    # MINISGL_QWEN35_CONV1D_EAGER above. Needed because the Triton reduction is
     # not bitwise-identical, so any correctness difference has to be attributable.
     if not x.is_cuda or os.environ.get("MINISGL_QWEN35_GATE_EAGER") == "1":
         return _qwen35_rmsnorm_gated(x, z, weight, eps)
-    return _qwen35_rmsnorm_gated_compiled(x, z, weight, eps)
+    if x.shape != z.shape or x.shape[-1] != weight.numel():
+        raise ValueError(
+            f"Qwen3.5 gated RMSNorm shape mismatch: "
+            f"x={tuple(x.shape)} z={tuple(z.shape)} weight={tuple(weight.shape)}"
+        )
+    if not (x.is_contiguous() and z.is_contiguous() and weight.is_contiguous()):
+        raise ValueError("Qwen3.5 gated RMSNorm requires contiguous inputs")
+    out = torch.empty_like(x)
+    width = int(x.shape[-1])
+    _qwen35_rmsnorm_gated_kernel[(x.numel() // width,)](
+        x,
+        z,
+        weight,
+        out,
+        eps=float(eps),
+        width=width,
+        block=triton.next_power_of_2(width),
+        num_warps=4,
+    )
+    return out
 
 
 @triton.jit

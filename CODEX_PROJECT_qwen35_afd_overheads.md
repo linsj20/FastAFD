@@ -129,6 +129,21 @@ was enabled.
   publication, where zero-width K/V tensors exposed `SymbolicSize`'s zero-as-
   unset sentinel. The publisher now derives zero KV edge/width counts from the
   empty KV descriptor without unwrapping those unset symbols.
+- A subsequent normal-routing A1 pair advanced both modes further. Legacy job
+  `6928449` passed its exact-capacity gate and captured the batch-19 decode
+  graph, served all 148 long-prefill requests, and wrote its sample bundle.
+  Its unchanged vLLM scorer could not start one baseline shard because the
+  inherited long run-directory temp path made vLLM's Unix-domain RPC address
+  exceed `sockaddr_un`'s 107-byte limit. The shard launcher now explicitly uses
+  a short relative RPC base under the ignored source `cache/` directory; this
+  changes only baseline process plumbing, not scoring. Attn-only job `6928456` passed the
+  corrected 397B weight loading and zero-KV publication but failed during
+  decode-graph capture because the gated RMSNorm's lazy `torch.compile` path
+  attempted an Inductor code-cache load and CUDA synchronization while its
+  stream was being captured. The fused gate is now an explicit Triton kernel;
+  its exact decode bucket is exercised by the existing attention prewarm, so
+  capture no longer depends on lazy compiler activity. The prior eager path is
+  retained only as the explicit A/B environment selection.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
@@ -146,7 +161,6 @@ was enabled.
   single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
   that concurrency and the earlier failed high-worker Xet mode.
 
-Next: discover the placement-specific exact A1 128K capacities from post-init
-page counts, run normal-routing alignment for legacy and attn-only at exact A1
-and then A3, capture perfect-balanced attn-only A1/A3 Nsight reports, and copy
-both report sets into the local workspace scratch tree.
+Next: complete normal-routing alignment for legacy and attn-only at exact A1
+batch 37 and then A3, capture perfect-balanced attn-only A1/A3 Nsight reports,
+and copy both report sets into the local workspace scratch tree.
