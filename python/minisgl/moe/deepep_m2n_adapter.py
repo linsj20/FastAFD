@@ -25,6 +25,7 @@ class DeepEPM2NDispatchOutput(NamedTuple):
     rank: int
     is_ag: bool
     is_eg: bool
+    expected_m_per_expert: int
     hidden_states_scale: torch.Tensor | None = None
 
     @property
@@ -143,6 +144,7 @@ class DeepEPM2NAdapter:
             if num_max_dispatch_tokens_per_rank is None
             else int(num_max_dispatch_tokens_per_rank)
         )
+        expected_m_per_expert = self._expected_m_per_expert(effective_max_tokens)
         self._validate_hidden_states(hidden_states)
         local_tokens = int(hidden_states.shape[0])
         if effective_max_tokens < local_tokens:
@@ -186,7 +188,9 @@ class DeepEPM2NAdapter:
             real_topk_weights.float().contiguous(),
             hidden_states_scale=hidden_states_scale,
             expert_alignment=(
-                self._resolve_expert_alignment(expert_alignment)
+                self._resolve_expert_alignment(
+                    expert_alignment, expected_m_per_expert
+                )
                 if self.use_expanded_layout
                 else 1
             ),
@@ -206,6 +210,7 @@ class DeepEPM2NAdapter:
             rank=self.rank,
             is_ag=self.is_ag,
             is_eg=self.is_eg,
+            expected_m_per_expert=expected_m_per_expert,
             hidden_states_scale=recv_x_scale,
         )
         self._log_dispatch_allocation(dispatch_output)
@@ -529,14 +534,33 @@ class DeepEPM2NAdapter:
             f"experts_per_rank={dispatch_output.layout.experts_per_union_rank}"
         )
 
+    def _expected_m_per_expert(self, max_tokens_per_rank: int) -> int:
+        numerator = (
+            4
+            * max(1, int(max_tokens_per_rank))
+            * self.layout.ag_size
+            * self.top_k
+        )
+        return max(
+            1,
+            (numerator + self.layout.real_num_experts - 1)
+            // self.layout.real_num_experts,
+        )
+
     @staticmethod
-    def _resolve_expert_alignment(expert_alignment: int | None) -> int:
+    def _resolve_expert_alignment(
+        expert_alignment: int | None, expected_m_per_expert: int
+    ) -> int:
         from minisgl.kernel import deepgemm as deep_gemm
 
         if expert_alignment is not None:
             alignment = int(expert_alignment)
         else:
-            alignment = int(deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout())
+            alignment = int(
+                deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout(
+                    int(expected_m_per_expert)
+                )
+            )
         if alignment <= 0:
             raise ValueError(f"expert_alignment must be positive, got {alignment}")
         deep_gemm.set_mk_alignment_for_contiguous_layout(alignment)

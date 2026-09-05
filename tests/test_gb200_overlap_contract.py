@@ -726,6 +726,23 @@ class GB200OverlapContractTests(unittest.TestCase):
         )
         self.assertIn("worker_blocks=min(M, expected_m * E)", runner_source)
         self.assertNotIn("expected_m = max(1, int(M) // max(1, E))", runner_source)
+        m2n_source = (
+            ROOT / "python/minisgl/moe/deepep_m2n_adapter.py"
+        ).read_text()
+        self.assertIn("expected_m_per_expert: int", m2n_source)
+        self.assertIn("def _expected_m_per_expert", m2n_source)
+        self.assertIn(
+            "get_theoretical_mk_alignment_for_contiguous_layout(\n"
+            "                    int(expected_m_per_expert)",
+            m2n_source,
+        )
+        transport_source = (
+            ROOT / "python/minisgl/kernel/csrc/jit/afd_fmha_transport.cu"
+        ).read_text()
+        self.assertIn(
+            "const bool no_kv = kv_desc.shape().Product() == 0", transport_source
+        )
+        self.assertIn("const int64_t kv_edge_count = no_kv ? 0", transport_source)
         psum_source = (
             ROOT / "python/minisgl/kernel/csrc/jit/psum_silu_mul_fp8_packed.cu"
         ).read_text()

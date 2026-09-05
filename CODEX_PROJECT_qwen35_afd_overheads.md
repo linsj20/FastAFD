@@ -121,6 +121,14 @@ was enabled.
   BF16 `weight_scale_inv` tensors from the 397B checkpoint loading into FP32
   runtime scale parameters; selected weights now convert to the expected
   parameter dtype, with a focused regression test.
+- Reruns `6928176`/`6928177` passed both earlier blockers. Legacy reached its
+  DeepGEMM expert call, where the older M2N dispatch record lacked the same
+  graph-static routing-density hint already carried by the ordinary DeepEP
+  dispatcher. M2N now computes/carries `expected_m_per_expert` and derives its
+  contiguous-layout alignment from it. Attn-only reached linear-attention Q
+  publication, where zero-width K/V tensors exposed `SymbolicSize`'s zero-as-
+  unset sentinel. The publisher now derives zero KV edge/width counts from the
+  empty KV descriptor without unwrapping those unset symbols.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per

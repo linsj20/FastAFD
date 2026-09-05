@@ -960,6 +960,9 @@ struct AfdFmhaTransportKernel {
         .with_dtype<int32_t>()
         .with_device<kDLCUDA>(device)
         .verify(completion_counter);
+    const bool no_kv = kv_desc.shape().Product() == 0;
+    const int64_t kv_edge_count = no_kv ? 0 : kv_edges.unwrap();
+    const int64_t kv_width_value = no_kv ? 0 : kv_width.unwrap();
     const auto dtype = data_dtype.unwrap();
     RuntimeCheck(
         dtype.code == DLDataTypeCode::kDLBfloat and dtype.bits == 16 and
@@ -984,7 +987,7 @@ struct AfdFmhaTransportKernel {
         .k_stride = k.stride(0),
         .v_stride = v.stride(0),
         .q_edges = static_cast<int>(q_edges.unwrap()),
-        .kv_edges = static_cast<int>(kv_edges.unwrap()),
+        .kv_edges = static_cast<int>(kv_edge_count),
         .ready_edges = static_cast<int>(ready_edges.unwrap()),
         .layer = static_cast<int>(layer),
         .slot = static_cast<int>(slot),
@@ -993,13 +996,13 @@ struct AfdFmhaTransportKernel {
     };
     const int64_t tasks = std::max<int64_t>(
         1,
-        rows.unwrap() * std::max(q_width.unwrap(), 2 * kv_width.unwrap()) / 4);
+        rows.unwrap() * std::max(q_width.unwrap(), 2 * kv_width_value) / 4);
     const LaunchKernel launch(
         publication_blocks(tasks), kThreads, device.unwrap());
     const bool single_ready = ready_edges.unwrap() == 1;
     const bool single_edge =
         single_ready and source_offset_count.unwrap() == 2 and
-        q_edges.unwrap() == 1 and kv_edges.unwrap() == 1;
+        q_edges.unwrap() == 1 and kv_edge_count == 1;
     if (single_edge)
       launch(publish_qkv_kernel<kHeadDim, true, true>, params);
     else if (single_ready)
