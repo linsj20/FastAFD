@@ -40,7 +40,7 @@ LATENCY_SAMPLE_POLICY = (
     "of its median; retain at least 10 steps, break equal-size ties by tighter "
     "range then higher mean, and use the retained arithmetic mean as latency"
 )
-FMHA_METRIC_VERSION = "20260820-fmha-only-dual-role-cuda-graph-span-v1"
+FMHA_METRIC_VERSION = "20260904-attn-only-dual-role-cuda-graph-span-v1"
 FMHA_LATENCY_BASIS = "max_complete_cuda_graph_span_across_profiled_attention_and_model_roles"
 
 
@@ -376,7 +376,7 @@ def fmha_profile_launches_per_step(
     attention_dp_size: int,
     mlp_dp_size: int,
 ) -> tuple[int, int]:
-    """Return attention/model graph launches for the grouped FMHA-only path."""
+    """Return attention/model graph launches for the grouped attention-only path."""
 
     if (
         attention_dp_size < 1
@@ -623,7 +623,7 @@ def main() -> None:
     if active_gpus != int(plan["active_gpus"]):
         raise RuntimeError("plan/result active-GPU mismatch")
 
-    if data.get("afd_model_placement") == "fmha-only":
+    if data.get("afd_model_placement") in {"attn-only", "fmha-only"}:
         extract_fmha_only(
             args=args,
             data=data,

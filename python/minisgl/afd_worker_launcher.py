@@ -135,6 +135,7 @@ def startup_afd_workers(coord: Any) -> None:
         "device_comm_num_sms": coord.device_comm_num_sms,
         "ray_nsys": bool(coord.server_args.ray_nsys),
         "disable_overlap": bool(coord.server_args.afd_disable_overlap),
+        "async_pending_steps": int(coord.async_pending_steps),
         "afd_num_mb": coord.afd_num_mb,
         "model_placement": coord.server_args.afd_model_placement,
         "rpc_timeout_ms": coord._rpc_timeout_ms,
@@ -250,7 +251,7 @@ def startup_afd_workers(coord: Any) -> None:
     # same token locations as the physical AG cache.  Per-GPU physical capacity
     # can vary slightly; constrain every logical allocator to the minimum before
     # any model initialization, graph capture, or request materialization.
-    if coord.server_args.afd_model_placement == "fmha-only":
+    if coord.server_args.afd_model_placement == "attn-only":
         attn_infos = ray.get(
             [worker.get_runtime_info.remote() for worker in coord.attn_workers]
         )

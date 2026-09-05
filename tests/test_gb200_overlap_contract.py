@@ -199,7 +199,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         ).read_text()
         self.assertIn("mapfile -t ALLOCATED_HOSTS", source)
         self.assertIn("sed -E 's/-T[0-9]+$//' | sort -u", source)
-        self.assertIn("FMHA-only allocation must remain in one NVL72 fabric block", source)
+        self.assertIn("attn-only allocation must remain in one NVL72 fabric block", source)
         self.assertIn(
             "ALLOW_DIRTY_SOURCE=${FASTAFD_ALLOW_DIRTY_SOURCE:-0}", source
         )
@@ -559,7 +559,10 @@ class GB200OverlapContractTests(unittest.TestCase):
             "batch = self.worker.runtime.materialize_ag_plan(namespaced)",
             runtime_source,
         )
-        self.assertIn("self.receive_attention_o(sub, epoch)", runtime_source)
+        self.assertIn(
+            "self.receive_attention_o(\n                        sub, epoch, layer_id\n",
+            runtime_source,
+        )
         self.assertNotIn("afd_fmha_source_subbatches", runtime_source)
         self.assertNotIn("_activate_transport_attn_dp", runtime_source)
         self.assertIn("mb % len(lane_streams)", expert_worker_source)
@@ -618,12 +621,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         staged_quantize_source = source[
             staged_quantize_start:staged_quantize_end
         ]
-        self.assertIn("constexpr int kLanesPerHead = 8", staged_quantize_source)
+        self.assertIn("constexpr int kLanesPerGroup = 8", staged_quantize_source)
         self.assertIn(
-            "kHeadsPerWarp = 32 / kLanesPerHead", staged_quantize_source
+            "kGroupsPerWarp = 32 / kLanesPerGroup", staged_quantize_source
         )
         self.assertIn(
-            "task_group_stride = warp_stride * kHeadsPerWarp",
+            "task_group_stride = warp_stride * kGroupsPerWarp",
             staged_quantize_source,
         )
         self.assertIn(
@@ -869,14 +872,14 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("deep_gemm.set_num_sms(compute_sms)", create_source)
         self.assertIn("reserved_sms={reserved_sms}", create_source)
 
-    def test_fmha_only_defaults_to_same_rank_megamoe(self) -> None:
+    def test_attn_only_defaults_to_same_rank_megamoe(self) -> None:
         support_source = (ROOT / "python/minisgl/afd_support.py").read_text()
         self.assertIn(
-            'default_backend = "megamoe" if placement == "fmha-only" else "deepep"',
+            'default_backend = "megamoe" if placement == "attn-only" else "deepep"',
             support_source,
         )
         self.assertIn(
-            'backend == "megamoe" and placement != "fmha-only"', support_source
+            'backend == "megamoe" and placement != "attn-only"', support_source
         )
         self.assertIn(
             'backend == "megamoe_m2n" and placement != "legacy"', support_source
@@ -885,7 +888,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         campaign = (
             ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
         ).read_text()
-        self.assertIn('if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then', campaign)
+        self.assertIn('if [[ "$AFD_MODEL_PLACEMENT" == attn-only ]]; then', campaign)
         self.assertIn("DEFAULT_AFD_MOE_BACKEND=megamoe", campaign)
         self.assertIn("DEFAULT_AFD_MOE_BACKEND=megamoe_m2n", campaign)
         self.assertIn("DEFAULT_AFD_MOE_BACKEND=deepep", campaign)
@@ -932,7 +935,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         prewarm_source = runtime_source[prewarm_start:prewarm_end]
         self.assertIn("self.model.forward_lm_head(lm_head_input)", prewarm_source)
         self.assertIn("per_mb_bs * self.num_mb", prewarm_source)
-        self.assertIn("backend.forward_prepared(q, 0, sub)", runtime_source)
+        self.assertIn("backend.forward_prepared(q, full_layer, sub)", runtime_source)
 
         deepep_source = (
             ROOT / "python/minisgl/layers/moe/token_dispatcher/deepep.py"

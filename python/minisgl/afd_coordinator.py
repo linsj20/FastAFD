@@ -134,6 +134,9 @@ class AfdCoordinator:
             raise RuntimeError("--afd-max-batched-tokens must be >= 1")
         self.max_seq_len = int(server_args.max_seq_len)
         self.device_comm_num_sms = max(1, int(server_args.afd_device_comm_num_sms))
+        self.async_pending_steps = max(
+            2, int(server_args.afd_async_pending_steps)
+        )
         if str(server_args.cache_type) != "naive":
             raise RuntimeError(
                 "AFD serve uses the centralized scheduler and currently supports only cache_type='naive'"
@@ -145,7 +148,7 @@ class AfdCoordinator:
         self.mlp_tp_size = int(server_args.afd_mlp_tp_size)
         self._layout = self._validate_dp_layout()
         if (
-            self.server_args.afd_model_placement == "fmha-only"
+            self.server_args.afd_model_placement == "attn-only"
             and self.attn_dp_size < self.mlp_dp_size
         ):
             raise RuntimeError(
@@ -342,7 +345,7 @@ class AfdCoordinator:
         # shared GIN slot layout must cover the largest merged MLP microbatch
         # even though each attention DP still schedules only its local
         # max_batched_tokens budget.
-        if self.server_args.afd_model_placement != "fmha-only":
+        if self.server_args.afd_model_placement != "attn-only":
             self.max_comm_tokens *= self._layout.attn_fanin_per_mlp_dp
         self.afd_num_mb = sizing.num_mb
 
@@ -524,6 +527,8 @@ class AfdCoordinator:
             f"attention_backend={self.attention_backend} "
             f"max_batched_tokens={self.max_batched_tokens} "
             f"decode_graph_bs={list(self.decode_graph_bs)} "
+            f"disable_overlap={bool(self.server_args.afd_disable_overlap)} "
+            f"async_pending_steps={self.async_pending_steps} "
             f"centralized_scheduler=True",
             flush=True,
         )
@@ -690,6 +695,12 @@ class AfdCoordinator:
             lambda: self._flush_cpu_trace("final"),
         )
 
+    def _wait_for_worker_hot_loops(self) -> None:
+        ray.get(
+            self._worker_hot_loop_refs,
+            timeout=self._shutdown_timeout_s,
+        )
+
     def _init_centralized_schedulers(self) -> None:
         if not self.attn_workers:
             raise RuntimeError("Cannot initialize centralized scheduler without attention workers")
@@ -715,7 +726,7 @@ class AfdCoordinator:
                 mlp_fanout=mlp_fanout,
                 eos_token_id=eos_token_id,
                 decode_remainder_to_last=(
-                    self.server_args.afd_model_placement == "fmha-only"
+                    self.server_args.afd_model_placement == "attn-only"
                 ),
             )
             for dp_rank in range(self._layout.attn_dp_size)
@@ -1159,7 +1170,7 @@ class AfdCoordinator:
                 ag_send_start_ns = time.perf_counter_ns()
                 self._send_cmd_to_workers(ranks, AfdRunAGStepCmd(plan=ag_plan))
                 ag_send_ns += time.perf_counter_ns() - ag_send_start_ns
-                if self.server_args.afd_model_placement == "fmha-only":
+                if self.server_args.afd_model_placement == "attn-only":
                     mlp_dp = self._layout.mlp_dp_for_attn_dp(dp)
                     model_source_plans.setdefault(mlp_dp, []).append(ag_plan)
                 pending_free[dp] = ()
@@ -1170,7 +1181,7 @@ class AfdCoordinator:
                 append_ns += time.perf_counter_ns() - append_start_ns
             ag_loop_ns = time.perf_counter_ns() - ag_loop_start_ns
 
-        if self.server_args.afd_model_placement == "fmha-only":
+        if self.server_args.afd_model_placement == "attn-only":
             model_dispatch_bucket = (
                 int(bucket) * int(self._layout.attn_fanin_per_mlp_dp)
             )
@@ -1202,7 +1213,7 @@ class AfdCoordinator:
 
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchEG", step=step_id, phase=phase)):
             eg_loop_start_ns = time.perf_counter_ns()
-            if self.server_args.afd_model_placement != "fmha-only":
+            if self.server_args.afd_model_placement != "attn-only":
                 eg_build_start_ns = time.perf_counter_ns()
                 eg_plan = AfdEGStepPlan(
                     step_id=step_id,
@@ -1349,7 +1360,7 @@ class AfdCoordinator:
         scheds = self._central_schedulers
         attn_tp = int(self.attn_tp_size)
         forward_remains = [_AfdForwardRemain() for _ in range(n_dp)]
-        max_pending = 3
+        max_pending = self.async_pending_steps
         log_line(
             self.log_path,
             f"[afd-overlap] mode=dp_lockstep_fixed_lead n_dp={n_dp} "
@@ -1482,7 +1493,7 @@ class AfdCoordinator:
     def _afd_collect_global(self, step_id, active_dps, attn_tp):
         """Collect all AG (active lanes x attn_tp) + EG replies for the global step;
         map each AG reply's tokens to its DP lane (lane = worker_rank // attn_tp)."""
-        if self.server_args.afd_model_placement == "fmha-only":
+        if self.server_args.afd_model_placement == "attn-only":
             expected = len(active_dps) * (attn_tp + self._layout.mlp_tp_size)
         else:
             expected = len(active_dps) * attn_tp + len(self._afd_expert_worker_ranks)

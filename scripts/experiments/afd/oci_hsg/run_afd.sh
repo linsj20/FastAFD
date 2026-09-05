@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a reproducible AFD point or Qwen3 topology-sweep point.
-# Usage: ./run_afd.sh [qwen3|minimax] [context] [input-batch/attention-DP-lane] [normalized-A:F-ratio] [attention-TP] [FFN-EP]
+# Usage: ./run_afd.sh [qwen3|qwen35|minimax] [context] [input-batch/attention-DP-lane] [normalized-A:F-ratio] [attention-TP] [FFN-EP]
 #
 # In the original pmap contract, the ratio is normalized by full FFN trays.
 # In the comprehensive contract, it is an active-GPU ratio:
@@ -29,8 +29,9 @@ preflight_error() {
 MODEL_KEY=${MODEL_KEY:-${1:-qwen3}}
 export AFD_MODEL_PLACEMENT_REQUESTED=${FASTAFD_AFD_MODEL_PLACEMENT:-${AFD_MODEL_PLACEMENT:-legacy}}
 case "$AFD_MODEL_PLACEMENT_REQUESTED" in
-    legacy|fmha-only|qwen3-128k-adaptive) ;;
-    *) echo "AFD_MODEL_PLACEMENT must be legacy, fmha-only, or qwen3-128k-adaptive" >&2; exit 2 ;;
+    legacy|attn-only|qwen3-128k-adaptive) ;;
+    fmha-only) AFD_MODEL_PLACEMENT_REQUESTED=attn-only ;;
+    *) echo "AFD_MODEL_PLACEMENT must be legacy, attn-only, or qwen3-128k-adaptive" >&2; exit 2 ;;
 esac
 export AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT_REQUESTED
 export AFD_MODEL_PLACEMENT_POLICY=explicit
@@ -308,6 +309,18 @@ case "$MODEL_KEY" in
             16384) DEFAULT_BATCH=48; DEFAULT_NODES=12 ;;
             *) DEFAULT_NODES=8 ;;
         esac ;;
+    qwen35)
+        MODEL_REVISION=a099dee70ccfcd8d5dda56aaa0b60cb8ecadabc9
+        MODEL_CACHE=models--Qwen--Qwen3.5-122B-A10B-FP8
+        MODEL_SOURCE_CONFIG_SHA256=""
+        MODEL_PRESET_DEFAULT=$(dirname "$(realpath "$0")")/run_afd_qwen3_parallel.sh
+        PROMPT_SOURCE_CONTEXT=8192
+        PROMPT_SHA256=26482bc14fe61372c30eed8731fae1103fe477cdf03c70e8a808c3723ede5fdb
+        MAX_SEQ_LEN=$((CONTEXT_MAX + 64))
+        MODEL_PROFILE_ID=native
+        ROPE_SCALING_FACTOR=0
+        ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=262144
+        DEFAULT_NODES=2 ;;
     minimax)
         case "$CONTEXT" in
         8192)
@@ -329,7 +342,7 @@ case "$MODEL_KEY" in
         MODEL_PROFILE_ID=native
         ROPE_SCALING_FACTOR=0
         ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=0 ;;
-    *) echo "model must be qwen3 or minimax" >&2; exit 2 ;;
+    *) echo "model must be qwen3, qwen35, or minimax" >&2; exit 2 ;;
 esac
 if [[ "$MODEL_KEY" == minimax && "$SWEEP_CONTRACT" != pmap ]]; then
     echo "MiniMax supports only the published pmap contract" >&2
@@ -339,6 +352,8 @@ if (( IRREGULAR )); then
     CURRENT_BEST_RATIO=7
 elif [[ "$MODEL_KEY" == minimax ]]; then
     CURRENT_BEST_RATIO=17
+elif [[ "$MODEL_KEY" == qwen35 ]]; then
+    CURRENT_BEST_RATIO=1
 else
     case "$CONTEXT" in
         1024) CURRENT_BEST_RATIO=1 ;;
@@ -378,14 +393,23 @@ else
         *) echo "pmap FFN EP must be 4, 8, or 16" >&2; exit 2 ;;
     esac
 fi
-# These are the minimum per-attention-DP-lane capacities measured by the
-# current TP1 results and the topology pilots. Qwen3 has four KV heads, so KV
-# sharding increases capacity through TP4 and then saturates at TP8.
-case "$ATTENTION_TP" in
-    1) AFD_KV_CAPACITY_TOKENS=839424 ;;
-    2) AFD_KV_CAPACITY_TOKENS=1674560 ;;
-    4|8) AFD_KV_CAPACITY_TOKENS=3349120 ;;
-esac
+# Qwen3 capacities below are measured per attention-DP lane. Qwen3 has four KV
+# heads, so KV sharding increases capacity through TP4 and then saturates at
+# TP8. Qwen3.5 starts with a page-aligned planning estimate; the runtime
+# page-count gate is authoritative and reports the exact scheduler ceiling.
+if [[ "$MODEL_KEY" == qwen35 ]]; then
+    [[ "$ATTENTION_TP" == 1 ]] || {
+        echo "Qwen3.5 AFD currently requires attention TP1" >&2
+        exit 2
+    }
+    AFD_KV_CAPACITY_TOKENS=6000000
+else
+    case "$ATTENTION_TP" in
+        1) AFD_KV_CAPACITY_TOKENS=839424 ;;
+        2) AFD_KV_CAPACITY_TOKENS=1674560 ;;
+        4|8) AFD_KV_CAPACITY_TOKENS=3349120 ;;
+    esac
+fi
 BASELINE_AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS
 AFD_KV_CAPACITY_TOKENS=${FASTAFD_AFD_KV_CAPACITY_TOKENS:-$AFD_KV_CAPACITY_TOKENS}
 [[ "$AFD_KV_CAPACITY_TOKENS" =~ ^[1-9][0-9]*$ ]] || {
@@ -401,7 +425,7 @@ if [[ "$AFD_MEMORY_RATIO" != 0.82 || -n "${FASTAFD_AFD_KV_CAPACITY_TOKENS:-}" ]]
         echo "tuned memory requires both FASTAFD_AFD_MEMORY_RATIO and FASTAFD_AFD_KV_CAPACITY_TOKENS" >&2
         exit 2
     }
-    (( AFD_KV_CAPACITY_TOKENS >= BASELINE_AFD_KV_CAPACITY_TOKENS )) || {
+    [[ "$MODEL_KEY" == qwen35 ]] || (( AFD_KV_CAPACITY_TOKENS >= BASELINE_AFD_KV_CAPACITY_TOKENS )) || {
         echo "tuned KV capacity cannot be below the measured 0.82 baseline" >&2
         exit 2
     }
@@ -502,7 +526,7 @@ if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
     if (( NORMALIZED_AF_RATIO >= 8 )); then
         AFD_MODEL_PLACEMENT=legacy
     else
-        AFD_MODEL_PLACEMENT=fmha-only
+        AFD_MODEL_PLACEMENT=attn-only
     fi
     export AFD_MODEL_PLACEMENT
     export AFD_MODEL_PLACEMENT_POLICY=qwen3-128k-b6-atp1-fep4-mb2-r8-crossover
@@ -510,7 +534,7 @@ if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
         "$AFD_MODEL_PLACEMENT_REQUESTED" "$AFD_MODEL_PLACEMENT" \
         "$AFD_MODEL_PLACEMENT_POLICY" "$NORMALIZED_AF_RATIO"
 fi
-if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then
+if [[ "$AFD_MODEL_PLACEMENT" == attn-only ]]; then
     DEFAULT_AFD_MOE_BACKEND=megamoe
 elif [[ "$SWEEP_CONTRACT" == pmap ]]; then
     DEFAULT_AFD_MOE_BACKEND=megamoe_m2n
@@ -522,8 +546,8 @@ case "$MINISGL_AFD_MOE_BACKEND" in
     deepep|megamoe|megamoe_m2n) ;;
     *) echo "MINISGL_AFD_MOE_BACKEND must be deepep, megamoe, or megamoe_m2n" >&2; exit 2 ;;
 esac
-if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$AFD_MODEL_PLACEMENT" != fmha-only ]]; then
-    echo "MINISGL_AFD_MOE_BACKEND=megamoe requires fmha-only placement" >&2
+if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$AFD_MODEL_PLACEMENT" != attn-only ]]; then
+    echo "MINISGL_AFD_MOE_BACKEND=megamoe requires attn-only placement" >&2
     exit 2
 fi
 if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != legacy ]]; then
@@ -546,8 +570,8 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && "$MINISGL_MEGAMOE_EXPERT_WEIGHT_D
 fi
 export MINISGL_AFD_MOE_BACKEND MINISGL_AFD_PERFECT_ROUTING
 export MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE
-if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 ]]; then
-    echo "irregular prompt-length ranges are supported only for Qwen3" >&2
+if (( IRREGULAR )) && [[ "$MODEL_KEY" != qwen3 && "$MODEL_KEY" != qwen35 ]]; then
+    echo "irregular prompt-length ranges require a Qwen model" >&2
     exit 2
 fi
 if (( IRREGULAR )) && [[ "$SWEEP_CONTRACT" != comprehensive ]] && (( NODES != 8 )); then
@@ -652,7 +676,7 @@ MICROBATCH_REMAINDER=$(( BATCH % AFD_NUM_MB ))
 MICROBATCH_REAL_SIZES=""
 MICROBATCH_SEPARATOR=""
 for ((mb_index=0; mb_index<AFD_NUM_MB; mb_index++)); do
-    if [[ "$AFD_MODEL_PLACEMENT" == fmha-only ]]; then
+    if [[ "$AFD_MODEL_PLACEMENT" == attn-only ]]; then
         mb_real_size=$(( MICROBATCH_BASE + (mb_index >= AFD_NUM_MB - MICROBATCH_REMAINDER ? 1 : 0) ))
     else
         mb_real_size=$(( MICROBATCH_BASE + (mb_index < MICROBATCH_REMAINDER ? 1 : 0) ))
@@ -1230,7 +1254,7 @@ def build_record(output_file):
     token_digest = hashlib.sha256()
     source_token_lengths = set()
     merge_gap_repairs = []
-    if model_key == "qwen3":
+    if model_key in {"qwen3", "qwen35"}:
         from minisgl.hf_support import load_tokenizer
 
         tokenizer = load_tokenizer(model_path)
@@ -1687,7 +1711,7 @@ moe_backend = os.environ["MINISGL_AFD_MOE_BACKEND"]
 megamoe_expert_weight_dtype = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"]
 num_mb = int(os.environ["AFD_NUM_MB"])
 mb_base, mb_remainder = divmod(batch, num_mb)
-if model_placement == "fmha-only":
+if model_placement == "attn-only":
     microbatch_real_sizes = [
         mb_base + (1 if mb >= num_mb - mb_remainder else 0)
         for mb in range(num_mb)
@@ -1765,7 +1789,7 @@ samples = json.loads((run / "sample.json").read_text()).get("samples", [])
 lengths = [len(x.get("generated_token_ids", [])) for x in samples]
 if len(samples) != count or set(lengths) != {output_tokens}:
     raise RuntimeError((len(samples), sorted(set(lengths))))
-if model_placement == "fmha-only":
+if model_placement == "attn-only":
     attention_trace_pattern = (
         "attention_dp*_rank*_nvtx_cpu.json"
         if attention_dp > 1
@@ -1831,7 +1855,7 @@ if (
 if len(steps) != 15 or steps != list(range(steps[0], steps[0] + 15)):
     raise RuntimeError(("target decode steps are not exactly consecutive", steps))
 trace_steps = [warmup_step, *steps]
-if model_placement == "fmha-only":
+if model_placement == "attn-only":
     trace_step_set = set(trace_steps)
     worker_trace_steps = [
         [step for step in captured if step in trace_step_set]
@@ -1959,19 +1983,19 @@ result = {
         "coordinator completion interval diagnostic only; final latency and "
         "TPS/GPU use the arithmetic mean of the dominant range among the 15 "
         "target-batch post-warmup critical CUDA spans, with its median also "
-        "reported; FMHA-only placement takes the maximum complete graph span "
+        "reported; attention-only placement takes the maximum complete graph span "
         "across one attention and one model representative"
     ),
     "primary_performance_metric": {
         "status": "pending_postprocess",
         "metric_version": (
-            "20260820-fmha-only-dual-role-cuda-graph-span-v1"
-            if model_placement == "fmha-only"
+            "20260904-attn-only-dual-role-cuda-graph-span-v1"
+            if model_placement == "attn-only"
             else "20260804-attention-cuda-execution-span-v14"
         ),
         "latency_basis": (
             "max_complete_cuda_graph_span_across_profiled_attention_and_model_roles"
-            if model_placement == "fmha-only"
+            if model_placement == "attn-only"
             else "afd_attention_cuda_execution_critical_target_batch_dominant_range_mean"
         ),
         "required_target_batch_selected_steps": 15,

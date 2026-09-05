@@ -400,7 +400,7 @@ def _validate_fp8_rows(name: str, tensor: torch.Tensor, head_dim: int) -> None:
 def _validate_packed_scales(
     scales: torch.Tensor, rows: int, width: int, head_dim: int
 ) -> None:
-    groups = (int(width) + int(head_dim) - 1) // int(head_dim)
+    groups = (int(width) + 127) // 128
     packed_groups = (groups + 3) // 4
     expected_stride = ((int(rows) + 3) // 4) * 4
     if (
@@ -421,10 +421,10 @@ def _validate_packed_scales(
 
 
 def _validate_fp8_o_quant_shape(o: torch.Tensor, head_dim: int) -> None:
-    if int(head_dim) != 128 or o.shape[1] % (4 * int(head_dim)):
+    if int(head_dim) % 128 or o.shape[1] % 512:
         raise ValueError(
-            "Fused AFD O quantization requires 128-wide heads and the existing "
-            f"four-head alignment, got width={o.shape[1]} head_dim={head_dim}"
+            "Fused AFD O quantization requires 128-element UE8M0 groups and "
+            f"four-group alignment, got width={o.shape[1]} head_dim={head_dim}"
         )
 
 
@@ -435,7 +435,7 @@ def _validate_fp8_staging(
     head_dim: int,
 ) -> None:
     _validate_fp8_rows("staged_o", staged_o, head_dim)
-    heads = int(o.shape[1]) // int(head_dim)
+    scale_groups = int(o.shape[1]) // 128
     if tuple(staged_o.shape) != tuple(o.shape):
         raise ValueError(
             "AFD staged FP8 O must match the BF16 O shape: "
@@ -445,11 +445,11 @@ def _validate_fp8_staging(
         staged_scales.dtype != torch.uint8
         or not staged_scales.is_cuda
         or not staged_scales.is_contiguous()
-        or tuple(staged_scales.shape) != (int(o.shape[0]), heads)
+        or tuple(staged_scales.shape) != (int(o.shape[0]), scale_groups)
     ):
         raise ValueError(
             "AFD staged O scales must be contiguous CUDA uint8 with one UE8M0 "
-            f"byte per row and head, got shape={tuple(staged_scales.shape)} "
+            f"byte per row and 128 elements, got shape={tuple(staged_scales.shape)} "
             f"dtype={staged_scales.dtype} device={staged_scales.device} "
             f"stride={staged_scales.stride()}"
         )

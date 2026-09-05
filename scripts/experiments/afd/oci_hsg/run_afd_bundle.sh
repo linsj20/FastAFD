@@ -39,6 +39,7 @@ MIN_REMAINING_SECONDS=${FASTAFD_MIN_REMAINING_SECONDS:-900}
 MAX_FAILURES=${FASTAFD_MAX_FAILURES:-2}
 CASE_TIMEOUT_SECONDS=${FASTAFD_CASE_TIMEOUT_SECONDS:-1800}
 MODEL_PLACEMENT=${FASTAFD_AFD_MODEL_PLACEMENT:-legacy}
+[[ "$MODEL_PLACEMENT" != fmha-only ]] || MODEL_PLACEMENT=attn-only
 MAX_NUM_MB=${FASTAFD_AFD_NUM_MB:-2}
 POOL_SELECTION_MODE=${FASTAFD_POOL_SELECTION_MODE:-auto}
 AUTO_RELEASE_FAILED=${FASTAFD_AUTO_RELEASE_FAILED:-0}
@@ -59,7 +60,7 @@ PROMPT_CACHE_ROOT=${FASTAFD_PROMPT_CACHE_ROOT:-}
 [[ "$MAX_FAILURES" == 2 ]]
 [[ "$CASE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]
 (( CASE_TIMEOUT_SECONDS >= 600 && CASE_TIMEOUT_SECONDS <= 3600 ))
-[[ "$MODEL_PLACEMENT" == legacy || "$MODEL_PLACEMENT" == fmha-only ]]
+[[ "$MODEL_PLACEMENT" == legacy || "$MODEL_PLACEMENT" == attn-only ]]
 [[ "$MAX_NUM_MB" =~ ^[1-9][0-9]*$ ]]
 [[ "$POOL_SELECTION_MODE" == auto || "$POOL_SELECTION_MODE" == isl-desc ]]
 [[ "$AUTO_RELEASE_FAILED" == 0 || "$AUTO_RELEASE_FAILED" == 1 ]]
@@ -109,13 +110,13 @@ if [[ "$TEST_MODE" == 0 && "${FASTAFD_BUNDLE_INSIDE:-0}" != 1 ]]; then
     mapfile -t ALLOCATED_HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
     (( ${#ALLOCATED_HOSTS[@]} == NODES ))
     HEAD_HOST=${ALLOCATED_HOSTS[0]}
-    if [[ "$MODEL_PLACEMENT" == fmha-only ]]; then
+    if [[ "$MODEL_PLACEMENT" == attn-only ]]; then
         mapfile -t FABRIC_BLOCKS < <(
             printf '%s\n' "${ALLOCATED_HOSTS[@]}" |
                 sed -E 's/-T[0-9]+$//' | sort -u
         )
         (( ${#FABRIC_BLOCKS[@]} == 1 )) || {
-            printf 'FMHA-only allocation must remain in one NVL72 fabric block; blocks=%s nodes=%s\n' \
+            printf 'attn-only allocation must remain in one NVL72 fabric block; blocks=%s nodes=%s\n' \
                 "${FABRIC_BLOCKS[*]}" "${ALLOCATED_HOSTS[*]}" >&2
             exit 2
         }

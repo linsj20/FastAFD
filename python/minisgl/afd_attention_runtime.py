@@ -341,6 +341,7 @@ class AfdAttentionRuntime:
         batch.positions_host = positions_host
         batch.positions = positions_host.to(self.state.device, non_blocking=True)
         table_indices = table_indices_host.to(self.state.device, non_blocking=True)
+        batch.state_indices = table_indices
         if plan.phase == "decode":
             batch.afd_req_table_indices_gpu = table_indices
         pos_i64 = batch.positions.to(torch.int64)
@@ -371,6 +372,7 @@ class AfdAttentionRuntime:
             sb.positions = batch.positions[ts:te]
             sb.input_ids = batch.input_ids[ts:te]
             sb.out_loc = batch.out_loc[ts:te]
+            sb.state_indices = batch.state_indices[ts:te]
             metadata = batch.attn_metadata_mbs[mb]
             if metadata is not None:
                 sb.attn_metadata = metadata

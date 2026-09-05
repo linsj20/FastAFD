@@ -17,6 +17,8 @@ from minisgl.afd_fmha_protocol import (
 )
 from minisgl.kernel.afd_fmha_transport import (
     ensure_afd_fmha_transport_built,
+    publish_o,
+    publish_o_release_turn,
     publish_qkv,
     quantize_publish_o_fp8,
     quantize_publish_o_fp8_release_turn,
@@ -67,6 +69,9 @@ class _FabricRecord:
     o_ready_shape: tuple[int, ...] = ()
     o_ready_offset: int = 0
     o_ready_writers: tuple[int, ...] = ()
+    linear_o_handle: bytes | None = None
+    linear_o_shape: tuple[int, ...] = ()
+    linear_o_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -110,11 +115,43 @@ class AfdFmhaRuntime:
         self.device = self.state.device
         self.role = worker.role
         self.head_dim = int(self.model_config.head_dim)
-        if self.head_dim != 128 or self.config.dtype != torch.bfloat16:
+        if self.head_dim % 128 or self.config.dtype != torch.bfloat16:
             raise RuntimeError(
-                "FMHA-only placement requires BF16 activations with head_dim=128, "
+                "FMHA-only placement requires BF16 activations and head_dim "
+                "divisible by 128, "
                 f"got dtype={self.config.dtype} head_dim={self.head_dim}"
             )
+        self.remote_attention_layers = tuple(
+            layer_id
+            for layer_id, layer_type in enumerate(self.model_config.layer_types)
+            if layer_type == "full_attention"
+        )
+        if not self.remote_attention_layers:
+            raise RuntimeError("FMHA-only placement requires full-attention layers")
+        self.remote_attention_index = {
+            layer_id: index
+            for index, layer_id in enumerate(self.remote_attention_layers)
+        }
+        self.q_transport_multiplier = (
+            2 if bool(self.model_config.attn_output_gate) else 1
+        )
+        self.is_hybrid_attention = bool(self.model_config.is_hybrid_attention)
+        if self.is_hybrid_attention:
+            if int(worker.attn_tp_size) != 1 or int(worker.mlp_tp_size) != 1:
+                raise RuntimeError(
+                    "Qwen3.5 attention-only placement currently requires TP1 "
+                    f"on both stages, got attention_tp={worker.attn_tp_size} "
+                    f"model_tp={worker.mlp_tp_size}"
+                )
+            if int(self.model_config.hidden_size) % self.head_dim:
+                raise RuntimeError(
+                    "Qwen3.5 hidden size must be divisible by attention head dim"
+                )
+        self.linear_payload_heads = (
+            int(self.model_config.hidden_size) // self.head_dim
+            if self.is_hybrid_attention
+            else 0
+        )
         if worker.attn_dp_size < worker.mlp_dp_size:
             raise RuntimeError(
                 "FMHA-only placement requires at least as many attention DP lanes "
@@ -138,18 +175,21 @@ class AfdFmhaRuntime:
                 "FMHA-only placement requires at least one microbatch, "
                 f"got --afd-num-mb {self.num_mb}"
             )
+        self.transport_rounds_per_step = (
+            int(self.model_config.num_layers) * self.num_mb
+        )
         self.num_lanes = min(2, self.num_mb)
         self.transport_slots = 2
         if (
             worker.enable_decode_graph
-            and int(self.model_config.num_layers) * self.num_mb
-            <= self.transport_slots
+            and self.transport_rounds_per_step <= self.transport_slots
         ):
             raise RuntimeError(
                 "FMHA-only exact readiness tickets require more graph rounds "
                 "than transport slots so replay cannot observe its prior final "
                 "ticket: "
-                f"layers={int(self.model_config.num_layers)} num_mb={self.num_mb} "
+                f"remote_layers={len(self.remote_attention_layers)} "
+                f"num_mb={self.num_mb} "
                 f"slots={self.transport_slots}"
             )
         if self.role == "attention" and len(self.state.attn_backends) < self.num_mb:
@@ -196,8 +236,9 @@ class AfdFmhaRuntime:
                 "FP8 O transport requires four-head-aligned TP slices: "
                 f"slices={invalid_o_slices}"
             )
+        self.scale_groups_per_head = self.head_dim // 128
         self.o_scale_packed_groups = div_ceil(
-            self.table.model_local_q_heads, 4
+            self.table.model_local_q_heads * self.scale_groups_per_head, 4
         )
         self.o_scale_row_stride = div_ceil(self.max_rows, 4) * 4
         self.o_scale_slot_elements = (
@@ -214,6 +255,7 @@ class AfdFmhaRuntime:
         self._create_moe_group()
         self._allocate_and_map_transport()
         if self.role == "mlp":
+            self.attention_model = None
             self._init_model_materializer_namespaces()
             self._create_tp_lane_communicators()
             self._load_model()
@@ -221,6 +263,7 @@ class AfdFmhaRuntime:
         else:
             self.model = None
             self.sampler = None
+            self._load_attention_model()
         self._graph_pool = None
         self._decode_graphs: dict[tuple[int, int], _FmhaDecodeGraph] = {}
         self._graph_output_free: torch.cuda.Event | None = None
@@ -261,6 +304,9 @@ class AfdFmhaRuntime:
         )
         self._graph_positions = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self._graph_state_indices = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
         )
         self._graph_out_loc = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
@@ -331,7 +377,7 @@ class AfdFmhaRuntime:
             expected_q_shape = (
                 self.transport_slots,
                 self.max_rows,
-                self.table.attn_local_q_heads,
+                self.table.attn_local_q_heads * self.q_transport_multiplier,
                 self.head_dim,
             )
             expected_q_ready_shape = (self.transport_slots, len(q_ready_writers))
@@ -364,7 +410,7 @@ class AfdFmhaRuntime:
                 (
                     self.transport_slots,
                     self.max_rows,
-                    self.table.attn_local_q_heads,
+                    self.table.attn_local_q_heads * self.scale_groups_per_head,
                 ),
                 dtype=torch.uint8,
                 device=self.device,
@@ -374,6 +420,7 @@ class AfdFmhaRuntime:
                 raise RuntimeError("FMHA-only attention state is missing fabric-owned KV")
             self.o_owner = None
             self.o_scale_owner = None
+            self.linear_o_owner = None
             attention_handle = self.q_owner.handle
             if not (
                 self.q_owner.allocation is self.q_ready_owner.allocation
@@ -407,34 +454,52 @@ class AfdFmhaRuntime:
             )
             if not o_ready_writers:
                 raise RuntimeError("model rank has no O transport writers")
-            (
-                self.o_owner,
-                self.o_scale_owner,
-                self.o_ready_owner,
-            ) = allocate_fabric_tensors(
+            allocation_specs = [
                 (
                     (
-                        (
                             self.transport_slots,
                             self.max_rows,
                             self.table.model_local_q_heads,
                             self.head_dim,
+                    ),
+                    torch.float8_e4m3fn,
+                ),
+                (
+                    (self.transport_slots, self.o_scale_slot_elements),
+                    torch.int32,
+                ),
+                (
+                    (
+                        self.transport_slots,
+                        self.fanin,
+                        len(o_ready_writers),
+                    ),
+                    torch.int64,
+                ),
+            ]
+            if self.is_hybrid_attention:
+                allocation_specs.append(
+                    (
+                        (
+                            self.transport_slots,
+                            self.max_rows,
+                            self.linear_payload_heads,
+                            self.head_dim,
                         ),
-                        torch.float8_e4m3fn,
-                    ),
-                    (
-                        (self.transport_slots, self.o_scale_slot_elements),
-                        torch.int32,
-                    ),
-                    (
-                        (self.transport_slots, self.fanin, len(o_ready_writers)),
-                        torch.int64,
-                    ),
+                        torch.bfloat16,
+                    )
                 )
-            )
+            allocations = allocate_fabric_tensors(tuple(allocation_specs))
+            self.o_owner, self.o_scale_owner, self.o_ready_owner = allocations[:3]
+            self.linear_o_owner = allocations[3] if self.is_hybrid_attention else None
             self.o_slots = self.o_owner.tensor
             self.o_scale_slots = self.o_scale_owner.tensor
             self.o_ready = self.o_ready_owner.tensor
+            self.linear_o_slots = (
+                self.linear_o_owner.tensor
+                if self.linear_o_owner is not None
+                else None
+            )
             self.o_ready.zero_()
             self.q_publish_counters = torch.zeros(
                 (self.transport_slots,), dtype=torch.int32, device=self.device
@@ -444,6 +509,10 @@ class AfdFmhaRuntime:
             if not (
                 self.o_owner.allocation is self.o_scale_owner.allocation
                 and self.o_owner.allocation is self.o_ready_owner.allocation
+                and (
+                    self.linear_o_owner is None
+                    or self.o_owner.allocation is self.linear_o_owner.allocation
+                )
             ):
                 raise RuntimeError(
                     "FMHA FP8 O, scales, and ready views must share one fabric arena"
@@ -462,6 +531,19 @@ class AfdFmhaRuntime:
                 o_ready_shape=tuple(int(x) for x in self.o_ready.shape),
                 o_ready_offset=int(self.o_ready_owner.byte_offset),
                 o_ready_writers=o_ready_writers,
+                linear_o_handle=(
+                    model_handle if self.linear_o_owner is not None else None
+                ),
+                linear_o_shape=(
+                    tuple(int(x) for x in self.linear_o_slots.shape)
+                    if self.linear_o_slots is not None
+                    else ()
+                ),
+                linear_o_offset=(
+                    int(self.linear_o_owner.byte_offset)
+                    if self.linear_o_owner is not None
+                    else 0
+                ),
             )
         torch.cuda.synchronize(self.device)
         records: list[_FabricRecord | None] = [None] * int(self.worker._topology.total_workers)
@@ -562,6 +644,7 @@ class AfdFmhaRuntime:
         worker = self.worker
         if self.role == "mlp":
             q_rows: list[list[int]] = []
+            linear_q_rows: list[list[int]] = []
             kv_rows: list[list[int]] = []
             q_ready_rows: list[list[int]] = []
             for source_index, attn_dp_rank in enumerate(
@@ -573,17 +656,23 @@ class AfdFmhaRuntime:
                     source_index=source_index,
                     include_q_ready=source_index == 0,
                     q_rows=q_rows,
+                    linear_q_rows=linear_q_rows,
                     kv_rows=kv_rows,
                     q_ready_rows=q_ready_rows,
                 )
             self.q_descriptors = self._descriptor_tensor(q_rows, 7)
+            self.linear_q_descriptors = self._descriptor_tensor(
+                linear_q_rows, 7
+            )
             self.kv_descriptors = self._descriptor_tensor(kv_rows, 8)
             self.q_ready_descriptors = self._descriptor_tensor(q_ready_rows, 3)
             self.o_descriptors = self._descriptor_tensor([], 10)
+            self.linear_o_descriptors = self._descriptor_tensor([], 7)
             self.o_ready_descriptors = self._descriptor_tensor([], 3)
             return
 
         o_rows: list[list[int]] = []
+        linear_o_rows: list[list[int]] = []
         o_ready_rows: list[list[int]] = []
         mlp_dp_rank = self.worker._topology.mlp_dp_for_attn_dp(
             int(worker.attn_dp_rank)
@@ -620,6 +709,20 @@ class AfdFmhaRuntime:
                     source_count=len(mapped_sources),
                 )
             )
+        if self.is_hybrid_attention:
+            record = self._record(records, "mlp", mlp_dp_rank, 0)
+            mapping = self._import("linear_o", record)
+            linear_o_rows.append(
+                [
+                    int(mapping.tensor.data_ptr()),
+                    0,
+                    0,
+                    self.linear_payload_heads,
+                    self.linear_payload_heads,
+                    int(record.linear_o_shape[1]),
+                    source_index,
+                ]
+            )
         o_ready_destinations = sorted(
             {
                 head_slice.destination_tp_rank
@@ -639,9 +742,11 @@ class AfdFmhaRuntime:
                 )
             )
         self.q_descriptors = self._descriptor_tensor([], 7)
+        self.linear_q_descriptors = self._descriptor_tensor([], 7)
         self.kv_descriptors = self._descriptor_tensor([], 8)
         self.q_ready_descriptors = self._descriptor_tensor([], 3)
         self.o_descriptors = self._descriptor_tensor(o_rows, 10)
+        self.linear_o_descriptors = self._descriptor_tensor(linear_o_rows, 7)
         self.o_ready_descriptors = self._descriptor_tensor(o_ready_rows, 3)
 
     def _append_model_input_descriptors(
@@ -652,6 +757,7 @@ class AfdFmhaRuntime:
         source_index: int,
         include_q_ready: bool,
         q_rows: list[list[int]],
+        linear_q_rows: list[list[int]],
         kv_rows: list[list[int]],
         q_ready_rows: list[list[int]],
     ) -> None:
@@ -666,14 +772,32 @@ class AfdFmhaRuntime:
                 head_slice.destination_tp_rank,
             )
             mapping = self._import("q", record)
-            q_rows.append(
-                self._slot_descriptor(
-                    mapping,
-                    head_slice,
-                    self.table.attn_local_q_heads,
-                    slot_rows=int(record.q_shape[1]),
-                    source_index=source_index,
-                )
+            descriptor = self._slot_descriptor(
+                mapping,
+                head_slice,
+                self.table.attn_local_q_heads * self.q_transport_multiplier,
+                slot_rows=int(record.q_shape[1]),
+                source_index=source_index,
+            )
+            q_rows.append(descriptor)
+            if self.q_transport_multiplier == 2:
+                gate_descriptor = list(descriptor)
+                gate_descriptor[1] += self.table.model_local_q_heads
+                gate_descriptor[2] += self.table.attn_local_q_heads
+                q_rows.append(gate_descriptor)
+        if self.is_hybrid_attention:
+            record = self._record(records, "attention", int(attn_dp_rank), 0)
+            mapping = self._import("q", record)
+            linear_q_rows.append(
+                [
+                    int(mapping.tensor.data_ptr()),
+                    0,
+                    0,
+                    self.linear_payload_heads,
+                    self.table.attn_local_q_heads * self.q_transport_multiplier,
+                    int(record.q_shape[1]),
+                    int(source_index),
+                ]
             )
         for head_slice in self.table.kv_slices:
             if head_slice.source_tp_rank != int(worker.tp_rank):
@@ -694,7 +818,7 @@ class AfdFmhaRuntime:
                     head_slice.head_count,
                     self.table.attn_local_kv_heads,
                     cache_rows,
-                    int(self.model_config.num_layers),
+                    int(self.model_config.num_full_attention_layers),
                     int(source_index),
                 ]
             )
@@ -866,7 +990,9 @@ class AfdFmhaRuntime:
         expected_scale_elements = (
             div_ceil(slot_rows, 4)
             * 4
-            * div_ceil(int(destination_local_heads), 4)
+            * div_ceil(
+                int(destination_local_heads) * self.scale_groups_per_head, 4
+            )
         )
         scale_shape = tuple(int(x) for x in record.o_scale_shape)
         if scale_shape != (self.transport_slots, expected_scale_elements):
@@ -939,30 +1065,83 @@ class AfdFmhaRuntime:
         from minisgl.engine.sample import Sampler
         from minisgl.models import load_weight
         from minisgl.models.qwen3_moe import Qwen3MoeForCausalLM
+        from minisgl.models.qwen35_moe_afd import Qwen3_5AttnOnlyForCausalLM
         from minisgl.layers import set_rope_device
 
         architectures = tuple(getattr(self.model_config, "architectures", ()))
-        if "Qwen3MoeForCausalLM" not in architectures:
+        if "Qwen3MoeForCausalLM" in architectures:
+            model_type = Qwen3MoeForCausalLM
+        elif "Qwen3_5MoeForConditionalGeneration" in architectures:
+            model_type = Qwen3_5AttnOnlyForCausalLM
+        else:
             raise RuntimeError(
-                "FMHA-only placement currently supports Qwen3MoeForCausalLM, "
+                "attention-only placement supports Qwen3 and Qwen3.5 MoE, "
                 f"got architectures={architectures}"
             )
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(self.config.dtype):
-            model = Qwen3MoeForCausalLM(self.model_config)
-        weights = {
-            key: (
-                value
-                if value.dtype == torch.float8_e4m3fn
-                or (value.dtype == torch.float32 and key.endswith("_scale"))
-                else value.to(self.config.dtype)
-            )
-            for key, value in load_weight(self.config.model_path, self.device)
-        }
+            model = model_type(self.model_config)
+        weights = self._load_selected_weights(model, load_weight)
         model.load_state_dict(weights)
         self.model = model
         self.sampler = Sampler(self.device, int(self.model_config.vocab_size))
 
+    def _load_attention_model(self) -> None:
+        self.attention_model = None
+        if not self.is_hybrid_attention:
+            return
+        from minisgl.layers import set_rope_device
+        from minisgl.models import load_weight
+        from minisgl.models.qwen35_moe_afd import Qwen3_5AttnOnlyAttentionStage
+
+        set_rope_device(self.device)
+        with torch.device("meta"), torch_dtype(self.config.dtype):
+            model = Qwen3_5AttnOnlyAttentionStage(self.model_config)
+        weights = self._load_selected_weights(
+            model, load_weight, skip_expert_weights=True
+        )
+        model.load_state_dict(weights)
+        self.attention_model = model
+
+    def _load_selected_weights(
+        self,
+        model: Any,
+        load_weight: Any,
+        *,
+        skip_expert_weights: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        expected = model.state_dict()
+        weights: dict[str, torch.Tensor] = {}
+        is_qwen35 = self.is_hybrid_attention
+
+        def keep_fp32(key: str) -> bool:
+            return is_qwen35 and (
+                key.endswith(".linear_attn.A_log")
+                or key.endswith("_input_scale")
+                or key.endswith("_weight_scale_2")
+            )
+
+        for key, value in load_weight(
+            self.config.model_path,
+            self.device,
+            skip_expert_weights=skip_expert_weights,
+        ):
+            if key not in expected:
+                continue
+            if value.dtype in (torch.uint8, torch.float8_e4m3fn) or (
+                value.dtype == torch.float32 and key.endswith("_scale")
+            ):
+                weights[key] = value
+            elif keep_fp32(key):
+                weights[key] = value.to(torch.float32)
+            else:
+                weights[key] = value.to(self.config.dtype)
+        missing = tuple(key for key in expected if key not in weights)
+        if missing:
+            raise RuntimeError(
+                f"attention-only stage is missing checkpoint tensors: {missing[:8]}"
+            )
+        return weights
 
     @staticmethod
     def _quantize_attention_o(
@@ -987,6 +1166,15 @@ class AfdFmhaRuntime:
         per_mb_bs = max(graph_sizes)
         batch = self._build_capture_batch(per_mb_bs)
         ctx = self.state.ctx
+        full_layer = self.remote_attention_layers[0]
+        linear_layer = next(
+            (
+                layer_id
+                for layer_id, layer_type in enumerate(self.model_config.layer_types)
+                if layer_type == "linear_attention"
+            ),
+            None,
+        )
         for mb, sub in enumerate(batch.afd_mb_subbatches):
             stream = (
                 self._decode_lane_streams[mb % self.num_lanes]
@@ -1011,7 +1199,20 @@ class AfdFmhaRuntime:
                     torch.cuda.stream(stream),
                     ctx.forward_batch(sub),
                 ):
-                    o = backend.forward_prepared(q, 0, sub)
+                    if linear_layer is not None:
+                        if self.attention_model is None:
+                            raise RuntimeError(
+                                "Qwen3.5 linear-attention stage is not loaded"
+                            )
+                        linear_input = torch.zeros(
+                            (per_mb_bs, int(self.model_config.hidden_size)),
+                            dtype=self.config.dtype,
+                            device=self.device,
+                        )
+                        self.attention_model.forward_linear(
+                            linear_layer, linear_input
+                        )
+                    o = backend.forward_prepared(q, full_layer, sub)
                     self._quantize_attention_o(o.view(per_mb_bs, -1))
                 stream.synchronize()
             finally:
@@ -1062,24 +1263,34 @@ class AfdFmhaRuntime:
                         layer.mlp.experts.dispatcher.prepare_for_capture(self.device)
 
                 with self._tp_lane_context(0), ctx.forward_batch(sub):
-                    hidden = self.model.embed_input_ids(sub.input_ids)
-                    _qkv, residual = layers[0].prepare_attention(hidden, None)
-                    o = torch.zeros(
-                        (
-                            merged_per_mb_bs,
-                            self.table.model_local_q_heads * self.head_dim,
-                        ),
-                        dtype=self.config.dtype,
-                        device=self.device,
-                    )
-                    o_fp8, o_scale = self._quantize_attention_o(o)
-                    hidden = layers[0].self_attn.finish_attention_fp8(
-                        o_fp8, o_scale
-                    )
-                    hidden, _residual = layers[0].post_attention_layernorm.forward(
-                        hidden, residual
-                    )
-                    self._run_model_moe(0, layers[0], hidden, lane=0)
+                    embedded = self.model.embed_input_ids(sub.input_ids)
+                    representative_layers = [0]
+                    if self.is_hybrid_attention:
+                        representative_layers.append(self.remote_attention_layers[0])
+                    for layer_id in dict.fromkeys(representative_layers):
+                        layer = layers[layer_id]
+                        _payload, residual = layer.prepare_attention(
+                            embedded, None
+                        )
+                        if self.model_config.layer_types[layer_id] == "linear_attention":
+                            hidden = torch.zeros_like(embedded)
+                        else:
+                            o = torch.zeros(
+                                (
+                                    merged_per_mb_bs,
+                                    self.table.model_local_q_heads * self.head_dim,
+                                ),
+                                dtype=self.config.dtype,
+                                device=self.device,
+                            )
+                            o_fp8, o_scale = self._quantize_attention_o(o)
+                            hidden = layer.self_attn.finish_attention_fp8(
+                                o_fp8, o_scale
+                            )
+                        hidden, _residual = layer.post_attention_layernorm.forward(
+                            hidden, residual
+                        )
+                        self._run_model_moe(layer_id, layer, hidden, lane=0)
                     # The fused router removes the model path's former cuBLAS
                     # gate GEMM. Materialize the remaining cuBLAS handle and
                     # exact-batch LM-head plan before CUDA graph capture.
@@ -1334,6 +1545,8 @@ class AfdFmhaRuntime:
     ) -> torch.Tensor:
         mega_moe = getattr(self, "_mega_moe", None)
         if mega_moe is None:
+            if self.is_hybrid_attention:
+                return layer.mlp.forward(hidden)
             prepared = layer.mlp.prepare_deepep(hidden)
             return layer.mlp.finish_deepep(prepared)
         output = mega_moe.forward(
@@ -1345,6 +1558,14 @@ class AfdFmhaRuntime:
         )
         if int(layer.mlp.experts.tp_size) > 1:
             output = layer.mlp.experts._comm.all_reduce(output)
+        if self.is_hybrid_attention:
+            from minisgl.models.qwen35_moe import qwen35_shared_output
+
+            shared = qwen35_shared_output(
+                layer.mlp.shared_expert.forward(hidden),
+                layer.mlp.shared_expert_gate.forward(hidden),
+            )
+            output = output + shared
         return output
 
     def warmup_decode_graphs(self, bs_list: tuple[int, ...]) -> list[int]:
@@ -1385,6 +1606,7 @@ class AfdFmhaRuntime:
         batch.input_ids = self._graph_input_ids[:bs]
         batch.positions = self._graph_positions[:bs]
         batch.out_loc = self._graph_out_loc[:bs]
+        batch.state_indices = self._graph_state_indices[:bs]
         batch.afd_num_sampling = int(bs)
         batch.afd_last_indices = self._graph_last_indices[:bs]
         batch.afd_writeback = {
@@ -1405,6 +1627,7 @@ class AfdFmhaRuntime:
             sub.input_ids = self._graph_input_ids[start:end]
             sub.positions = self._graph_positions[start:end]
             sub.out_loc = self._graph_out_loc[start:end]
+            sub.state_indices = self._graph_state_indices[start:end]
             if self.role == "attention":
                 backend = self.state.attn_backends[mb]
                 if mb not in self._capture_backends_initialized:
@@ -1765,9 +1988,15 @@ class AfdFmhaRuntime:
                 ctx.mlp_deepep_buffer = moe_buffers[mb % len(moe_buffers)]
             try:
                 with self._tp_lane_context(mb), ctx.forward_batch(sub):
-                    o_fp8, o_scale = self.receive_attention_o(sub, epoch)
-                    hidden[mb] = layer.self_attn.finish_attention_fp8(
-                        o_fp8, o_scale
+                    output, output_scale = self.receive_attention_o(
+                        sub, epoch, layer_id
+                    )
+                    hidden[mb] = (
+                        output
+                        if output_scale is None
+                        else layer.self_attn.finish_attention_fp8(
+                            output, output_scale
+                        )
                     )
                     hidden[mb], residual[mb] = (
                         layer.post_attention_layernorm.forward(
@@ -1860,6 +2089,19 @@ class AfdFmhaRuntime:
                 qkv, residual[mb] = layer.prepare_attention(
                     hidden[mb], residual[mb]
                 )
+                if (
+                    self.is_hybrid_attention
+                    and self.model_config.layer_types[layer_id]
+                    == "linear_attention"
+                ):
+                    handoff_event.record(lane_stream)
+                    self.publish_model_qkv(
+                        qkv,
+                        sub,
+                        layer=layer_id,
+                        epoch=epoch,
+                    )
+                    return
                 q, k, v = self.prepare_model_qkv(qkv, sub, layer=layer_id)
                 handoff_event.record(lane_stream)
                 self.publish_model_qkv_payload(
@@ -1899,10 +2141,16 @@ class AfdFmhaRuntime:
             # The O wait can be resident while the peer computes. Heavy local
             # work starts only after both O-ready and prior-compute-done.
             with lane_context(mb, lane):
-                o_fp8, o_scale = self.receive_attention_o(sub, epoch)
+                output, output_scale = self.receive_attention_o(
+                    sub, epoch, layer_id
+                )
                 lane_stream.wait_event(previous_compute_event)
-                hidden[mb] = layer.self_attn.finish_attention_fp8(
-                    o_fp8, o_scale
+                hidden[mb] = (
+                    output
+                    if output_scale is None
+                    else layer.self_attn.finish_attention_fp8(
+                        output, output_scale
+                    )
                 )
                 hidden[mb], residual[mb] = (
                     layer.post_attention_layernorm.forward(
@@ -2005,6 +2253,7 @@ class AfdFmhaRuntime:
         assert self._graph_input_ids is not None
         self._graph_positions[:bs].copy_(batch.positions)
         self._graph_out_loc[:bs].copy_(batch.out_loc)
+        self._graph_state_indices[:bs].copy_(batch.state_indices)
         if self.role == "attention":
             capture_batch = entry.batch
             capture_batch.reqs = batch.reqs
@@ -2118,6 +2367,30 @@ class AfdFmhaRuntime:
         layer: int,
         epoch: int,
     ) -> None:
+        if self.model_config.layer_types[layer] == "linear_attention":
+            source_offsets = batch.afd_fmha_source_token_offsets_device
+            if source_offsets is None:
+                raise RuntimeError(
+                    "linear-attention publication requires source offsets"
+                )
+            slot = epoch % self.transport_slots
+            empty = qkv.new_empty((int(qkv.shape[0]), 0))
+            publish_qkv(
+                qkv,
+                empty,
+                empty,
+                batch.out_loc,
+                source_offsets,
+                self.linear_q_descriptors,
+                self.kv_descriptors[:0],
+                self.q_ready_descriptors,
+                self.q_publish_counters[slot : slot + 1],
+                layer=0,
+                slot=slot,
+                head_dim=self.head_dim,
+                ready_value=epoch + 1,
+            )
+            return
         q, k, v = self.prepare_model_qkv(qkv, batch, layer=layer)
         self.publish_model_qkv_payload(
             q,
@@ -2137,10 +2410,18 @@ class AfdFmhaRuntime:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q_dim = self.table.model_local_q_heads * self.head_dim
         kv_dim = self.table.model_local_kv_heads * self.head_dim
-        q, k, v = qkv.split((q_dim, kv_dim, kv_dim), dim=-1)
+        q_gate, k, v = qkv.split(
+            (q_dim * self.q_transport_multiplier, kv_dim, kv_dim), dim=-1
+        )
         attention = self.model.model.layers.op_list[layer].self_attn.attn
+        if self.q_transport_multiplier == 2:
+            q, gate = self.model.model.layers.op_list[
+                layer
+            ].self_attn.split_query_gate(q_gate)
+        else:
+            q, gate = q_gate, None
         q, k = attention.apply_qk_norm_rope(batch.positions, q, k)
-        return q, k, v
+        return (torch.cat((q, gate), dim=-1) if gate is not None else q), k, v
 
     def publish_model_qkv_payload(
         self,
@@ -2168,7 +2449,7 @@ class AfdFmhaRuntime:
             self.kv_descriptors,
             self.q_ready_descriptors,
             self.q_publish_counters[slot : slot + 1],
-            layer=layer,
+            layer=self.remote_attention_index[layer],
             slot=slot,
             head_dim=self.head_dim,
             ready_value=epoch + 1,
@@ -2240,7 +2521,54 @@ class AfdFmhaRuntime:
                 turn=attention_turn,
                 expected_turn=expected_turn,
             )
+        if self.model_config.layer_types[layer] == "linear_attention":
+            if self.attention_model is None:
+                raise RuntimeError("Qwen3.5 linear-attention stage is not loaded")
+            linear_input = q_slot.view(rows, -1)[
+                :, : int(self.model_config.hidden_size)
+            ]
+            o = self.attention_model.forward_linear(layer, linear_input)
+            if attention_turn is None:
+                publish_o(
+                    o,
+                    self.linear_o_descriptors,
+                    self.o_ready_descriptors,
+                    self.o_publish_counters[slot : slot + 1],
+                    slot=slot,
+                    destination_source_stride=destination_source_stride,
+                    head_dim=self.head_dim,
+                    ready_value=epoch + 1,
+                )
+            else:
+                assert next_turn is not None
+                publish_o_release_turn(
+                    o,
+                    self.linear_o_descriptors,
+                    self.o_ready_descriptors,
+                    self.o_publish_counters[slot : slot + 1],
+                    attention_turn,
+                    slot=slot,
+                    destination_source_stride=destination_source_stride,
+                    next_turn=next_turn,
+                    head_dim=self.head_dim,
+                    ready_value=epoch + 1,
+                )
+            if enqueue_next_q_wait:
+                assert expected_turn is not None
+                self._wait_attention_q(
+                    batch,
+                    epoch=epoch + self.num_mb,
+                    turn=attention_turn,
+                    expected_turn=expected_turn + self.num_mb,
+                )
+            return
+        if self.q_transport_multiplier == 2:
+            q_slot, gate = q_slot.chunk(2, dim=1)
+        else:
+            gate = None
         o = self.state.ctx.attn_backend.forward_prepared(q_slot, layer, batch)
+        if gate is not None:
+            o = o * torch.sigmoid(gate)
         o = o.view(rows, -1).contiguous()
         staged_o = self.o_fp8_staging[slot, :rows]
         staged_scales = self.o_scale_staging[slot, :rows]
@@ -2287,8 +2615,8 @@ class AfdFmhaRuntime:
             )
 
     def receive_attention_o(
-        self, batch: Any, epoch: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, batch: Any, epoch: int, layer: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         source_offsets = tuple(
             int(value) for value in batch.afd_fmha_source_token_offsets
         )
@@ -2315,6 +2643,30 @@ class AfdFmhaRuntime:
             head_dim=self.head_dim,
             expected_ready=epoch + 1,
         )
+        if (
+            layer is not None
+            and self.model_config.layer_types[layer] == "linear_attention"
+        ):
+            if self.linear_o_slots is None:
+                raise RuntimeError("Qwen3.5 linear-attention output arena is missing")
+            if batch.phase == "decode":
+                return self.linear_o_slots[slot, :rows].view(rows, -1), None
+            output = torch.empty(
+                (rows, int(self.model_config.hidden_size)),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            for source, (left, right) in enumerate(
+                zip(source_offsets, source_offsets[1:])
+            ):
+                count = right - left
+                source_start = source * self.source_max_rows
+                output[left:right].copy_(
+                    self.linear_o_slots[
+                        slot, source_start : source_start + count
+                    ].view(count, -1)
+                )
+            return output, None
         source_rows = tuple(
             right - left for left, right in zip(source_offsets, source_offsets[1:])
         )

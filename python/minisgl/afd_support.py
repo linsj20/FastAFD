@@ -46,11 +46,15 @@ _RUNTIME_ENV_KEYS = (
     "CUDA_HOME",
     "CUDA_PATH",
     "CUDA_NVCC_EXECUTABLE",
+    "CUDA_DEVICE_MAX_CONNECTIONS",
+    "MINISGL_QWEN35_CONV1D_EAGER",
+    "MINISGL_QWEN35_GATE_EAGER",
     "DG_JIT_CACHE_DIR",
     "DG_JIT_NVCC_COMPILER",
     "DG_JIT_USE_NVRTC",
     "TVM_FFI_CACHE_DIR",
     "FLASHINFER_WORKSPACE_BASE",
+    "FLASHINFER_NVCC",
     "TRITON_PTXAS_BLACKWELL_PATH",
     "MAX_JOBS",
     "MINISGL_DEEPEP_BUILD_DIR",
@@ -117,15 +121,17 @@ def _scope_cache_env(
 def resolve_afd_moe_backend(model_placement: str) -> str:
     """Resolve and validate the MoE transport/compute backend for a placement."""
     placement = str(model_placement)
-    if placement not in ("legacy", "fmha-only"):
+    if placement == "fmha-only":
+        placement = "attn-only"
+    if placement not in ("legacy", "attn-only"):
         raise ValueError(f"unsupported AFD model placement {placement!r}")
 
-    default_backend = "megamoe" if placement == "fmha-only" else "deepep"
+    default_backend = "megamoe" if placement == "attn-only" else "deepep"
     backend = str(afd_env("MOE_BACKEND", default_backend))
     if backend not in ("deepep", "megamoe", "megamoe_m2n"):
         raise ValueError(f"unsupported AFD MoE backend {backend!r}")
-    if backend == "megamoe" and placement != "fmha-only":
-        raise ValueError("same-rank megamoe requires fmha-only placement")
+    if backend == "megamoe" and placement != "attn-only":
+        raise ValueError("same-rank megamoe requires attn-only placement")
     if backend == "megamoe_m2n" and placement != "legacy":
         raise ValueError("split megamoe_m2n requires legacy placement")
     return backend

@@ -1,5 +1,12 @@
 # Project Memory
 
+## Active Qwen3.5 AFD overhead placement (2026-09-04 PDT)
+
+See `CODEX_PROJECT_qwen35_afd_overheads.md`. Development is isolated to the
+workspace mirror under `scratch/qwen35_afd_overheads_20260904/source_mirror`;
+the primary `fmha_only` checkout remains unchanged. The canonical new placement
+name is `attn-only` (`fmha-only` remains an input compatibility alias).
+
 ## Active 1K perfect-routing maximum-batch search (2026-09-04 PDT)
 
 The user requested the real maximum 1K batch for A1:F1/EP4 using the accepted

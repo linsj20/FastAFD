@@ -18,7 +18,7 @@ import sys
 
 
 METRIC_VERSION = "20260804-attention-cuda-execution-span-v14"
-FMHA_METRIC_VERSION = "20260820-fmha-only-dual-role-cuda-graph-span-v1"
+FMHA_METRIC_VERSION = "20260904-attn-only-dual-role-cuda-graph-span-v1"
 CASE_ID_PATTERN = re.compile(
     r"(?:i[1-9][0-9]*|r[1-9][0-9]*-[1-9][0-9]*)-"
     r"fep[1-9][0-9]*-r[1-9][0-9]*-atp[1-9][0-9]*-b[1-9][0-9]*"
@@ -449,7 +449,7 @@ def validate_metric(
     required_steps = int(case["required_trace_decode_steps"])
     required_batch = int(case["required_target_batch_per_attention_dp_lane"])
     placement = result.get("afd_model_placement")
-    if placement == "fmha-only":
+    if placement in {"attn-only", "fmha-only"}:
         decode_steps = [int(step) for step in metric.get("decode_step_ids", [])]
         warmup_step = int(metric.get("warmup_decode_step_id", -1))
         trace_steps = [

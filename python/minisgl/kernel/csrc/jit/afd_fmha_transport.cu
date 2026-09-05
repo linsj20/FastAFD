@@ -475,24 +475,26 @@ __device__ __forceinline__ void publish_o_fp8_payload(
           reinterpret_cast<const uint4*>(params.o + src_offset)[0];
     }
 
-    const int packed_head_count = head_count / 4;
+    constexpr int kScaleGroupsPerHead = kHeadDim / 128;
+    const int packed_group_count = head_count * kScaleGroupsPerHead / 4;
     const int64_t scale_tasks =
-        static_cast<int64_t>(params.rows) * packed_head_count;
+        static_cast<int64_t>(params.rows) * packed_group_count;
     const int64_t destination_rows =
         static_cast<int64_t>(params.destination_source_stride) * source_count;
     const int64_t destination_scale_stride =
         (destination_rows + 3) / 4 * 4;
     for (int64_t task = thread; task < scale_tasks; task += stride) {
-      const int packed_head = static_cast<int>(task % packed_head_count);
-      const int row = static_cast<int>(task / packed_head_count);
+      const int packed_group = static_cast<int>(task % packed_group_count);
+      const int row = static_cast<int>(task / packed_group_count);
       const int64_t src_offset =
           static_cast<int64_t>(row) * params.scale_stride_row +
-          static_cast<int64_t>(src_head / 4 + packed_head) *
+          static_cast<int64_t>(src_head * kScaleGroupsPerHead / 4 + packed_group) *
               params.scale_stride_group;
       const int64_t destination_row =
           static_cast<int64_t>(source) * params.destination_source_stride + row;
       const int64_t dst_offset =
-          destination_row + static_cast<int64_t>(dst_head / 4 + packed_head) *
+          destination_row +
+          static_cast<int64_t>(dst_head * kScaleGroupsPerHead / 4 + packed_group) *
               destination_scale_stride;
       destination_scales[dst_offset] = params.scales[src_offset];
     }
@@ -529,15 +531,16 @@ __device__ __forceinline__ void quantize_o_fp8_to_stage(
     const QuantizePublishOFp8Params params) {
   // Keep quantization as the attention compute tail, but materialize its small
   // FP8 result locally so remote publication can remain a communication tail.
-  static_assert(kHeadDim == 128);
+  static_assert(kHeadDim % 128 == 0);
   constexpr int kWarpsPerBlock = kThreads / 32;
-  constexpr int kLanesPerHead = 8;
-  constexpr int kHeadsPerWarp = 32 / kLanesPerHead;
-  constexpr int kValuesPerLane = kHeadDim / kLanesPerHead;
+  constexpr int kLanesPerGroup = 8;
+  constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
+  constexpr int kValuesPerLane = 128 / kLanesPerGroup;
+  constexpr int kScaleGroupsPerHead = kHeadDim / 128;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
-  const int head_in_warp = lane / kLanesPerHead;
-  const int lane_in_head = lane % kLanesPerHead;
+  const int group_in_warp = lane / kLanesPerGroup;
+  const int lane_in_group = lane % kLanesPerGroup;
   const int64_t global_warp =
       static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
   const int64_t warp_stride =
@@ -549,24 +552,25 @@ __device__ __forceinline__ void quantize_o_fp8_to_stage(
     const int src_head = static_cast<int>(desc[2]);
     const int head_count = static_cast<int>(desc[4]);
 
-    const int64_t tasks = static_cast<int64_t>(params.rows) * head_count;
-    const int64_t task_group_stride = warp_stride * kHeadsPerWarp;
+    const int group_count = head_count * kScaleGroupsPerHead;
+    const int64_t tasks = static_cast<int64_t>(params.rows) * group_count;
+    const int64_t task_group_stride = warp_stride * kGroupsPerWarp;
     for (int64_t first_task = global_warp;
          first_task < tasks;
          first_task += task_group_stride) {
-      // Each 8-lane subgroup quantizes one head while the other subgroups
+      // Each 8-lane subgroup quantizes one 128-value scale group while the others
       // process three additional tasks owned by this warp.  This preserves
       // the publication mapping below and shortens the pre-handoff phase
       // without changing the grid, payload layout, or scale definition.
-      const int64_t task = first_task + head_in_warp * warp_stride;
+      const int64_t task = first_task + group_in_warp * warp_stride;
       if (task >= tasks)
         continue;
-      const int head = static_cast<int>(task % head_count);
-      const int row = static_cast<int>(task / head_count);
+      const int group = static_cast<int>(task % group_count);
+      const int row = static_cast<int>(task / group_count);
       const auto* source_values = params.o +
           static_cast<int64_t>(row) * params.o_stride +
-          static_cast<int64_t>(src_head + head) * kHeadDim +
-          lane_in_head * kValuesPerLane;
+          static_cast<int64_t>(src_head) * kHeadDim + group * 128 +
+          lane_in_group * kValuesPerLane;
       const uint4 packed_bf16[2] = {
           *reinterpret_cast<const uint4*>(source_values),
           *reinterpret_cast<const uint4*>(source_values + 8),
@@ -581,14 +585,14 @@ __device__ __forceinline__ void quantize_o_fp8_to_stage(
         amax = fmaxf(amax, fabsf(converted[i]));
       }
       #pragma unroll
-      for (int offset = kLanesPerHead / 2; offset > 0; offset >>= 1)
+      for (int offset = kLanesPerGroup / 2; offset > 0; offset >>= 1)
         amax = fmaxf(
             amax,
             __shfl_xor_sync(
-                0xffu << (head_in_warp * kLanesPerHead),
+                0xffu << (group_in_warp * kLanesPerGroup),
                 amax,
                 offset,
-                kLanesPerHead));
+                kLanesPerGroup));
 
       const uint32_t bits = __float_as_uint(amax * (1.0f / 448.0f));
       const uint8_t exponent = static_cast<uint8_t>(
@@ -605,17 +609,17 @@ __device__ __forceinline__ void quantize_o_fp8_to_stage(
             __NV_SATFINITE,
             __NV_E4M3);
 
-      const int source_head = src_head + head;
+      const int source_group = src_head * kScaleGroupsPerHead + group;
       const int64_t staged_offset =
           static_cast<int64_t>(row) * params.staged_o_stride +
-          static_cast<int64_t>(source_head) * kHeadDim +
-          lane_in_head * kValuesPerLane;
+          static_cast<int64_t>(source_group) * 128 +
+          lane_in_group * kValuesPerLane;
       *reinterpret_cast<uint4*>(params.staged_o + staged_offset) =
           *reinterpret_cast<const uint4*>(output);
-      if (lane_in_head == 0)
+      if (lane_in_group == 0)
         params.staged_scales[
             static_cast<int64_t>(row) * params.staged_scale_stride +
-            source_head] = exponent;
+            source_group] = exponent;
     }
   }
 }
@@ -623,10 +627,11 @@ __device__ __forceinline__ void quantize_o_fp8_to_stage(
 template <int kHeadDim, bool kSingleEdge>
 __device__ __forceinline__ void publish_staged_o_fp8_payload(
     const QuantizePublishOFp8Params params) {
-  static_assert(kHeadDim == 128);
+  static_assert(kHeadDim % 128 == 0);
   constexpr int kWarpsPerBlock = kThreads / 32;
   constexpr int kPacksPerHead = kHeadDim / 16;
   constexpr int kHeadsPerWarp = 32 / kPacksPerHead;
+  constexpr int kScaleGroupsPerHead = kHeadDim / 128;
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   const int head_in_warp = lane / kPacksPerHead;
@@ -681,22 +686,25 @@ __device__ __forceinline__ void publish_staged_o_fp8_payload(
           pack * 16;
       *reinterpret_cast<uint4*>(destination + dst_offset) =
           *reinterpret_cast<const uint4*>(params.staged_o + staged_offset);
-      if (pack == 0) {
+      if (pack % 8 == 0) {
         const int64_t destination_rows =
             static_cast<int64_t>(params.destination_source_stride) * source_count;
         const int64_t destination_scale_stride =
             (destination_rows + 3) / 4 * 4;
-        const int destination_head = dst_head + head;
+        const int source_group =
+            source_head * kScaleGroupsPerHead + pack / 8;
+        const int destination_group =
+            (dst_head + head) * kScaleGroupsPerHead + pack / 8;
         const int64_t destination_row =
             static_cast<int64_t>(source) * params.destination_source_stride + row;
         const int64_t destination_word =
-            destination_row + static_cast<int64_t>(destination_head / 4) *
+            destination_row + static_cast<int64_t>(destination_group / 4) *
                 destination_scale_stride;
         destination_scales[destination_word * sizeof(int32_t) +
-                           destination_head % 4] =
+                           destination_group % 4] =
             params.staged_scales[
                 static_cast<int64_t>(row) * params.staged_scale_stride +
-                source_head];
+                source_group];
       }
     }
   }
@@ -773,11 +781,11 @@ void launch_quantize_publish_o_fp8(
     int64_t next_turn,
     int64_t ready_value) {
   using namespace host;
-  static_assert(kHeadDim == 128);
+  static_assert(kHeadDim % 128 == 0);
   auto device = SymbolicDevice{};
   auto rows = SymbolicSize{"rows"};
   auto width = SymbolicSize{"width"};
-  auto heads = SymbolicSize{"heads"};
+  auto scale_groups = SymbolicSize{"scale_groups"};
   auto edges = SymbolicSize{"edges"};
   auto ready_edges = SymbolicSize{"ready_edges"};
   auto data_dtype = SymbolicDType{};
@@ -792,7 +800,7 @@ void launch_quantize_publish_o_fp8(
       .with_dtype(staged_dtype)
       .with_device<kDLCUDA>(device)
       .verify(staged_o);
-  TensorMatcher({rows, heads})
+  TensorMatcher({rows, scale_groups})
       .with_strides({-1, 1})
       .with_dtype<uint8_t>()
       .with_device<kDLCUDA>(device)
@@ -832,8 +840,8 @@ void launch_quantize_publish_o_fp8(
   RuntimeCheck(
       output_dtype.bits == 8 and output_dtype.lanes == 1,
       "fused AFD O staging requires an 8-bit payload");
-  RuntimeCheck(heads.unwrap() * kHeadDim == width.unwrap());
-  RuntimeCheck(width.unwrap() % (4 * kHeadDim) == 0);
+  RuntimeCheck(scale_groups.unwrap() * 128 == width.unwrap());
+  RuntimeCheck(width.unwrap() % (4 * 128) == 0);
   RuntimeCheck(
       rows.unwrap() > 0 and edges.unwrap() > 0 and ready_edges.unwrap() > 0);
   RuntimeCheck(
@@ -1191,7 +1199,7 @@ struct AfdFmhaTransportKernel {
     RuntimeCheck(width.unwrap() % kHeadDim == 0);
     RuntimeCheck(
         packed_groups.unwrap() ==
-        (width.unwrap() / kHeadDim + 3) / 4);
+        (width.unwrap() / 128 + 3) / 4);
     RuntimeCheck(scales.stride(0) == 1);
     RuntimeCheck(scales.stride(1) == (rows.unwrap() + 3) / 4 * 4);
     RuntimeCheck(edges.unwrap() > 0 and ready_edges.unwrap() > 0);
@@ -1283,7 +1291,7 @@ struct AfdFmhaTransportKernel {
     RuntimeCheck(width.unwrap() % kHeadDim == 0);
     RuntimeCheck(
         packed_groups.unwrap() ==
-        (width.unwrap() / kHeadDim + 3) / 4);
+        (width.unwrap() / 128 + 3) / 4);
     RuntimeCheck(scales.stride(0) == 1);
     RuntimeCheck(scales.stride(1) == (rows.unwrap() + 3) / 4 * 4);
     RuntimeCheck(edges.unwrap() > 0 and ready_edges.unwrap() > 0);

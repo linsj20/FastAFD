@@ -24,18 +24,25 @@ def _descriptor(rows: list[list[int]], width: int, device: torch.device) -> torc
 def _prebuild() -> None:
     """Build both extensions once before the four ranks enter collectives."""
     torch.cuda.set_device(0)
+    head_dim = int(os.environ.get("AFD_FABRIC_SMOKE_HEAD_DIM", "128"))
     ensure_afd_fmha_transport_built(128)
+    if head_dim != 128:
+        ensure_afd_fmha_transport_built(head_dim)
     from minisgl.kernel import deepep_moe
     from minisgl.kernel import deepgemm as deep_gemm
 
     deepep_moe._load_extension()
+    q_heads = int(os.environ.get("AFD_FABRIC_SMOKE_Q_HEADS", "64"))
     deep_gemm.per_token_cast_to_fp8(
-        torch.zeros((4, 64 * 128), dtype=torch.bfloat16, device="cuda"),
+        torch.zeros((4, q_heads * head_dim), dtype=torch.bfloat16, device="cuda"),
         use_ue8m0=True,
         gran_k=128,
         use_packed_ue8m0=True,
     )
-    print("AFD_FABRIC_TRANSPORT_PREBUILD_OK head_dim=128 fabric_extension=ready")
+    print(
+        "AFD_FABRIC_TRANSPORT_PREBUILD_OK "
+        f"head_dims=128,{head_dim} fabric_extension=ready"
+    )
 
 
 def main() -> None:
@@ -68,8 +75,11 @@ def main() -> None:
         raise RuntimeError(
             f"fabric smoke rows and iterations must be positive, got {rows}/{iterations}"
         )
-    q_heads, kv_heads, head_dim = 64, 8, 128
-    o_scale_packed_groups = (q_heads + 3) // 4
+    q_heads = int(os.environ.get("AFD_FABRIC_SMOKE_Q_HEADS", "64"))
+    kv_heads = int(os.environ.get("AFD_FABRIC_SMOKE_KV_HEADS", "8"))
+    head_dim = int(os.environ.get("AFD_FABRIC_SMOKE_HEAD_DIM", "128"))
+    scale_groups = q_heads * head_dim // 128
+    o_scale_packed_groups = (scale_groups + 3) // 4
     o_scale_row_stride = ((rows + 3) // 4) * 4
     o_scale_slot_elements = o_scale_row_stride * o_scale_packed_groups
     num_layers = 3
@@ -95,7 +105,7 @@ def main() -> None:
             device=device,
         )
         o_scale_staging = torch.empty(
-            (2, rows, q_heads), dtype=torch.uint8, device=device
+            (2, rows, scale_groups), dtype=torch.uint8, device=device
         )
         turn = torch.zeros((1,), dtype=torch.int64, device=device)
         attention_handle = q_owner.handle
@@ -389,7 +399,7 @@ def main() -> None:
         print(
             "AFD_FABRIC_TRANSPORT_SMOKE_OK "
             f"pairs={pair_count} rows={rows} iterations={iterations} "
-            f"q_heads={q_heads} kv_heads={kv_heads}"
+            f"q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim}"
         )
     dist.destroy_process_group()
 

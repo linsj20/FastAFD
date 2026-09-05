@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate FMHA-only fused BF16-to-FP8 O publication.
+# Validate attn-only BF16/FP8 transport publication.
 # Required: FASTAFD_SOURCE_REPO FASTAFD_IMAGE FASTAFD_VENV OUTPUT_ROOT
 
 #SBATCH --account=coreai_comparch_sysarch
@@ -13,12 +13,14 @@
 #SBATCH --gres=gpu:4
 #SBATCH --exclusive
 #SBATCH --no-requeue
-#SBATCH --job-name=fmha-fused-o-publish-smoke
+#SBATCH --job-name=attn-transport-smoke
 
 set -euo pipefail
 
 : "${FASTAFD_SOURCE_REPO:?}" "${FASTAFD_IMAGE:?}" "${FASTAFD_VENV:?}" \
   "${OUTPUT_ROOT:?}"
+RANKS=${AFD_FABRIC_SMOKE_RANKS:-4}
+[[ "$RANKS" == 2 || "$RANKS" == 4 ]]
 
 CACHE_ROOT=${MINISGL_DEEPGEMM_BUILD_DIR:-$OUTPUT_ROOT/cache/deepgemm}
 DEEPEP_CACHE_ROOT=${MINISGL_DEEPEP_BUILD_DIR:-$OUTPUT_ROOT/cache/deepep_moe}
@@ -49,7 +51,7 @@ srun "${COMMON_SRUN[@]}" --ntasks=1 --ntasks-per-node=1 \
   "$FASTAFD_SOURCE_REPO/tests/afd_fabric_transport_smoke.py"
 
 # Exercise repeated turn/counter reuse while checking remote FP8 bytes/scales.
-srun "${COMMON_SRUN[@]}" --ntasks=4 --ntasks-per-node=4 \
+srun "${COMMON_SRUN[@]}" --ntasks="$RANKS" --ntasks-per-node="$RANKS" \
   "${COMMON_ENV[@]}" MASTER_ADDR="$MASTER_ADDR" MASTER_PORT=29671 \
   AFD_FABRIC_SMOKE_ROWS="${AFD_FABRIC_SMOKE_ROWS:-3}" \
   AFD_FABRIC_SMOKE_ITERATIONS="${AFD_FABRIC_SMOKE_ITERATIONS:-9}" \

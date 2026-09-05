@@ -43,7 +43,15 @@ def create_kvcache_pool(
         device=device,
         dtype=dtype,
         storage=storage,
+        layer_ids=tuple(
+            idx
+            for idx, layer_type in enumerate(model_config.layer_types)
+            if layer_type == "full_attention"
+        ),
     )
+
+
+from .hybrid_pool import HybridGDNStatePool, create_hybrid_gdn_state_pool
 
 
 @SUPPORTED_CACHE_MANAGER.register("naive")
@@ -73,4 +81,6 @@ __all__ = [
     "SizeInfo",
     "MatchResult",
     "SUPPORTED_CACHE_MANAGER",
+    "HybridGDNStatePool",
+    "create_hybrid_gdn_state_pool",
 ]

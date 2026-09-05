@@ -250,6 +250,9 @@ export VLLM_SCORE_CONCURRENCY="${VLLM_SCORE_CONCURRENCY:-16}"
 if [[ -z "${VLLM_EXTRA_ARGS:-}" ]]; then
   export VLLM_EXTRA_ARGS="--distributed-executor-backend mp --data-parallel-backend mp --data-parallel-size 4 --data-parallel-size-local 4 --enable-expert-parallel --all2all-backend deepep_low_latency --moe-backend deep_gemm --max-num-batched-tokens 40000 --max-num-seqs 16 --gpu-memory-utilization 0.97 --no-enable-prefix-caching --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":[1,2,4,8,16,32,40,64,80,128,160,256]}'"
 fi
+if [[ "${MODEL_KEY:-qwen3}" == qwen35 && " $VLLM_EXTRA_ARGS " != *" --language-model-only "* ]]; then
+  export VLLM_EXTRA_ARGS="$VLLM_EXTRA_ARGS --language-model-only"
+fi
 export VLLM_USE_FLASHINFER_MOE_FP8="${VLLM_USE_FLASHINFER_MOE_FP8:-0}"
 export VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-1}"
 export VLLM_MOE_USE_DEEP_GEMM="${VLLM_MOE_USE_DEEP_GEMM:-1}"

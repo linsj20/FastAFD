@@ -605,7 +605,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             ("publish", layer, epoch, int(qkv.shape[0]))
         )
 
-        def receive(sub, epoch):
+        def receive(sub, epoch, layer=None):
             rows = int(sub.positions.numel())
             calls.append(("receive", epoch, rows))
             output = torch.full((rows, 1), float(epoch))
@@ -675,7 +675,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             live_epochs[slot] = epoch
             calls.append(("publish", layer, epoch, int(qkv.shape[0])))
 
-        def receive(sub, epoch):
+        def receive(sub, epoch, layer=None):
             rows = int(sub.positions.numel())
             slot = epoch % 2
             self.assertEqual(live_epochs.pop(slot), epoch)
@@ -745,6 +745,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 2
+        runtime.is_hybrid_attention = False
         runtime.state = SimpleNamespace(ctx=ctx, stream=root)
         runtime._moe_buffers = buffers
         runtime._tp_lane_communicators = communicators
@@ -772,7 +773,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         def publish_model_qkv_payload(q, k, v, sub, *, layer, epoch):
             observations.append(('publish', layer, epoch, active_stream[0]))
 
-        def receive(sub, epoch):
+        def receive(sub, epoch, layer=None):
             rows = int(sub.positions.numel())
             observations.append(('receive', epoch, rows, active_stream[0]))
             output = torch.full((rows, 1), float(epoch))
@@ -921,6 +922,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 3
+        runtime.is_hybrid_attention = False
         runtime.state = SimpleNamespace(ctx=ctx)
         runtime._moe_buffers = buffers
         runtime._tp_lane_communicators = communicators
@@ -941,7 +943,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
         runtime.prepare_model_qkv = lambda qkv, sub, *, layer: (qkv, qkv, qkv)
         runtime.publish_model_qkv_payload = lambda *args, **kwargs: None
-        runtime.receive_attention_o = lambda sub, epoch: (
+        runtime.receive_attention_o = lambda sub, epoch, layer=None: (
             torch.full((int(sub.positions.numel()), 1), float(epoch)),
             torch.ones((int(sub.positions.numel()), 1), dtype=torch.int32),
         )
@@ -1005,6 +1007,64 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             any(item[0] == 'combine_release' for item in observations)
         )
 
+    def test_hybrid_ping_pong_publishes_linear_hidden_without_qkv_split(self) -> None:
+        calls: list[tuple] = []
+        waits: list[tuple[str, str]] = []
+        records: list[tuple[str, str]] = []
+        lanes = (_FakeStream("mb0", waits), _FakeStream("mb1", waits))
+        bootstrap_events = tuple(
+            _FakeEvent(f"bootstrap_q{mb}", records) for mb in range(2)
+        )
+        compute_events = (
+            tuple(_FakeEvent(f"compute_mb{mb}", records) for mb in range(2)),
+        )
+
+        runtime = object.__new__(AfdFmhaRuntime)
+        runtime.num_mb = 2
+        runtime.is_hybrid_attention = True
+        runtime.model_config = SimpleNamespace(layer_types=("linear_attention",))
+        runtime.state = SimpleNamespace(ctx=_Context())
+        runtime._moe_buffers = ()
+        runtime._tp_lane_communicators = ()
+        runtime._tp_distributed_plugin = None
+        runtime.model = _Model([_Layer(0, calls)])
+        runtime.prepare_model_qkv = lambda *args, **kwargs: self.fail(
+            "linear-attention hidden state must not enter the full-QKV splitter"
+        )
+        runtime.publish_model_qkv = (
+            lambda hidden, sub, *, layer, epoch: calls.append(
+                ("publish_linear", layer, epoch, int(hidden.shape[0]))
+            )
+        )
+        runtime.receive_attention_o = lambda sub, epoch, layer=None: (
+            torch.full((int(sub.positions.numel()), 1), float(epoch)),
+            None,
+        )
+        subs = [SimpleNamespace(positions=torch.arange(2)) for _ in range(2)]
+        batch = SimpleNamespace(
+            input_ids=torch.arange(4, dtype=torch.int32),
+            positions=torch.arange(4),
+            afd_mb_subbatches=subs,
+            afd_microbatch_token_offsets=(0, 2, 4),
+        )
+
+        with patch("torch.cuda.stream", side_effect=contextlib.nullcontext):
+            output = runtime._run_model_forward(
+                batch,
+                slot_base=0,
+                real_token_counts=(2, 2),
+                dispatch_bucket=2,
+                lane_streams=lanes,
+                bootstrap_compute_events=bootstrap_events,
+                compute_done_events=compute_events,
+            )
+
+        self.assertEqual(tuple(output.shape), (4, 1))
+        self.assertEqual(
+            [call for call in calls if call[0] == "publish_linear"],
+            [("publish_linear", 0, 0, 2), ("publish_linear", 0, 1, 2)],
+        )
+
     def test_mb2_attention_runs_wait_fmha_and_publish_on_matching_main_stream(self) -> None:
         observations: list[tuple] = []
         waits: list[tuple[str, str]] = []
@@ -1030,7 +1090,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 2
         runtime.transport_slots = 2
-        runtime.model_config = SimpleNamespace(num_layers=2)
+        runtime.model_config = SimpleNamespace(
+            num_layers=2, layer_types=("full_attention", "full_attention")
+        )
+        runtime.q_transport_multiplier = 1
         runtime.state = SimpleNamespace(ctx=ctx, stream=root, attn_backends=backends)
         runtime.max_rows = 4
         runtime.source_max_rows = 4
@@ -1197,7 +1260,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 3
         runtime.transport_slots = 2
-        runtime.model_config = SimpleNamespace(num_layers=2)
+        runtime.model_config = SimpleNamespace(
+            num_layers=2, layer_types=("full_attention", "full_attention")
+        )
+        runtime.q_transport_multiplier = 1
         runtime.state = SimpleNamespace(
             ctx=ctx,
             attn_backends=tuple(make_backend(mb) for mb in range(3)),

@@ -132,7 +132,10 @@ def main() -> None:
         expected_prompts = int(result["attention_dp_size"]) * batch
         expected_tokens = expected_prompts * int(result["tokens_per_sample"])
 
-        require(result["afd_model_placement"] == "fmha-only", f"placement: {case_id}")
+        require(
+            result["afd_model_placement"] in {"attn-only", "fmha-only"},
+            f"placement: {case_id}",
+        )
         require(result["sweep_contract"] == "comprehensive", f"contract: {case_id}")
         require(int(result["allocated_trays"]) == trays, f"result trays: {case_id}")
         require(int(result["allocated_gpus"]) == allocated_gpus, f"allocated GPUs: {case_id}")
