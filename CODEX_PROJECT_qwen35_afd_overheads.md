@@ -168,6 +168,13 @@ was enabled.
   conversion plus `fp8_fp8_mega_moe`; FP4 retains the optimized existing path
   and remains the default. Alignment plans select FP8 with normal routing;
   perfect-balanced performance trace plans remain FP4.
+- Normal-routing FP8 target-shape smoke job `6930893` completed `0:0` in 2:58
+  on one four-GPU tray. It exercised 512 experts, top-k 10, hidden 4,096,
+  intermediate 1,024, route-prepared/rank-ready graph execution, and the
+  FP8xFP8 kernel. All row/bucket numeric cases passed with cosine
+  0.999747--0.999896; the exact target case produced finite output with 14
+  active experts. This validates the selectable FP8 kernel and weight layout
+  before another full 397B run.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
