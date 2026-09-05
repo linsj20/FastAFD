@@ -198,6 +198,16 @@ was enabled.
   match the explicit reference at cosine 0.999913871 and maximum absolute
   error 22.537384; the exact graph case exercised 103 active experts and
   finite output. This is the required kernel-level proof before repeating A1.
+- Corrected full-model FP8 MegaMoE sample job `6932154` produced all 148x17
+  tokens; 137/148 sequences exactly match the passing legacy sample and first-
+  token agreement improved from zero to 95.95%. Strict score job `6932885`
+  nevertheless fails the unchanged gate at top-1 0.977742, top-10 0.994436,
+  top-100 0.998808, mean rank 2.9523, and maximum rank 3,170. The residual
+  difference is consistent with MegaMoE's required checkpoint block-FP8 to
+  per-32-UE8M0 weight requantization. Do not weaken the top-10=1.0 criterion.
+  Strict attn-only alignment therefore uses normal-routing DeepEP with the
+  checkpoint FP8 arithmetic, while requested perfect-balanced Nsight traces
+  retain same-rank FP4 MegaMoE.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   Direct-launch dry runs resolve the provisional A1 point to 45 requests per
