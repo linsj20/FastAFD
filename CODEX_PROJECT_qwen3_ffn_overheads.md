@@ -114,7 +114,7 @@ success, per the user's decision.
 
 The uncompressed perfect-routing task root and its local result copy were
 removed after verified archival. The authoritative payload is now
-`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/fastafd_reproduce/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst`
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD/artifacts/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst`
 with external manifest/SHA/summary sidecars. It has exactly 1,599 payload-only
 members (1,512 NSYS, 84 per-case result/metric JSONs, and three audit/comparison
 files), full integrity/member audits passed, and archive SHA-256 is

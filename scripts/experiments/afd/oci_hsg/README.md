@@ -84,9 +84,10 @@ Keep source, live results, and archives separate. On the shared remote, use the
 single canonical checkout and keep it immutable until every submitted job is
 terminal; do not create a per-run source worktree:
 
-- source checkout: `/lustre/.../users/$USER/github/FastAFD`;
-- live task root: `/lustre/.../users/$USER/<sweep-name>`;
-- completed archives: `fastafd_reproduce/archives/completed_sweeps/`;
+- accepted source mirror: `/lustre/.../users/$USER/FastAFD/local-mirror`;
+- reference or candidate source: `/lustre/.../users/$USER/FastAFD/source/<variant-name>`;
+- live task root: `/lustre/.../users/$USER/FastAFD/artifacts/<subproject>/<run-name>`;
+- completed archives: `FastAFD/artifacts/archives/completed_sweeps/`;
 - local checkout: source, reusable controls, project memory, and visualizations
   only. Do not copy full result trees into local `scratch/`.
 

@@ -515,7 +515,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("self.o_scale_staging", runtime_source)
         self.assertIn("self._quantize_attention_o", runtime_source)
         self.assertIn("finish_attention_fp8(", runtime_source)
-        self.assertNotIn("self_attn.finish_attention(o)", runtime_source)
+        # The legacy transport remains FP8, while Qwen3.5 hybrid attention
+        # intentionally transports BF16 O and finishes its gated output
+        # projection on the model worker.
+        self.assertIn("if self.is_hybrid_attention:", runtime_source)
+        self.assertIn("self_attn.finish_attention(o)", runtime_source)
+        self.assertIn("self_attn.finish_attention(output)", runtime_source)
         self.assertIn("self.num_lanes = min(2, self.num_mb)", runtime_source)
         self.assertIn("self.transport_slots = 2", runtime_source)
         self.assertIn("mb % len(lane_streams)", runtime_source)
@@ -622,7 +627,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("if constexpr (!kSingleEdge)", source)
         self.assertIn("source_offset_count.unwrap() == 2", source)
         self.assertEqual(source.count("ready_edges.unwrap() == 1"), 6)
-        self.assertIn("q_edges.unwrap() == 1 and kv_edges.unwrap() == 1", source)
+        self.assertIn("q_edges.unwrap() == 1 and kv_edge_count == 1", source)
         self.assertEqual(source.count("single_ready and edges.unwrap() == 1"), 5)
         self.assertIn("publish_qkv_kernel<kHeadDim, true, true>", source)
         self.assertIn("publish_qkv_kernel<kHeadDim, false, false>", source)

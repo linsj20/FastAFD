@@ -1,4 +1,136 @@
-# Qwen3.5 AFD overhead placement
+# Qwen3.5 AFD support
+
+## Remote workspace consolidation (2026-09-05 PDT)
+
+The primary local `fmha_only` checkout remains the authoritative development
+source. The sole accepted remote mirror for future execution is now
+`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD/local-mirror`.
+Immediately after the remote move, its clean tree object
+`106a8cb4ecdc16a69058fe6249fbba9249c355cd` exactly matched the local committed
+tree. The project-memory relocation recorded here is synchronized into the
+amended accepted checkpoint in both checkouts.
+
+Qwen3 and Qwen3.5 experiment evidence is consolidated without deletion under
+`FastAFD/artifacts/`. The preserved roots are
+`qwen3_ffn_overheads_20260820`, `qwen3_ffn_overheads_20260828`,
+`qwen3_ffn_overheads_20260831`, and `qwen35_afd_overheads_20260904`.
+The former remote `scratch/qwen3_ffn_overheads_20260820` tree is preserved as
+`FastAFD/artifacts/qwen3_ffn_overheads_20260820/auxiliary_scratch`.
+
+All 105 files from `fastafd_reproduce/archives` were moved intact to
+`FastAFD/artifacts/archives`, including compressed payloads, SHA files,
+manifests, summaries, case indexes, metadata, and logs. In particular, the
+perfect-routing archive and its three verification sidecars remain together at
+`FastAFD/artifacts/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst*`.
+The old Qwen3/Qwen3.5 task-root paths and old archive path no longer exist.
+No result, archive, cache, log, or source snapshot was deleted during this
+consolidation.
+
+## Previous workspace consolidation and canonical AFD launcher (2026-09-04 PDT)
+
+Local `scratch/` is now visualization-only: 25 standalone HTML/PNG files,
+3.2 MiB total, organized under `scratch/visualizations/` by study. All local
+result trees, NSYS reports, source snapshots, scripts, docs, caches, temporary
+review directories, `.DS_Store`, and custom hidden directories were removed.
+Older memory entries retain their historical paths as provenance; they are not
+claims that those deleted scratch files still exist. Current visualization
+paths start at `scratch/visualizations/`.
+
+The complete perfect-routing sweep was archived remotely as
+`FastAFD/artifacts/archives/completed_sweeps/afd_128k_perfect_routing_e00afda_20260901.tar.zst`.
+It contains exactly 1,599 result payloads / 1,473,202,820 uncompressed bytes:
+1,512 `.nsys-rep`, 42 `afd-result.json`, 42 metric JSON, and three audit/
+comparison data files. No scripts, docs, logs, or caches are members. Full
+`zstd -t`, exact member audit, external 1,599-row SHA manifest, and archive
+SHA-256 `3dc1842ba90410dc921103450ac45ad5eb1cbe6e2d6b4d13cbc6322350f52089`
+passed. The uncompressed sweep and completed archive staging were then removed;
+the `.manifest.tsv`, `.sha256`, and `.summary.json` sidecars remain beside the
+607 MiB archive.
+
+The older remote archive workspace is also consolidated. CPU data-mover job
+`6919189` completed `0:0`, deleted the last of 3,623 confirmed source targets,
+and revalidated all 42 protected sweep-14 cases. The canonical 14-archive set
+remains under `archives/sweeps_20260830/` with 5,219-row case and 15-row sweep
+indexes; its former `.work` is now visible `metadata/`, logs are under `logs/`,
+and the duplicate `.tools` scripts and empty rebuild/staging roots were removed.
+Job `6919354` then removed the superseded unfiltered rollback set: six payloads
+totaling 520,203,971,236 bytes, including the abandoned 9,763,782,656-byte
+`.partial`. The archive tree now has no custom hidden directories.
+
+`scripts/experiments/afd/oci_hsg/run_afd.sh` is now the only AFD launcher in
+main source. It absorbs the removed `run_afd_reproduce.sh` and remote
+`codex_scripts/reproduce_oci_hsg/run_afd.sh`: Qwen3 pmap/comprehensive and
+MiniMax 8K/16K published layouts, uniform/irregular prompts, explicit topology,
+legacy/FMHA/adaptive placement, DeepEP/MegaMoE/MegaMoE-M2N, production/perfect
+routing, direct/bundle execution, and strict NSYS extraction. Legacy pmap
+defaults to `megamoe_m2n`, legacy comprehensive to `deepep`, and FMHA-only to
+same-rank `megamoe`; incompatible combinations fail rather than fall back.
+Persistent reproduction/source/image/venv paths are required, eliminating the
+stale home-image default. The canonical launcher and M2N fix match locally and
+remotely; historical worktree copies are not launch sources. The remote was
+physically consolidated
+on 2026-09-04: the exact used `e00afda8af6e9fc6ad240ec0bd776b960066a53c`
+checkout, plus the validated M2N template fix and merged launcher, was promoted
+to `users/shengjiel/FastAFD/local-mirror`. All 81 linked experiment worktrees, their
+common Git repository, one standalone FMHA checkout, and the superseded former
+main checkout were removed after verification; the experiment root now has
+zero remaining Git roots. Nonempty `scratch/` trees were moved first, without
+compression, to visible
+`fastafd_reproduce/legacy_workspace_scratch_20260904/`. The temporary staging
+and rollback paths were removed. Standard `.git` in the sole canonical checkout
+is the only hidden repository directory intentionally retained.
+
+Real merged-launcher validation is under remote visible task root
+`run_afd_canonical_validation_20260904`. Qwen job `6918707` correctly exposed
+that a pmap `deepep` default was invalid on source `e00afda`: it failed before
+measurement with `DeepEPM2NDispatchOutput` lacking `expected_m_per_expert`.
+No fallback was attempted; the backend policy was corrected explicitly.
+Replacement Qwen M2N job `6918910` then failed before inference during JIT
+warmup, while pending MiniMax job `6918902` was canceled before allocation to
+avoid repeating the failure. CPU-only NVCC job `6919340` reproduced the exact
+cause: scheduler additions had shifted `layout::WorkspaceM2N` into the new
+boolean `kRankReadyRecvCounts` template slot. The M2N instantiation now passes
+explicit `false` values for both scheduler booleans; CPU recheck `6919396`
+compiled the same generated Qwen kernel to a 150 KiB cubin in 1:29. A focused
+source contract guards the template argument order. Real Qwen replacement job
+`6919438` then completed inference and made the 2,688-sample output, coordinator
+trace, capture marker, and all 32 Nsight reports durable, but failed in outer
+postprocessing because `run_afd.sh` was replaced in that worktree while Bash
+was still reading it. Reusing the stable launcher's exact embedded postprocessor
+against those artifacts passed: 17 tokens/sample, warmup step 1536 plus 15
+measured steps, 16 traced steps, 33.369306-ms median coordinator interval, and
+2517.283398103 tokens/s/active GPU (-0.028459% from the published reference).
+This was an operational live-file replacement failure, not a kernel or teardown
+hang. Immutable-file rerun `6919706` then completed `0:0` end to end in 12:52
+with the strict two-file source manifest: 2,688 samples, 17 tokens/sample,
+warmup 1536 plus 15 measured/16 traced steps, 32 Nsight reports, a
+33.403805-ms median coordinator interval, and 2514.683581706
+tokens/s/active GPU (-0.131708% from reference). MiniMax job `6919520` remained
+pending and was canceled before allocation at 16:49 PDT so its source could be
+consolidated safely. The identical published 8K/b72/17:1 real case was
+resubmitted as job `6920969` from the sole canonical checkout with an 18-node,
+two-hour request. It was pending on priority at 17:02 PDT. The exact source
+head, tracked status, and hashes of all existing tracked changes at submission
+are under `run_afd_canonical_validation_20260904/control/`. This submission
+uses explicit dirty-source mode because the removed duplicate launcher is a
+tracked deletion, which the current two-column SHA manifest cannot represent.
+Do not edit or resync the remote canonical checkout until `6920969` is terminal.
+
+After the Qwen evidence and result SHA were recorded, five superseded
+validation directories and the accepted Qwen payload were deleted. This
+reduced the temporary validation root from 15 GiB to 95 MiB. Only the shared
+prompt cache and `6920969`'s MiniMax run directory remain; remove that task root
+after the MiniMax result is recorded. The deleted validation payloads were
+temporary and are not recoverable; the completed 42-case sweep archive was not
+touched.
+
+The earlier apparent hang is now documented in the OCI-HSG README. In 17
+audited cases, capture/sample/coordinator artifacts were already durable and
+only Ray/process-tree teardown consumed another 210--214 seconds. The current
+runner terminates its allocation-scoped driver after those three durability
+gates; status 137 plus `post-capture-driver-termination.txt` is expected cleanup,
+not failure. An NSYS export is progressing while report/stream sizes or progress
+records advance; a ZMQ port collision is a separate exact-case retry condition.
 
 ## Goal and constraints
 
@@ -8,21 +140,24 @@ current `fmha_only` branch's two-lane schedule and optimizations. Linear
 attention, its convolution state, and its recurrent GDN state must remain on
 attention workers in both placements. The canonical split-placement name is
 `attn-only`; accept and immediately normalize the old `fmha-only` spelling.
-First prove normal-routing A1:F1/EP4 alignment at the real 128K maximum batch,
-then prove normal-routing A3:F1/EP4 alignment. Run each alignment topology in
-both `legacy` and `attn-only`. After correctness is established, capture
-perfect-balanced `attn-only` Nsight Systems reports for A1:F1 and A3:F1 and
-retain both report sets locally. Use HSG `short`, one-hour jobs, with
-5/15-minute monitoring. Keep plans, results, metrics, and traces isolated by
-purpose and placement so repeated shape IDs cannot overwrite one another.
+Alignment uses normal routing and the unchanged all-generated-token scorer with
+top-10 exactly 1.0. Legacy A1 at the real 128K maximum batch established the
+accepted baseline; the user then directed work to focus on attn-only and
+explicitly allowed 8K/small-batch A1 and A3 alignment. After correctness,
+capture perfect-balanced `attn-only` Nsight Systems reports for A1:F1 and A3:F1
+using direct-decode perf mode with random resident 128K state, and retain both
+report sets locally. Use HSG `short`, one-hour jobs, with 5/15-minute
+monitoring. Keep plans, results, metrics, and traces isolated by purpose and
+placement so repeated shape IDs cannot overwrite one another.
 
-The primary local checkout remains untouched while the candidate is under
-validation; once both requested traces pass, copy the final validated source
-back to that current branch without switching branches. The editable source is
-`scratch/qwen35_afd_overheads_20260904/source_mirror`. The isolated remote task root is
-`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/qwen35_afd_overheads_20260904`;
-its `source` checkout is a test/launch copy synchronized from the local mirror.
-Do not modify the canonical remote FastAFD checkout.
+The validated source has been propagated to the primary local `fmha_only`
+checkout without switching branches; that checkout is now the authoritative
+source. The workspace reference copy remains under
+`scratch/qwen35_afd_overheads_20260904/source_mirror`. The isolated remote
+execution checkout is now `FastAFD/local-mirror`, synchronized from the primary
+local checkout, and its associated task evidence is under
+`FastAFD/artifacts/qwen35_afd_overheads_20260904`. Do not develop directly in
+the remote checkout.
 
 ## Implementation state
 
@@ -39,7 +174,9 @@ post-attention norm. They publish normalized hidden states for linear layers
 and Q/K/V plus output gate for full layers. Attention workers own all GDN
 weights/state and execute linear layers; they return BF16 linear output. For
 full layers they own only KV state and FMHA execution, apply the output gate,
-and return the existing packed-UE8M0 FP8 payload. All 60 layers remain rounds
+and return BF16 O so the model worker can run the gated output projection in
+the original algorithmic order. The legacy non-hybrid transport remains the
+existing packed-UE8M0 FP8 path. All 60 layers remain rounds
 in the existing MB2/two-slot wavefront; only the 15 full-attention layers occupy
 KV storage. Qwen3.5 currently fails fast unless attention TP and model TP are
 both one, matching A1/A3 with FFN EP4.
@@ -384,6 +521,12 @@ was enabled.
   A1 and A3 report directories and strict metric JSONs are copied into the
   local task scratch tree.
 
-Next: propagate the validated candidate source to the untouched primary current
-branch without switching branches, run the focused local/source checks that are
-available there, and leave the local checkout as the continuing main version.
+Completion audit: the primary checkout, workspace mirror, and isolated HSG
+source contain the same runtime implementation. Remote focused tests pass
+65/65 across Qwen3.5 ownership, FMHA protocol/runtime, perf mode, perfect
+routing, transport, and trace-window contracts. Two stale test fixtures were
+updated to initialize Qwen3.5 fields when bypassing the runtime constructor,
+and the transport text contract now recognizes hybrid BF16 O plus zero-KV
+linear-attention layers; production code and the alignment standard did not
+change. Local shell syntax and `git diff --check` pass. The local primary
+checkout remains the continuing main version.

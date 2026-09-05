@@ -353,6 +353,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_model_o_receive_waits_once_for_all_sources(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.is_hybrid_attention = False
         runtime.fanin = 2
         runtime.source_max_rows = 3
         runtime.max_rows = 6
@@ -614,6 +615,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         calls: list[tuple] = []
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 2
+        runtime.model_config = SimpleNamespace(
+            layer_types=("full_attention", "full_attention")
+        )
         runtime.state = SimpleNamespace(ctx=_Context())
         runtime.model = _Model([_Layer(0, calls), _Layer(1, calls)])
         runtime.publish_model_qkv = lambda qkv, sub, *, layer, epoch: calls.append(
@@ -681,6 +685,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         live_epochs: dict[int, int] = {}
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 6
+        runtime.model_config = SimpleNamespace(
+            layer_types=("full_attention", "full_attention")
+        )
         runtime.state = SimpleNamespace(ctx=_Context())
         runtime.model = _Model([_Layer(0, calls), _Layer(1, calls)])
 
@@ -761,6 +768,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 2
         runtime.is_hybrid_attention = False
+        runtime.model_config = SimpleNamespace(
+            layer_types=("full_attention", "full_attention")
+        )
         runtime.state = SimpleNamespace(ctx=ctx, stream=root)
         runtime._moe_buffers = buffers
         runtime._tp_lane_communicators = communicators
@@ -938,6 +948,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.num_mb = 3
         runtime.is_hybrid_attention = False
+        runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
         runtime.state = SimpleNamespace(ctx=ctx)
         runtime._moe_buffers = buffers
         runtime._tp_lane_communicators = communicators
