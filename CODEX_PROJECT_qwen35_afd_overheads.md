@@ -359,9 +359,31 @@ was enabled.
   0.999939--0.999986, and the exact batch-19 case produced finite output with
   all 128 local experts active. The CUDA/JIT and balanced-ID paths are therefore
   validated before any multi-node full-model trace.
+- Perf-mode A1 trace job `6938654` ran on two trays/eight GPUs and completed
+  the GPU workload in 9:49. It allocated the exact 77,659-page capacity,
+  randomized 76,342,886,400 KV elements plus GDN state on every attention
+  rank, bypassed prefill, and produced all eight nonempty Nsight reports plus
+  the coordinator trace/sample. The exact trace contract passed: warmup step 1
+  and measured steps 2--16. The outer job exited 1 only because its external
+  plan used an obsolete `-fp4` case-ID suffix/status label; no GPU rerun was
+  made. The plan was corrected to the launcher's canonical case ID and required
+  extractor status, and the unchanged postprocessor was recovered on the login
+  CPU using the Nsight CLI extracted from the pinned container. A1 retains all
+  15 samples with zero outliers: mean/median/max critical spans are
+  41.409710/41.398816/41.740449 ms, dominant range 1.7198%, maximum/median gap
+  0.8252%, and throughput 446.755124 tokens/s per active GPU. This is an
+  accepted trace despite the metadata-only Slurm exit.
+- Perf-mode A3 trace job `6938898` then ran on four trays/16 GPUs and completed
+  cleanly `0:0` in 9:04 with `SUCCESS`. All 12 attention ranks randomized the
+  same 76,342,886,400-element KV allocation plus GDN state, and all 16 workers
+  emitted nonempty Nsight reports. It captured warmup step 1 plus the required
+  steps 2--16. The unchanged stability policy excluded only step 2 and retained
+  14/15 samples: mean/median/max critical spans are
+  42.706790/42.694548/43.589412 ms, dominant range 3.3230%, maximum/median gap
+  2.0960%, one outlier, and throughput 649.779572 tokens/s per active GPU. Both
+  A1 and A3 report directories and strict metric JSONs are copied into the
+  local task scratch tree.
 
-Next: submit only the FP4 perf-mode A1 trace first; monitor manually at
-5/15-minute intervals and treat a 50-minute execution as suspicious. Submit A3
-only after A1 completes the exact 15-step trace contract.
-Copy both report sets into the local workspace scratch tree, then propagate the
-validated candidate source to the untouched primary current branch.
+Next: propagate the validated candidate source to the untouched primary current
+branch without switching branches, run the focused local/source checks that are
+available there, and leave the local checkout as the continuing main version.
