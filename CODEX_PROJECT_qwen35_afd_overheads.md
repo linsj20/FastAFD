@@ -113,14 +113,15 @@ was enabled.
   planning estimate; the runtime page-count gate remains the placement-specific
   maximum-batch authority.
 - The earlier 122B snapshot completed but was superseded by the user's 397B
-  selection and remains intact. The pinned 397B repository contains
-  406,125,181,280 bytes of model tensors across 94 shards (406,198,638,888
-  bytes / 107 repository files including metadata). Its standard HTTP download
-  uses `HF_HUB_DISABLE_XET=1` and two workers; do not repeat the failed
-  high-worker Xet mode used for the earlier snapshot.
+  selection and remains intact. The pinned 397B snapshot is complete at
+  revision `ea5b4f8`: all 107 repository files and 94 tensor shards are present,
+  no blob is incomplete or symlink broken, and the index declares
+  406,125,181,280 tensor bytes. Six concurrent standard-HTTP workers initially
+  accelerated the transfer but triggered Hugging Face 429/queue errors; a
+  single-worker `HF_HUB_DISABLE_XET=1` resume completed reliably. Avoid both
+  that concurrency and the earlier failed high-worker Xet mode.
 
-Next: finish the snapshot, reconcile and commit the isolated remote source,
-discover the placement-specific exact A1 128K capacities from post-init page
-counts, run normal-routing alignment for legacy and attn-only at exact A1 and
-then A3, capture perfect-balanced attn-only A1/A3 Nsight reports, and copy both
-report sets into the local workspace scratch tree.
+Next: discover the placement-specific exact A1 128K capacities from post-init
+page counts, run normal-routing alignment for legacy and attn-only at exact A1
+and then A3, capture perfect-balanced attn-only A1/A3 Nsight reports, and copy
+both report sets into the local workspace scratch tree.
