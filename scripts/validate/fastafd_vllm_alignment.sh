@@ -30,7 +30,7 @@ Options:
   --attn-tp-size N            AFD attention-side TP size. Default: 4
   --mlp-tp-size N             AFD model/mlp-side TP size. Default: 4
   --afd-mlp-ep-size N         AFD model/mlp-side EP size. Default: 1
-  --afd-model-placement NAME  legacy or fmha-only. Default: legacy
+  --afd-model-placement NAME  legacy or attn-only. Default: legacy
   --vllm-tp-size N            vLLM TP size. Default: number of GPUs in --gpus
   --ray-address ADDR          Ray address for AFD phase. Default: auto
   --ray-nsys                 Enable Nsight Systems profiling for AFD Ray workers

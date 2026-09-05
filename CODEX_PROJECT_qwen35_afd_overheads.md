@@ -65,6 +65,12 @@ compatibility alias.
   specializations for head dimensions 128 and 256 and passed three repeated
   fabric iterations with Qwen3.5 shape 32Q/2KV/256 across two independent
   pairs. Output is `logs/transport-smoke-6925193.out` under the task root.
+- The implementation is committed as mirror commit `2d8eb5e` and isolated
+  remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
+  A direct-launch dry run resolves the provisional A1 point to 45 requests per
+  attention-DP lane, 180 prompts, 22+23 MB2 split, four attention plus four
+  EP4 model GPUs on two trays. This is only the planning estimate; the runtime
+  page-count gate remains the maximum-batch authority.
 - The 127,195,718,583-byte pinned model snapshot is downloading into the task
   model cache. The first 8-worker Xet attempt failed a 67 MB allocation on the
   login host; the resumed standard HTTP path uses `HF_HUB_DISABLE_XET=1` and

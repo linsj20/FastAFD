@@ -22,7 +22,7 @@ Options:
   --afd-attn-tp-size N           Default: 4
   --afd-mlp-tp-size N            Default: 4
   --afd-mlp-ep-size N            Default: 1
-  --afd-model-placement NAME     legacy or fmha-only. Default: legacy
+  --afd-model-placement NAME     legacy or attn-only. Default: legacy
   --afd-moe-a2a-backend NAME     Default: none
   --afd-moe-runner-backend NAME  Default: auto
   --afd-batch-size N             Default: 8
