@@ -640,18 +640,6 @@ def _exact_qwen_case(
                 ),
                 perfect_balance=bool(perfect_routing),
             )
-            if perfect_routing:
-                expected_ids = (
-                    torch.arange(
-                        rows * top_k, dtype=ids.dtype, device=ids.device
-                    ).view(rows, top_k)
-                    + rank * rows * top_k
-                ) % num_experts
-                if not torch.equal(ids, expected_ids):
-                    raise RuntimeError(
-                        "perfect-routing IDs do not match the deterministic "
-                        f"global sequence on rank={rank}"
-                    )
 
         def run_stage() -> None:
             prepare_input()
@@ -687,6 +675,18 @@ def _exact_qwen_case(
                         f"for rows={rows} sms={num_sms}"
                     )
                 current = (ids.clone(), weights.clone(), output.clone())
+                if perfect_routing:
+                    expected_ids = (
+                        torch.arange(
+                            rows * top_k, dtype=ids.dtype, device=ids.device
+                        ).view(rows, top_k)
+                        + rank * rows * top_k
+                    ) % num_experts
+                    if not torch.equal(current[0], expected_ids):
+                        raise RuntimeError(
+                            "perfect-routing IDs do not match the deterministic "
+                            f"global sequence on rank={rank}"
+                        )
                 if reference is None:
                     reference = current
                 elif not all(

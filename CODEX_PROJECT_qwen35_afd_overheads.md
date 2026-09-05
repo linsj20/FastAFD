@@ -87,6 +87,11 @@ was enabled.
   all four full stage state dictionaries live together exhausted login-host
   thread-local memory; the isolated construction with one BLAS thread passed,
   so subsequent stage checks must remain isolated.
+- Target-shape router smoke job `6925717` compiled the 512-expert kernel and
+  passed its preliminary route-prepared numeric checks, then failed because
+  the new deterministic-ID test called `torch.equal` inside CUDA graph capture.
+  The assertion is moved to the synchronized eager validation immediately
+  before capture; the candidate kernel itself was not implicated.
 - The implementation is committed as mirror commit `2d8eb5e` and isolated
   remote commit `80380b3`; the primary checkout remains clean at `3c5315f`.
   A direct-launch dry run resolves the provisional A1 point to 45 requests per
