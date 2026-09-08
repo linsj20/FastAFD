@@ -74,6 +74,19 @@ class Qwen35AttnOnlyStructureTest(unittest.TestCase):
             model_keys = Qwen3_5AttnOnlyForCausalLM(_config()).state_dict()
 
         self.assertTrue(any(".linear_attn." in key for key in attention_keys))
+        self.assertTrue(
+            any(".linear_attn.in_proj_qkvz.weight" in key for key in attention_keys)
+        )
+        self.assertTrue(
+            any(".linear_attn.in_proj_ba.weight" in key for key in attention_keys)
+        )
+        for old_projection in ("qkv", "z", "b", "a"):
+            self.assertFalse(
+                any(
+                    f".linear_attn.in_proj_{old_projection}.weight" in key
+                    for key in attention_keys
+                )
+            )
         self.assertFalse(any(".self_attn." in key for key in attention_keys))
         self.assertFalse(any(".mlp." in key for key in attention_keys))
         self.assertFalse(any(".linear_attn." in key for key in model_keys))

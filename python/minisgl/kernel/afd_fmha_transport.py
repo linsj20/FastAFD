@@ -35,6 +35,11 @@ def _jit_module(head_dim: int):
                 f"AfdFmhaTransportKernel<{args}>::quantize_publish_o_fp8_release_turn",
             ),
             ("wait_turn", f"AfdFmhaTransportKernel<{args}>::wait_turn"),
+            ("release_turn", f"AfdFmhaTransportKernel<{args}>::release_turn"),
+            (
+                "signal_direct_o_release_turn",
+                f"AfdFmhaTransportKernel<{args}>::signal_direct_o_release_turn",
+            ),
             ("wait_ready", f"AfdFmhaTransportKernel<{args}>::wait_ready"),
             ("wait_ready_turn", f"AfdFmhaTransportKernel<{args}>::wait_ready_turn"),
         ],
@@ -89,22 +94,32 @@ def publish_o(
     ready_descriptors: torch.Tensor,
     completion_counter: torch.Tensor,
     *,
+    gate: torch.Tensor | None = None,
     slot: int,
     destination_source_stride: int,
     head_dim: int,
     ready_value: int,
 ) -> None:
     _validate_bf16_rows("o", o, head_dim)
+    gate_input = o if gate is None else gate
+    _validate_bf16_rows("gate", gate_input, head_dim)
+    if gate_input.shape != o.shape:
+        raise ValueError(
+            f"AFD O gate shape {tuple(gate_input.shape)} does not match "
+            f"payload shape {tuple(o.shape)}"
+        )
     _validate_completion_counter(completion_counter)
     _validate_ready_value(ready_value)
     _jit_module(int(head_dim)).publish_o(
         o,
+        gate_input,
         descriptors,
         ready_descriptors,
         completion_counter,
         int(slot),
         int(destination_source_stride),
         int(ready_value),
+        int(gate is not None),
     )
 
 
@@ -115,6 +130,7 @@ def publish_o_release_turn(
     completion_counter: torch.Tensor,
     turn: torch.Tensor,
     *,
+    gate: torch.Tensor | None = None,
     slot: int,
     destination_source_stride: int,
     next_turn: int,
@@ -122,11 +138,19 @@ def publish_o_release_turn(
     ready_value: int,
 ) -> None:
     _validate_bf16_rows("o", o, head_dim)
+    gate_input = o if gate is None else gate
+    _validate_bf16_rows("gate", gate_input, head_dim)
+    if gate_input.shape != o.shape:
+        raise ValueError(
+            f"AFD O gate shape {tuple(gate_input.shape)} does not match "
+            f"payload shape {tuple(o.shape)}"
+        )
     _validate_completion_counter(completion_counter)
     _validate_turn(turn, next_turn)
     _validate_ready_value(ready_value)
     _jit_module(int(head_dim)).publish_o_release_turn(
         o,
+        gate_input,
         descriptors,
         ready_descriptors,
         completion_counter,
@@ -135,6 +159,7 @@ def publish_o_release_turn(
         int(destination_source_stride),
         int(next_turn),
         int(ready_value),
+        int(gate is not None),
     )
 
 
@@ -325,6 +350,39 @@ def wait_turn(
     )
 
 
+def release_turn(
+    turn: torch.Tensor,
+    *,
+    next_turn: int,
+    head_dim: int,
+) -> None:
+    """Release the peer compute lane before enqueueing publication work."""
+    _validate_turn(turn, next_turn)
+    _jit_module(int(head_dim)).release_turn(turn, int(next_turn))
+
+
+def signal_direct_o_release_turn(
+    ready_descriptors: torch.Tensor,
+    turn: torch.Tensor,
+    *,
+    slot: int,
+    next_turn: int,
+    head_dim: int,
+    ready_value: int,
+) -> None:
+    """Release the next lane and publish a directly produced symmetric O."""
+    _validate_ready_descriptors(ready_descriptors)
+    _validate_turn(turn, next_turn)
+    _validate_ready_value(ready_value)
+    _jit_module(int(head_dim)).signal_direct_o_release_turn(
+        ready_descriptors,
+        turn,
+        int(slot),
+        int(next_turn),
+        int(ready_value),
+    )
+
+
 def _validate_turn(turn: torch.Tensor | None, value: int | None) -> None:
     if (
         turn is None
@@ -350,6 +408,22 @@ def _validate_ready(name: str, ready: torch.Tensor) -> None:
         or ready.numel() < 1
     ):
         raise ValueError(f"{name} must be a nonempty contiguous CUDA int64 vector")
+
+
+def _validate_ready_descriptors(descriptors: torch.Tensor) -> None:
+    if (
+        descriptors.dtype != torch.int64
+        or not descriptors.is_cuda
+        or not descriptors.is_contiguous()
+        or descriptors.ndim != 2
+        or descriptors.shape[0] < 1
+        or descriptors.shape[1] != 3
+    ):
+        raise ValueError(
+            "AFD ready descriptors must be a nonempty contiguous CUDA int64 "
+            f"matrix with width 3, got shape={tuple(descriptors.shape)} "
+            f"dtype={descriptors.dtype} device={descriptors.device}"
+        )
 
 
 def _validate_ready_value(value: int) -> None:
@@ -479,6 +553,8 @@ __all__ = [
     "quantize_publish_o_fp8",
     "quantize_publish_o_fp8_release_turn",
     "publish_qkv",
+    "release_turn",
+    "signal_direct_o_release_turn",
     "wait_ready",
     "wait_turn",
 ]

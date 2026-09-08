@@ -141,15 +141,22 @@ class AfdCoordinator:
         self.perf_mode = bool(server_args.afd_perf_mode)
         self.perf_context_len = int(server_args.afd_perf_context_len)
         if self.perf_mode:
-            if server_args.afd_model_placement != "attn-only":
-                raise RuntimeError("AFD perf mode requires attn-only placement")
-            if resolve_afd_moe_backend(server_args.afd_model_placement) != "megamoe":
-                raise RuntimeError("AFD perf mode requires the same-rank MegaMoE backend")
-            # Perfect routing is a compile-time expert-ID substitution inside
-            # the normal fused gate kernel. Its 32-bit multiply/add/mask ID
-            # arithmetic adds no division or execution stage; gate GEMM/top-k
-            # and every downstream dispatch/expert/combine kernel remain.
-            os.environ["MINISGL_AFD_PERFECT_ROUTING"] = "1"
+            placement = str(server_args.afd_model_placement)
+            backend = resolve_afd_moe_backend(placement)
+            expected_backend = "megamoe" if placement == "attn-only" else "megamoe_m2n"
+            if (placement, backend) not in (
+                ("attn-only", "megamoe"),
+                ("legacy", "megamoe_m2n"),
+            ):
+                raise RuntimeError(
+                    "AFD perf mode requires a MegaMoE placement/backend pair: "
+                    f"placement={placement} backend={backend} expected={expected_backend}"
+                )
+            if placement == "attn-only":
+                # Perfect routing is a compile-time expert-ID substitution inside
+                # the normal fused gate kernel. Gate GEMM/top-k and every
+                # dispatch/expert/combine kernel remain.
+                os.environ["MINISGL_AFD_PERFECT_ROUTING"] = "1"
         if str(server_args.cache_type) != "naive":
             raise RuntimeError(
                 "AFD serve uses the centralized scheduler and currently supports only cache_type='naive'"

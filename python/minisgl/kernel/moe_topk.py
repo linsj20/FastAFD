@@ -116,6 +116,7 @@ def gate_topk(
         torch.Tensor, torch.Tensor, int, int, int, int, bool
     ] | None = None,
     perfect_balance: bool = False,
+    defer_route_dependent_launch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
     16-way K-split) + softmax + top-k (+ optional renormalize) in ONE kernel
@@ -130,6 +131,11 @@ def gate_topk(
     ``route_prepare`` = (symmetric buffer, device buffer-pointer table, rank,
     ranks, aligned token capacity, MegaMoE SMs, rank-ready publication) groups
     and remotely publishes the selected routes before MegaMoE starts.
+
+    ``defer_route_dependent_launch`` retains the route-ready protocol but lets
+    CUDA release the dependent MegaMoE launch when the selector completes.
+    This gives a peer-lane shared-expert tail launch priority in Qwen3.5's
+    exact-two-stream FFN graph. Other callers keep the early PDL signal.
 
     ``perfect_balance`` preserves the normal gate GEMM, softmax, and top-k work
     but compile-time-substitutes a deterministic global sequence for the final
@@ -239,6 +245,10 @@ def gate_topk(
             raise RuntimeError("gate_topk route bucket is smaller than the token count")
         if int(route_num_sms) <= 0:
             raise RuntimeError("gate_topk route MegaMoE SM count must be positive")
+    elif defer_route_dependent_launch:
+        raise RuntimeError(
+            "deferred route dependent launch requires route preparation"
+        )
     module.launch(
         weights, ids,
         hidden.contiguous(), gate_weight.contiguous(),
@@ -251,6 +261,7 @@ def gate_topk(
         int(route_bucket), int(route_num_sms),
         bool(route_rank_ready),
         bool(perfect_balance),
+        bool(defer_route_dependent_launch),
     )
     return ids, weights
 

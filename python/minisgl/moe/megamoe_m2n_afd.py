@@ -8,7 +8,7 @@ DeepEP union adapter's per-layer dispatch/expert/combine sequence:
   EG owner ranks, waits for the expert write-back, and reduces top-k into a
   bf16 output.
 - EG ranks: :meth:`eg_moe` is ONE persistent kernel that pulls FP8 tokens from
-  the AG ranks, runs the fused FP8xFP8 L1/L2 grouped GEMM pipeline (SwiGLU and
+  the AG ranks, runs the fused FP8xFP8 or FP8xFP4 L1/L2 grouped GEMM pipeline (SwiGLU and
   top-k weights fused in the L1 epilogue), and pushes BF16 expert outputs into
   the AG combine buffers.  Qwen FP8 checkpoint weights are requantized once at
   init to the per-32 UE8M0 mega format (:meth:`register_eg_layer_weights`).
@@ -48,6 +48,7 @@ class MegaMoEM2NAfdAdapter:
         real_num_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        num_layers: int,
         top_k: int,
         num_max_dispatch_tokens_per_rank: int,
         num_lanes: int = 1,
@@ -71,6 +72,7 @@ class MegaMoEM2NAfdAdapter:
         self.is_eg = not self.is_ag
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
+        self.num_layers = int(num_layers)
         self.routed_top_k = int(top_k)
         self.shared_experts_per_rank = int(shared_experts_per_rank)
         if self.shared_experts_per_rank not in (0, 1):
@@ -89,6 +91,32 @@ class MegaMoEM2NAfdAdapter:
         self.bucket = int(num_max_dispatch_tokens_per_rank)
         self.num_lanes = max(1, int(num_lanes))
         self.routed_scaling_factor = float(routed_scaling_factor)
+        weight_path = os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH", "").strip()
+        weight_dtype = os.environ.get(
+            "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp4"
+        ).strip().lower()
+        if weight_path and weight_dtype != "fp4":
+            raise RuntimeError(
+                "a preconverted MegaMoE expert checkpoint requires fp4 weights"
+            )
+        if weight_path and self.shared_experts_per_rank:
+            raise RuntimeError(
+                "preconverted MegaMoE W4 currently supports routed experts only"
+            )
+        self._weight_loader = (
+            _mm.Mxfp4ExpertWeightLoader(
+                weight_path,
+                torch.device("cuda", torch.cuda.current_device()),
+                num_layers=self.num_layers,
+                num_experts=self.real_num_experts,
+                hidden=self.hidden_size,
+                intermediate_hidden=self.intermediate_size,
+            )
+            if weight_path and self.is_eg
+            else None
+        )
+        self.use_fp8_weights = not bool(weight_path)
+        self.precision = "fp8_fp8" if self.use_fp8_weights else "fp8_fp4"
 
         self.buffers: list[_mm.MegaMoEM2NSymmBuffer] = []
         if not defer_buffer_allocation:
@@ -258,6 +286,15 @@ class MegaMoEM2NAfdAdapter:
         """
         if not self.is_eg:
             raise RuntimeError("register_eg_layer_weights called on an AG rank")
+        if self._weight_loader is not None:
+            local_experts = int(experts.local_num_experts)
+            l1_t, l2_t = self._weight_loader.load_layer(
+                layer_id,
+                expert_offset=int(experts.local_expert_offset),
+                expert_count=local_experts,
+            )
+            self._register_transformed_layer(layer_id, l1_t, l2_t)
+            return
         quant_method = getattr(getattr(experts, "quant", None), "method", None)
         scale_format = getattr(experts, "_fp8_scale_format", None)
         block_shape = tuple(getattr(getattr(experts, "quant", None), "weight_block_size", (128, 128)))
@@ -300,6 +337,14 @@ class MegaMoEM2NAfdAdapter:
         l1 = _mm.requant_qwen_fp8_weights_per32(l1_weight, l1_scale, inplace=True)
         l2 = _mm.requant_qwen_fp8_weights_per32(l2_weight, l2_scale, inplace=True)
         l1_t, l2_t = _mm.transform_weights_for_mega_moe(l1, l2)
+        self._register_transformed_layer(layer_id, l1_t, l2_t)
+
+    def _register_transformed_layer(
+        self,
+        layer_id: int,
+        l1_t: tuple[torch.Tensor, torch.Tensor],
+        l2_t: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         global_layer_id = int(layer_id)
         compact_layer_id = len(self._eg_global_to_compact)
         self._eg_global_to_compact[global_layer_id] = compact_layer_id
@@ -377,6 +422,7 @@ class MegaMoEM2NAfdAdapter:
             expected_num_tokens_per_rank=expected,
             num_experts_per_rank=self.num_experts // self.eg_size,
             l1_weights_nbytes=self._eg_l1_nbytes,
+            use_fp8_weights=self.use_fp8_weights,
             fast_math=True,
             num_sms=self.eg_num_sms,
             num_prefetch_bytes=self.eg_prefetch_bytes,
@@ -410,6 +456,7 @@ class MegaMoEM2NAfdAdapter:
             expected_num_tokens_per_rank=expected,
             num_experts_per_rank=self.num_experts // self.eg_size,
             l1_weights_nbytes=self._eg_l1_nbytes,
+            use_fp8_weights=self.use_fp8_weights,
             fast_math=True,
             num_sms=0,  # full device: nothing co-resides on a dedicated EG rank
             num_prefetch_bytes=self.eg_prefetch_bytes,
@@ -448,6 +495,7 @@ class MegaMoEM2NAfdAdapter:
             num_experts_per_rank=self.num_experts // self.eg_size,
             l1_weights_nbytes=self._eg_l1_nbytes,
             num_layers=int(num_layers),
+            use_fp8_weights=self.use_fp8_weights,
             fast_math=True,
             num_sms=0,
             num_prefetch_bytes=self.eg_prefetch_bytes,

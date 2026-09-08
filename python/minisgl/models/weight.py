@@ -30,6 +30,10 @@ _MERGE_GROUPS = {
     ".up_proj": (".gate_up_proj", ("gate", "up")),
     ".w1": (".gate_up_proj", ("gate", "up")),
     ".w3": (".gate_up_proj", ("gate", "up")),
+    ".in_proj_qkv": (".in_proj_qkvz", ("qkv", "z")),
+    ".in_proj_z": (".in_proj_qkvz", ("qkv", "z")),
+    ".in_proj_b": (".in_proj_ba", ("b", "a")),
+    ".in_proj_a": (".in_proj_ba", ("b", "a")),
 }
 _SLOT_NAMES = {
     ".q_proj": "q",
@@ -39,6 +43,10 @@ _SLOT_NAMES = {
     ".up_proj": "up",
     ".w1": "gate",
     ".w3": "up",
+    ".in_proj_qkv": "qkv",
+    ".in_proj_z": "z",
+    ".in_proj_b": "b",
+    ".in_proj_a": "a",
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 _GLM4_LAYER_PATTERN = re.compile(r"^model\.layers\.(?P<idx>\d+)\.")
@@ -379,8 +387,22 @@ def _find_paired_scale_key(
 def _get_merge_info(key: str):
     """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
-        if key.count(suffix):
-            return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
+        marker = f"{suffix}."
+        if marker in key:
+            return (
+                key.replace(marker, f"{fused_suffix}.", 1),
+                _SLOT_NAMES[suffix],
+                slots,
+            )
+        # Expert FP8 scales are flattened to ``*_scale`` attributes before
+        # expert stacking. Preserve projection fusion for those runtime names.
+        scale_suffix = f"{suffix}_scale"
+        if key.endswith(scale_suffix):
+            return (
+                key.removesuffix(scale_suffix) + f"{fused_suffix}_scale",
+                _SLOT_NAMES[suffix],
+                slots,
+            )
     return None
 
 

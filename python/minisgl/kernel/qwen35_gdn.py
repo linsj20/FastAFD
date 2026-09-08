@@ -27,9 +27,76 @@ def qwen35_gdn_gates(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return log forget gate ``g`` and delta update gate ``beta`` in FP32."""
 
-    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
-    beta = torch.sigmoid(b.float())
+    if not a.is_cuda:
+        g = -A_log.float().exp() * F.softplus(a.float() + dt_bias.float())
+        beta = torch.sigmoid(b.float())
+        return g, beta
+    if a.shape != b.shape or a.ndim != 2:
+        raise ValueError(
+            f"Qwen3.5 GDN gate inputs must be matching 2D tensors, "
+            f"got a={tuple(a.shape)} b={tuple(b.shape)}"
+        )
+    if A_log.numel() != a.shape[1] or dt_bias.numel() != a.shape[1]:
+        raise ValueError(
+            "Qwen3.5 GDN gate parameter shape mismatch: "
+            f"heads={a.shape[1]} A_log={tuple(A_log.shape)} "
+            f"dt_bias={tuple(dt_bias.shape)}"
+        )
+    if a.stride(-1) != 1 or b.stride(-1) != 1:
+        raise ValueError("Qwen3.5 GDN gate head dimensions must be contiguous")
+
+    g = torch.empty(a.shape, dtype=torch.float32, device=a.device)
+    beta = torch.empty(b.shape, dtype=torch.float32, device=b.device)
+    block_heads = triton.next_power_of_2(a.shape[1])
+    _qwen35_gdn_gates_kernel[(a.shape[0],)](
+        a,
+        b,
+        A_log,
+        dt_bias,
+        g,
+        beta,
+        a.stride(0),
+        b.stride(0),
+        a.shape[1],
+        BLOCK_HEADS=block_heads,
+        num_warps=2,
+    )
     return g, beta
+
+
+@triton.jit
+def _qwen35_gdn_gates_kernel(
+    a_ptr,
+    b_ptr,
+    A_log_ptr,
+    dt_bias_ptr,
+    g_ptr,
+    beta_ptr,
+    a_row_stride,
+    b_row_stride,
+    num_heads,
+    BLOCK_HEADS: tl.constexpr,
+):
+    token = tl.program_id(0)
+    head = tl.arange(0, BLOCK_HEADS)
+    mask = head < num_heads
+    a = tl.load(
+        a_ptr + token * a_row_stride + head, mask=mask, other=0.0
+    ).to(tl.float32)
+    b = tl.load(
+        b_ptr + token * b_row_stride + head, mask=mask, other=0.0
+    ).to(tl.float32)
+    A_log = tl.load(A_log_ptr + head, mask=mask, other=0.0).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
+    softplus_arg = a + dt_bias
+    softplus = tl.where(
+        softplus_arg <= 20.0,
+        tl.log(1.0 + tl.exp(softplus_arg)),
+        softplus_arg,
+    )
+    output_offset = token * num_heads + head
+    tl.store(g_ptr + output_offset, -tl.exp(A_log) * softplus, mask=mask)
+    tl.store(beta_ptr + output_offset, tl.sigmoid(b), mask=mask)
 
 
 def _expand_qk_heads(
@@ -205,6 +272,8 @@ def _qwen35_causal_conv1d_decode_kernel(
     idx_ptr,
     pos_ptr,
     out_ptr,
+    q_norm_scale_ptr,
+    k_norm_scale_ptr,
     num_channels,
     x_row_stride,
     state_slot_stride,
@@ -213,8 +282,15 @@ def _qwen35_causal_conv1d_decode_kernel(
     w_channel_stride,
     w_tap_stride,
     out_row_stride,
+    num_requests,
     KERNEL_WIDTH: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    PACK_QKV: tl.constexpr,
+    KEY_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    COMPUTE_QK_SCALES: tl.constexpr,
+    KEY_HEAD_DIM: tl.constexpr,
+    NUM_KEY_HEADS: tl.constexpr,
 ):
     """One fused decode step of the Qwen3.5 depthwise causal convolution.
 
@@ -276,11 +352,60 @@ def _qwen35_causal_conv1d_decode_kernel(
     )
 
     out = acc * tl.sigmoid(acc)
-    tl.store(
-        out_ptr + req * out_row_stride + offs_c,
-        out.to(out_ptr.dtype.element_ty),
-        mask=mask_c,
-    )
+    out_rounded = out.to(out_ptr.dtype.element_ty)
+    if COMPUTE_QK_SCALES:
+        # Recurrent value tiles share each Q/K head. Compute its normalization
+        # multiplier once while the just-produced BF16 head is still resident,
+        # instead of repeating two reductions in every recurrent tile.
+        channel_block = tl.program_id(1)
+        if channel_block < 2 * NUM_KEY_HEADS:
+            norm_input = out_rounded.to(tl.float32)
+            inv_norm = tl.rsqrt(
+                tl.sum(norm_input * norm_input, axis=0) + 1.0e-6
+            )
+            if channel_block < NUM_KEY_HEADS:
+                tl.store(
+                    q_norm_scale_ptr + req * NUM_KEY_HEADS + channel_block,
+                    inv_norm * (KEY_HEAD_DIM**-0.5),
+                )
+            else:
+                tl.store(
+                    k_norm_scale_ptr
+                    + req * NUM_KEY_HEADS
+                    + channel_block
+                    - NUM_KEY_HEADS,
+                    inv_norm,
+                )
+    if PACK_QKV:
+        # Store the conv result directly as three globally contiguous tensors.
+        # The recurrent kernel walks token-major Q/K/V independently; packing
+        # here avoids materializing a row-interleaved tensor and then copying
+        # each slice solely to repair its token stride.
+        q_end = KEY_DIM
+        k_end = 2 * KEY_DIM
+        packed_offset = tl.where(
+            offs_c < q_end,
+            req * KEY_DIM + offs_c,
+            tl.where(
+                offs_c < k_end,
+                num_requests * KEY_DIM + req * KEY_DIM + offs_c - q_end,
+                2 * num_requests * KEY_DIM
+                + req * VALUE_DIM
+                + offs_c
+                - k_end,
+            ),
+        )
+        tl.store(
+            out_ptr + packed_offset,
+            out_rounded,
+            mask=mask_c,
+        )
+    else:
+        tl.store(
+            out_ptr + req * out_row_stride + offs_c,
+            out_rounded,
+            mask=mask_c,
+        )
 
 
 def qwen35_causal_conv1d_decode_eager(
@@ -337,6 +462,8 @@ def qwen35_causal_conv1d_decode(
         state_indices,
         positions,
         out,
+        out,
+        out,
         num_channels,
         x.stride(0),
         state_pool.stride(0),
@@ -345,11 +472,124 @@ def qwen35_causal_conv1d_decode(
         weight.stride(0),
         weight.stride(-1),
         out.stride(0),
+        num_requests,
         KERNEL_WIDTH=kernel_width,
         BLOCK_C=block_c,
+        PACK_QKV=False,
+        KEY_DIM=0,
+        VALUE_DIM=0,
+        COMPUTE_QK_SCALES=False,
+        KEY_HEAD_DIM=0,
+        NUM_KEY_HEADS=0,
         num_warps=4,
     )
     return out
+
+
+def qwen35_causal_conv1d_decode_packed(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    key_dim: int,
+    value_dim: int,
+    key_head_dim: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fuse decode convolution with token-contiguous Q/K/V materialization."""
+
+    if 2 * key_dim + value_dim != x.shape[-1]:
+        raise ValueError(
+            "Qwen3.5 packed convolution dimensions do not cover the input: "
+            f"key={key_dim} value={value_dim} input={x.shape[-1]}"
+        )
+    num_requests = x.shape[0]
+    if not x.is_cuda or os.environ.get("MINISGL_QWEN35_CONV1D_EAGER") == "1":
+        mixed = qwen35_causal_conv1d_decode_eager(
+            x, weight, state_pool, state_indices, positions
+        )
+        q, k, v = mixed.split((key_dim, key_dim, value_dim), dim=-1)
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        q_f32 = q.view(num_requests, -1, key_head_dim).float()
+        k_f32 = k.view(num_requests, -1, key_head_dim).float()
+        q_scale = torch.rsqrt(q_f32.square().sum(dim=-1) + 1.0e-6)
+        q_scale = q_scale * (key_head_dim**-0.5)
+        k_scale = torch.rsqrt(k_f32.square().sum(dim=-1) + 1.0e-6)
+        return q, k, v, q_scale, k_scale
+
+    num_channels = x.shape[1]
+    kernel_width = weight.shape[-1]
+    if not 2 <= kernel_width <= 4:
+        raise ValueError(
+            f"qwen35_causal_conv1d_decode_packed supports kernel_width 2..4, got "
+            f"{kernel_width} from weight shape {tuple(weight.shape)}"
+        )
+    block_c = 128
+    if key_dim % block_c or value_dim % block_c:
+        raise ValueError(
+            "Qwen3.5 packed convolution requires 128-aligned Q/K/V widths, "
+            f"got key={key_dim} value={value_dim}"
+        )
+    if key_head_dim != block_c or key_dim % key_head_dim:
+        raise ValueError(
+            "Qwen3.5 packed convolution Q/K scale fusion requires "
+            f"128-wide key heads, got key_dim={key_dim} head_dim={key_head_dim}"
+        )
+
+    packed = torch.empty(
+        num_requests * num_channels, dtype=x.dtype, device=x.device
+    )
+    num_key_heads = key_dim // key_head_dim
+    q_norm_scale = torch.empty(
+        (num_requests, num_key_heads), dtype=torch.float32, device=x.device
+    )
+    k_norm_scale = torch.empty_like(q_norm_scale)
+    grid = (num_requests, triton.cdiv(num_channels, block_c))
+    _qwen35_causal_conv1d_decode_kernel[grid](
+        x,
+        weight,
+        state_pool,
+        state_indices,
+        positions,
+        packed,
+        q_norm_scale,
+        k_norm_scale,
+        num_channels,
+        x.stride(0),
+        state_pool.stride(0),
+        state_pool.stride(1),
+        state_pool.stride(2),
+        weight.stride(0),
+        weight.stride(-1),
+        0,
+        num_requests,
+        KERNEL_WIDTH=kernel_width,
+        BLOCK_C=block_c,
+        PACK_QKV=True,
+        KEY_DIM=key_dim,
+        VALUE_DIM=value_dim,
+        COMPUTE_QK_SCALES=True,
+        KEY_HEAD_DIM=key_head_dim,
+        NUM_KEY_HEADS=num_key_heads,
+        num_warps=4,
+    )
+    q_elements = num_requests * key_dim
+    v_elements = num_requests * value_dim
+    q = packed[:q_elements].view(num_requests, key_dim)
+    k = packed[q_elements : 2 * q_elements].view(num_requests, key_dim)
+    v = packed[2 * q_elements : 2 * q_elements + v_elements].view(
+        num_requests, value_dim
+    )
+    return q, k, v, q_norm_scale, k_norm_scale
 
 
 def _qwen35_rmsnorm_gated(
@@ -374,9 +614,11 @@ def _qwen35_rmsnorm_gated_kernel(
     z_ptr,
     weight_ptr,
     out_ptr,
+    z_token_stride,
     eps: tl.constexpr,
     rows: tl.constexpr,
     width: tl.constexpr,
+    heads: tl.constexpr,
     row_block: tl.constexpr,
     block: tl.constexpr,
 ):
@@ -384,7 +626,10 @@ def _qwen35_rmsnorm_gated_kernel(
     offsets = tl.arange(0, block)[None, :]
     mask = (row < rows) & (offsets < width)
     x = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
-    z = tl.load(z_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
+    token = row // heads
+    head = row % heads
+    z_offset = token * z_token_stride + head * width + offsets
+    z = tl.load(z_ptr + z_offset, mask=mask, other=0.0).to(tl.float32)
     weight = tl.load(weight_ptr + offsets, mask=offsets < width, other=0.0).to(
         tl.float32
     )
@@ -396,6 +641,64 @@ def _qwen35_rmsnorm_gated_kernel(
         out_ptr + row * width + offsets,
         out.to(out_ptr.dtype.element_ty),
         mask=mask,
+    )
+
+
+@triton.jit
+def _qwen35_rmsnorm_gated_fp8_kernel(
+    x_ptr,
+    z_ptr,
+    weight_ptr,
+    out_ptr,
+    scale_ptr,
+    z_token_stride,
+    eps: tl.constexpr,
+    rows: tl.constexpr,
+    width: tl.constexpr,
+    heads: tl.constexpr,
+    scale_token_stride: tl.constexpr,
+    scale_group_stride: tl.constexpr,
+    row_block: tl.constexpr,
+    block: tl.constexpr,
+):
+    row_base = tl.program_id(0) * row_block
+    local_row_id = tl.arange(0, row_block)
+    local_row = local_row_id[:, None]
+    row = row_base + local_row
+    offsets = tl.arange(0, block)[None, :]
+    mask = (row < rows) & (offsets < width)
+    x = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(tl.float32)
+    token = row // heads
+    head = row % heads
+    z_offset = token * z_token_stride + head * width + offsets
+    z = tl.load(z_ptr + z_offset, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + offsets, mask=offsets < width, other=0.0).to(
+        tl.float32
+    )
+    inv_rms = tl.rsqrt(tl.sum(x * x, axis=1)[:, None] / width + eps)
+    normalized = x * inv_rms * weight
+    gate = z * tl.sigmoid(z)
+
+    # Preserve the standalone path's BF16 boundary before computing dynamic
+    # per-128 UE8M0 scales and FP8 values.
+    rounded = (normalized * gate).to(x_ptr.dtype.element_ty).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(rounded), axis=1), 1.0e-10)
+    scale_raw = tl.maximum(amax * (1.0 / 448.0), 1.0e-10)
+    scale = tl.exp2(tl.ceil(tl.log2(scale_raw)))
+    quantized = tl.clamp(rounded / scale[:, None], -448.0, 448.0).to(
+        out_ptr.dtype.element_ty
+    )
+    tl.store(out_ptr + row * width + offsets, quantized, mask=mask)
+
+    scale_exp = scale.to(tl.int32, bitcast=True) >> 23
+    packed = tl.sum(scale_exp << (local_row_id.to(tl.int32) * 8), axis=0)
+    token = row_base // heads
+    packed_group = (row_base % heads) // row_block
+    tl.store(
+        scale_ptr
+        + token * scale_token_stride
+        + packed_group * scale_group_stride,
+        packed,
     )
 
 
@@ -418,10 +721,15 @@ def qwen35_rmsnorm_gated(
             f"Qwen3.5 gated RMSNorm shape mismatch: "
             f"x={tuple(x.shape)} z={tuple(z.shape)} weight={tuple(weight.shape)}"
         )
-    if not (x.is_contiguous() and z.is_contiguous() and weight.is_contiguous()):
-        raise ValueError("Qwen3.5 gated RMSNorm requires contiguous inputs")
+    if not (x.is_contiguous() and weight.is_contiguous()):
+        raise ValueError("Qwen3.5 gated RMSNorm requires contiguous x/weight")
+    if z.stride(-1) != 1 or z.stride(-2) != z.shape[-1]:
+        raise ValueError(
+            "Qwen3.5 gated RMSNorm requires contiguous per-token z heads"
+        )
     out = torch.empty_like(x)
     width = int(x.shape[-1])
+    heads = int(x.shape[-2])
     rows = x.numel() // width
     row_block = 2
     _qwen35_rmsnorm_gated_kernel[(triton.cdiv(rows, row_block),)](
@@ -429,14 +737,77 @@ def qwen35_rmsnorm_gated(
         z,
         weight,
         out,
+        z.stride(0),
         eps=float(eps),
         rows=rows,
         width=width,
+        heads=heads,
         row_block=row_block,
         block=triton.next_power_of_2(width),
         num_warps=2,
     )
     return out
+
+
+def qwen35_rmsnorm_gated_fp8(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse GDN gated RMSNorm with dynamic FP8 input quantization."""
+
+    if not x.is_cuda:
+        raise RuntimeError("Qwen3.5 fused gated RMSNorm FP8 requires CUDA")
+    if x.shape != z.shape or x.shape[-1] != weight.numel():
+        raise ValueError(
+            f"Qwen3.5 gated RMSNorm FP8 shape mismatch: "
+            f"x={tuple(x.shape)} z={tuple(z.shape)} weight={tuple(weight.shape)}"
+        )
+    if x.dtype != torch.bfloat16 or z.dtype != torch.bfloat16:
+        raise ValueError("Qwen3.5 fused gated RMSNorm FP8 requires BF16 inputs")
+    if not (x.is_contiguous() and weight.is_contiguous()):
+        raise ValueError("Qwen3.5 fused gated RMSNorm FP8 requires contiguous x/weight")
+    if z.stride(-1) != 1 or z.stride(-2) != z.shape[-1]:
+        raise ValueError(
+            "Qwen3.5 fused gated RMSNorm FP8 requires contiguous per-token heads"
+        )
+
+    tokens, heads, width = x.shape
+    row_block = 4
+    if width != 128 or heads % row_block:
+        raise ValueError(
+            "Qwen3.5 fused gated RMSNorm FP8 requires width=128 and heads%4=0, "
+            f"got heads={heads} width={width}"
+        )
+    rows = tokens * heads
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    aligned_tokens = (tokens + 3) // 4 * 4
+    packed_groups = heads // row_block
+    scales = torch.empty_strided(
+        (tokens, packed_groups),
+        (1, aligned_tokens),
+        dtype=torch.int32,
+        device=x.device,
+    )
+    _qwen35_rmsnorm_gated_fp8_kernel[(triton.cdiv(rows, row_block),)](
+        x,
+        z,
+        weight,
+        out,
+        scales,
+        z.stride(0),
+        eps=float(eps),
+        rows=rows,
+        width=width,
+        heads=heads,
+        scale_token_stride=scales.stride(0),
+        scale_group_stride=scales.stride(1),
+        row_block=row_block,
+        block=128,
+        num_warps=4,
+    )
+    return out, scales
 
 
 @triton.jit
@@ -574,6 +945,14 @@ def _qwen35_gdn_decode_kernel(
     state_indices_ptr,
     positions_ptr,
     output_ptr,
+    q_norm_scale_ptr,
+    k_norm_scale_ptr,
+    g_ptr,
+    beta_ptr,
+    a_row_stride,
+    b_row_stride,
+    HAS_QK_NORM_SCALES: tl.constexpr,
+    HAS_PRECOMPUTED_GATES: tl.constexpr,
     H_Q: tl.constexpr,
     H_V: tl.constexpr,
     K: tl.constexpr,
@@ -605,8 +984,13 @@ def _qwen35_gdn_decode_kernel(
         mask=key_mask,
         other=0.0,
     ).to(tl.float32)
-    q *= tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) * (K**-0.5)
-    k *= tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
+    if HAS_QK_NORM_SCALES:
+        norm_offset = token_idx * H_Q + key_head
+        q *= tl.load(q_norm_scale_ptr + norm_offset)
+        k *= tl.load(k_norm_scale_ptr + norm_offset)
+    else:
+        q *= tl.rsqrt(tl.sum(q * q, axis=0) + 1e-6) * (K**-0.5)
+        k *= tl.rsqrt(tl.sum(k * k, axis=0) + 1e-6)
 
     slot = tl.load(state_indices_ptr + token_idx).to(tl.int64)
     position = tl.load(positions_ptr + token_idx)
@@ -620,18 +1004,24 @@ def _qwen35_gdn_decode_kernel(
     )
     state = tl.where(position == 0, 0.0, state)
 
-    head_offset = token_idx * H_V + value_head
-    a = tl.load(a_ptr + head_offset).to(tl.float32)
-    b = tl.load(b_ptr + head_offset).to(tl.float32)
-    A_log = tl.load(A_log_ptr + value_head).to(tl.float32)
-    dt_bias = tl.load(dt_bias_ptr + value_head).to(tl.float32)
-    softplus_arg = a + dt_bias
-    softplus = tl.where(
-        softplus_arg <= 20.0,
-        tl.log(1.0 + tl.exp(softplus_arg)),
-        softplus_arg,
-    )
-    state *= tl.exp(-tl.exp(A_log) * softplus)
+    gate_offset = token_idx * H_V + value_head
+    if HAS_PRECOMPUTED_GATES:
+        g = tl.load(g_ptr + gate_offset).to(tl.float32)
+        beta = tl.load(beta_ptr + gate_offset).to(tl.float32)
+    else:
+        a = tl.load(a_ptr + token_idx * a_row_stride + value_head).to(tl.float32)
+        b = tl.load(b_ptr + token_idx * b_row_stride + value_head).to(tl.float32)
+        A_log = tl.load(A_log_ptr + value_head).to(tl.float32)
+        dt_bias = tl.load(dt_bias_ptr + value_head).to(tl.float32)
+        softplus_arg = a + dt_bias
+        softplus = tl.where(
+            softplus_arg <= 20.0,
+            tl.log(1.0 + tl.exp(softplus_arg)),
+            softplus_arg,
+        )
+        g = -tl.exp(A_log) * softplus
+        beta = tl.sigmoid(b)
+    state *= tl.exp(g)
 
     v = tl.load(
         v_ptr + (token_idx * H_V + value_head) * V + value_offsets,
@@ -639,7 +1029,7 @@ def _qwen35_gdn_decode_kernel(
         other=0.0,
     ).to(tl.float32)
     memory = tl.sum(state * k[None, :], axis=1)
-    delta = (v - memory) * tl.sigmoid(b)
+    delta = (v - memory) * beta
     state += delta[:, None] * k[None, :]
     output = tl.sum(state * q[None, :], axis=1)
 
@@ -662,8 +1052,15 @@ def qwen35_gdn_decode(
     state_pool: torch.Tensor,
     state_indices: torch.Tensor,
     positions: torch.Tensor,
+    q_norm_scale: torch.Tensor | None = None,
+    k_norm_scale: torch.Tensor | None = None,
+    g: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused single-token GDN update; mutates selected recurrent-state slots."""
+
+    if (g is None) != (beta is None):
+        raise ValueError("Qwen3.5 GDN requires both precomputed gates")
 
     if not q.is_cuda:
         outputs = []
@@ -672,32 +1069,74 @@ def qwen35_gdn_decode(
             initial = state_pool[slot]
             if int(positions[token_idx]) == 0:
                 initial = torch.zeros_like(initial)
-            g, beta = qwen35_gdn_gates(
-                a[token_idx], b[token_idx], A_log, dt_bias
-            )
+            if g is None or beta is None:
+                token_g, token_beta = qwen35_gdn_gates(
+                    a[token_idx], b[token_idx], A_log, dt_bias
+                )
+            else:
+                token_g = g[token_idx]
+                token_beta = beta[token_idx]
             output, final_state = qwen35_recurrent_gated_delta_rule(
                 q[token_idx : token_idx + 1],
                 k[token_idx : token_idx + 1],
                 v[token_idx : token_idx + 1],
-                g.unsqueeze(0),
-                beta.unsqueeze(0),
+                token_g.unsqueeze(0),
+                token_beta.unsqueeze(0),
                 initial,
             )
             state_pool[slot].copy_(final_state)
             outputs.append(output)
         return torch.cat(outputs, dim=0)
 
-    # q/k/v arrive as strided views of the fused conv output. Reading them in place
-    # by stride was measured and REJECTED: it removes 108 copy launches/step worth
-    # ~0.62 ms but costs the bandwidth-bound recurrent kernel 25.65 us per launch
-    # (+0.92 ms/step), because materializing them also warms L2 for the read that
-    # immediately follows. Net +0.30 ms/step, so the copies stay.
+    # The optimized decode convolution already writes token-contiguous Q/K/V,
+    # making these calls no-ops. Keep them for other callers: reading the old
+    # row-interleaved views in place was measured and REJECTED because the
+    # bandwidth-bound recurrent kernel lost more than the copy kernels saved.
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    a = a.contiguous()
-    b = b.contiguous()
+    if a.stride(-1) != 1 or b.stride(-1) != 1:
+        raise ValueError("Qwen3.5 GDN a/b head dimensions must be contiguous")
     output = torch.empty_like(v)
+    has_qk_norm_scales = q_norm_scale is not None or k_norm_scale is not None
+    if has_qk_norm_scales:
+        if q_norm_scale is None or k_norm_scale is None:
+            raise ValueError(
+                "Qwen3.5 GDN requires both Q and K normalization scales"
+            )
+        expected_scale_shape = (q.shape[0], q.shape[1])
+        if (
+            q_norm_scale.shape != expected_scale_shape
+            or k_norm_scale.shape != expected_scale_shape
+        ):
+            raise ValueError(
+                "Qwen3.5 GDN normalization scale shape mismatch: "
+                f"expected={expected_scale_shape} q={tuple(q_norm_scale.shape)} "
+                f"k={tuple(k_norm_scale.shape)}"
+            )
+        q_norm_scale = q_norm_scale.contiguous()
+        k_norm_scale = k_norm_scale.contiguous()
+    else:
+        # Triton still requires pointer arguments when the compile-time branch
+        # removes the loads.
+        q_norm_scale = q
+        k_norm_scale = k
+    has_precomputed_gates = g is not None or beta is not None
+    if has_precomputed_gates:
+        if g is None or beta is None:
+            raise ValueError("Qwen3.5 GDN requires both precomputed gates")
+        expected_gate_shape = (v.shape[0], v.shape[1])
+        if g.shape != expected_gate_shape or beta.shape != expected_gate_shape:
+            raise ValueError(
+                "Qwen3.5 precomputed gate shape mismatch: "
+                f"expected={expected_gate_shape} g={tuple(g.shape)} "
+                f"beta={tuple(beta.shape)}"
+            )
+        g = g.contiguous()
+        beta = beta.contiguous()
+    else:
+        g = a
+        beta = b
     key_dim = q.shape[-1]
     value_dim = v.shape[-1]
     block_key = triton.next_power_of_2(key_dim)
@@ -715,6 +1154,14 @@ def qwen35_gdn_decode(
         state_indices,
         positions,
         output,
+        q_norm_scale,
+        k_norm_scale,
+        g,
+        beta,
+        a.stride(0),
+        b.stride(0),
+        HAS_QK_NORM_SCALES=has_qk_norm_scales,
+        HAS_PRECOMPUTED_GATES=has_precomputed_gates,
         H_Q=q.shape[1],
         H_V=v.shape[1],
         K=key_dim,
@@ -732,6 +1179,7 @@ def qwen35_gdn_decode(
 
 __all__ = [
     "qwen35_causal_conv1d_decode",
+    "qwen35_causal_conv1d_decode_packed",
     "qwen35_causal_conv1d_prefill",
     "qwen35_gdn_decode",
     "qwen35_gdn_gates",
@@ -740,4 +1188,5 @@ __all__ = [
     "qwen35_recurrent_gated_delta_rule",
     "qwen35_recurrent_gated_delta_rule_packed",
     "qwen35_rmsnorm_gated",
+    "qwen35_rmsnorm_gated_fp8",
 ]

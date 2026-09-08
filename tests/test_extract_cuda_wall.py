@@ -1,22 +1,68 @@
 from __future__ import annotations
 
+import io
 import unittest
+from unittest import mock
 
 from scripts.experiments.afd.oci_hsg.extract_cuda_wall import (
     collapse_fmha_graph_spans,
     fmha_profile_launches_per_step,
+    load_matching_plan,
 )
 
 
 class CollapseFmhaGraphSpansTests(unittest.TestCase):
+    @staticmethod
+    def _result() -> dict[str, object]:
+        return {
+            "normalized_attention_to_ffn_active_gpu_ratio": "3:1",
+            "ffn_ep_size": 4,
+            "batch_per_attention_dp_lane": 2,
+            "context_range_tokens": {"min": 8192, "max": 8192},
+            "prompt_mode": "uniform",
+            "context_tokens": 8192,
+            "megamoe_expert_weight_dtype": "fp8",
+        }
+
+    def test_plan_preserves_explicit_active_gpu_count(self) -> None:
+        path = mock.Mock()
+        path.open.return_value = io.StringIO(
+            "rerun_index,case_id,status,active_gpus\n"
+            "1,i8192-fep4-r3-atp1-b2-fp8,"
+            "needs_corrected_target_batch_rerun,13\n"
+        )
+        plan = load_matching_plan(
+            path,
+            self._result(),
+            "i8192-fep4-r3-atp1-b2-fp8",
+        )
+        self.assertEqual(plan["active_gpus"], "13")
+
+    def test_legacy_plan_derives_active_gpu_count_from_ratio(self) -> None:
+        path = mock.Mock()
+        path.open.return_value = io.StringIO(
+            "rerun_index,case_id,status\n"
+            "1,i8192-fep4-r3-atp1-b2-fp8,"
+            "needs_corrected_target_batch_rerun\n"
+        )
+        plan = load_matching_plan(
+            path,
+            self._result(),
+            "i8192-fep4-r3-atp1-b2-fp8",
+        )
+        self.assertEqual(plan["active_gpus"], "16")
+
     def test_grouped_model_has_one_launch_independent_of_fanin(self) -> None:
         self.assertEqual(fmha_profile_launches_per_step(4, 4), (1, 1))
         self.assertEqual(fmha_profile_launches_per_step(8, 4), (1, 1))
         self.assertEqual(fmha_profile_launches_per_step(44, 4), (1, 1))
+        self.assertEqual(fmha_profile_launches_per_step(7, 4), (1, 1))
 
-    def test_grouped_profile_rejects_nonintegral_fanin(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "fan-in is not integral"):
-            fmha_profile_launches_per_step(7, 4)
+    def test_grouped_profile_rejects_invalid_dp_sizes(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "at least as many attention"):
+            fmha_profile_launches_per_step(3, 4)
+        with self.assertRaisesRegex(RuntimeError, "positive DP sizes"):
+            fmha_profile_launches_per_step(0, 4)
 
     def test_single_launch_per_step_is_unchanged(self) -> None:
         collapsed, node_count, grouped = collapse_fmha_graph_spans(

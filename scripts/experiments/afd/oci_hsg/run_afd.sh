@@ -93,6 +93,12 @@ AFD_PERF_MODE=${FASTAFD_AFD_PERF_MODE:-${AFD_PERF_MODE:-0}}
     echo "FASTAFD_AFD_PERF_MODE must be 0 or 1" >&2
     exit 2
 }
+AFD_FORCE_MULTI_MB_GRAPH_OVERLAP=${FASTAFD_AFD_FORCE_MULTI_MB_GRAPH_OVERLAP:-${AFD_FORCE_MULTI_MB_GRAPH_OVERLAP:-0}}
+[[ "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" == 0 || "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" == 1 ]] || {
+    echo "FASTAFD_AFD_FORCE_MULTI_MB_GRAPH_OVERLAP must be 0 or 1" >&2
+    exit 2
+}
+export AFD_FORCE_MULTI_MB_GRAPH_OVERLAP
 if [[ "$AFD_PERF_MODE" == 1 && "$NSYS" != 1 ]]; then
     echo "AFD perf mode is profiling-only and requires NSYS=1" >&2
     exit 2
@@ -517,6 +523,25 @@ else
     ALLOCATED_GPUS=$(( NODES * 4 ))
     SHARED_ROLE_TRAYS=0
 fi
+ATTENTION_GPUS_OVERRIDE=${FASTAFD_ATTENTION_GPUS_OVERRIDE:-}
+if [[ -n "$ATTENTION_GPUS_OVERRIDE" ]]; then
+    [[ "$SWEEP_CONTRACT" == comprehensive ]] || {
+        echo "FASTAFD_ATTENTION_GPUS_OVERRIDE requires the comprehensive contract" >&2
+        exit 2
+    }
+    [[ "$ATTENTION_GPUS_OVERRIDE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "FASTAFD_ATTENTION_GPUS_OVERRIDE must be a positive integer" >&2
+        exit 2
+    }
+    ATTENTION_GPUS=$ATTENTION_GPUS_OVERRIDE
+    FFN_GPUS=$FFN_EP
+    ACTIVE_GPUS=$(( ATTENTION_GPUS + FFN_GPUS ))
+    NODES=$(( (ACTIVE_GPUS + 3) / 4 ))
+    ALLOCATED_GPUS=$(( NODES * 4 ))
+    ATTENTION_TRAYS=$(( (ATTENTION_GPUS + 3) / 4 ))
+    FFN_TRAYS=$(( (FFN_GPUS + 3) / 4 ))
+    SHARED_ROLE_TRAYS=$(( ATTENTION_TRAYS + FFN_TRAYS - NODES ))
+fi
 if [[ "$SWEEP_CONTRACT" == comprehensive || "$MODEL_KEY" == minimax ]]; then
     MAX_TOTAL_TRAYS=${FASTAFD_MAX_TOTAL_TRAYS:-18}
 else
@@ -565,6 +590,8 @@ if [[ "$AFD_MODEL_PLACEMENT_REQUESTED" == qwen3-128k-adaptive ]]; then
 fi
 if [[ "$AFD_MODEL_PLACEMENT" == attn-only ]]; then
     DEFAULT_AFD_MOE_BACKEND=megamoe
+elif [[ "$MODEL_KEY" == qwen35 ]]; then
+    DEFAULT_AFD_MOE_BACKEND=megamoe_m2n
 elif [[ "$SWEEP_CONTRACT" == pmap ]]; then
     DEFAULT_AFD_MOE_BACKEND=megamoe_m2n
 else
@@ -584,11 +611,11 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe_m2n && "$AFD_MODEL_PLACEMENT" != leg
     exit 2
 fi
 if [[ "$AFD_PERF_MODE" == 1 ]]; then
-    [[ "$AFD_MODEL_PLACEMENT" == attn-only && "$MINISGL_AFD_MOE_BACKEND" == megamoe ]] || {
-        echo "AFD perf mode requires attn-only placement with same-rank MegaMoE" >&2
-        exit 2
-    }
-    MINISGL_AFD_PERFECT_ROUTING=1
+    case "$AFD_MODEL_PLACEMENT:$MINISGL_AFD_MOE_BACKEND" in
+        attn-only:megamoe) MINISGL_AFD_PERFECT_ROUTING=1 ;;
+        legacy:megamoe_m2n) MINISGL_AFD_PERFECT_ROUTING=0 ;;
+        *) echo "AFD perf mode requires attn-only:megamoe or legacy:megamoe_m2n" >&2; exit 2 ;;
+    esac
 else
     MINISGL_AFD_PERFECT_ROUTING=${MINISGL_AFD_PERFECT_ROUTING:-0}
 fi
@@ -605,6 +632,11 @@ if [[ "$MINISGL_AFD_MOE_BACKEND" == megamoe && \
       "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" != fp8 && \
       "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" != fp4 ]]; then
     echo "MegaMoE requires MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp8 or fp4" >&2
+    exit 2
+fi
+if [[ "$MODEL_KEY" == qwen35 && "$MINISGL_AFD_MOE_BACKEND" == megamoe* && \
+      "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" != fp4 ]]; then
+    echo "Qwen3.5 MegaMoE requires MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp4" >&2
     exit 2
 fi
 export MINISGL_AFD_MOE_BACKEND MINISGL_AFD_PERFECT_ROUTING
@@ -701,6 +733,16 @@ elif [[ "$MODEL_KEY:$CONTEXT:$BATCH:$NODES" == minimax:16384:36:18 ]]; then
 fi
 MODEL_SOURCE_PATH=${FASTAFD_MODEL_PATH:-$HF_CACHE/$MODEL_CACHE/snapshots/$MODEL_REVISION}
 MODEL_PATH=$MODEL_SOURCE_PATH
+MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH=${FASTAFD_MEGAMOE_EXPERT_WEIGHT_PATH:-${MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH:-}}
+if [[ "$MODEL_KEY" == qwen35 && "$MINISGL_AFD_MOE_BACKEND" == megamoe* ]]; then
+    MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH=${MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH:-$ROOT/models/Qwen3.5-397B-A17B-FP8-MXFP4-MoE/snapshots/$MODEL_REVISION}
+    [[ -f "$MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH/conversion_manifest.json" && \
+       -f "$MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH/model.safetensors.index.json" ]] || {
+        echo "Qwen3.5 MegaMoE MXFP4 checkpoint is incomplete: $MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH" >&2
+        exit 2
+    }
+fi
+export MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH
 MODEL_PROFILE_MANIFEST=""
 if [[ "$MODEL_PROFILE_ID" != native ]]; then
     MODEL_PATH=$ROOT/model-profiles/$MODEL_PROFILE_ID
@@ -752,8 +794,8 @@ if [[ "$SWEEP_CONTRACT" == comprehensive ]]; then
 fi
 
 if [[ "${FASTAFD_DRY_RUN:-0}" == 1 && -z "${SLURM_JOB_ID:-}" ]]; then
-    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s afd_model_placement=%s afd_perf_mode=%s perfect_routing=%s afd_moe_backend=%s megamoe_expert_weight_dtype=%s case_id=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
-        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$AFD_PERF_MODE" "$MINISGL_AFD_PERFECT_ROUTING" "$MINISGL_AFD_MOE_BACKEND" \
+    printf 'mode=afd sweep_contract=%s submit_qos=%s model=%s afd_model_placement=%s afd_perf_mode=%s force_multi_mb_graph_overlap=%s perfect_routing=%s afd_moe_backend=%s megamoe_expert_weight_dtype=%s case_id=%s prompt_mode=%s context_min=%s context_max=%s irregular=%s input_batch_per_attention_dp_lane=%s capacity_max_batch=%s raw_kv_max_batch=%s require_capacity_max=%s microbatch_real_sizes=%s nodes=%s allocated_gpus=%s active_gpus=%s shared_role_trays=%s normalized_af_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s attention_gpus=%s ffn_gpus=%s prompts=%s prompt_lengths=%s prompt_length_sum=%s required_kv_tokens_per_attention_dp_lane=%s known_kv_capacity_tokens_per_attention_rank=%s afd_memory_ratio=%s afd_num_pages_override=%s max_seq_len=%s graph_batch_per_mb=%s graph_padded_input_batch=%s nsys_cuda_graph_trace=%s nsys_target_batch_per_attention_dp=%s nsys_capture_decode_steps=%s capture_policy=%s prompt_source=%s model_profile=%s rope_factor=%s\n' \
+        "$SWEEP_CONTRACT" "$SUBMIT_QOS" "$MODEL_KEY" "$AFD_MODEL_PLACEMENT" "$AFD_PERF_MODE" "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" "$MINISGL_AFD_PERFECT_ROUTING" "$MINISGL_AFD_MOE_BACKEND" \
         "$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" "$CASE_ID" \
         "$PROMPT_MODE" "$CONTEXT_MIN" "$CONTEXT_MAX" "$IRREGULAR" \
         "$BATCH" "$CAPACITY_MAX_BATCH" "$RAW_KV_MAX_BATCH" "$REQUIRE_CAPACITY_MAX" \
@@ -836,7 +878,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     JOB=$(sbatch "${SBATCH_ARGS[@]}" \
         --job-name="$JOB_NAME" \
         --output="$RUN_DIR/slurm-%j.out" --error="$RUN_DIR/slurm-%j.err" \
-        --export="ALL,FASTAFD_SUBMIT_QOS=$SUBMIT_QOS,FASTAFD_SWEEP_CONTRACT=$SWEEP_CONTRACT,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_PERF_MODE=$AFD_PERF_MODE,AFD_PERF_CONTEXT_LEN=$AFD_PERF_CONTEXT_LEN,MINISGL_AFD_PERFECT_ROUTING=$MINISGL_AFD_PERFECT_ROUTING,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,AFD_ATTENTION_TO_FFN_TRAY_RATIO=$NORMALIZED_AF_RATIO,AFD_ATTN_TP_SIZE=$ATTENTION_TP,AFD_MLP_EP_SIZE=$FFN_EP,NORMALIZED_AF_RATIO=$NORMALIZED_AF_RATIO,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_TP=$ATTENTION_TP,FFN_EP=$FFN_EP,ATTENTION_GPUS=$ATTENTION_GPUS,FFN_GPUS=$FFN_GPUS,ACTIVE_GPUS=$ACTIVE_GPUS,ALLOCATED_GPUS=$ALLOCATED_GPUS,SHARED_ROLE_TRAYS=$SHARED_ROLE_TRAYS,ATTENTION_DP_SIZE=$ATTENTION_DP_SIZE,ATTENTION_WORKERS=$ATTENTION_WORKERS,MLP_DP_SIZE=$MLP_DP_SIZE,MLP_TP_SIZE=$MLP_TP_SIZE,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,EXPECTED_SOURCE_COORDINATOR_SHA256=$EXPECTED_SOURCE_COORDINATOR_SHA256,EXPECTED_SOURCE_PROFILER_SHA256=$EXPECTED_SOURCE_PROFILER_SHA256,EXPECTED_SOURCE_PROTOCOL_SHA256=$EXPECTED_SOURCE_PROTOCOL_SHA256,EXPECTED_SOURCE_PLACEMENT_SHA256=$EXPECTED_SOURCE_PLACEMENT_SHA256,EXPECTED_SOURCE_API_SHA256=$EXPECTED_SOURCE_API_SHA256,EXPECTED_SOURCE_ARGS_SHA256=$EXPECTED_SOURCE_ARGS_SHA256,CUDA_EXTRACT_SCRIPT=$CUDA_EXTRACT_SCRIPT,CUDA_METRIC_PLAN=$CUDA_METRIC_PLAN,CUDA_SPAN_MODULE=$CUDA_SPAN_MODULE,CUDA_METRICS_ROOT=$CUDA_METRICS_ROOT,CUDA_EXTRACT_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
+        --export="ALL,FASTAFD_SUBMIT_QOS=$SUBMIT_QOS,FASTAFD_SWEEP_CONTRACT=$SWEEP_CONTRACT,FASTAFD_ATTENTION_GPUS_OVERRIDE=$ATTENTION_GPUS_OVERRIDE,FASTAFD_MAX_TOTAL_TRAYS=$MAX_TOTAL_TRAYS,MODEL_KEY=$MODEL_KEY,PROMPT_MODE=$PROMPT_MODE,CONTEXT_SPEC=$CONTEXT_SPEC,CONTEXT=$CONTEXT,CONTEXT_MIN=$CONTEXT_MIN,CONTEXT_MAX=$CONTEXT_MAX,IRREGULAR=$IRREGULAR,SHAPE_ID=$SHAPE_ID,PROMPT_LENGTH_SUM=$PROMPT_LENGTH_SUM,AFD_PERF_MODE=$AFD_PERF_MODE,AFD_PERF_CONTEXT_LEN=$AFD_PERF_CONTEXT_LEN,AFD_FORCE_MULTI_MB_GRAPH_OVERLAP=$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP,MINISGL_AFD_PERFECT_ROUTING=$MINISGL_AFD_PERFECT_ROUTING,MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE,MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH=$MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH,AFD_REQUIRED_KV_TOKENS=$AFD_REQUIRED_KV_TOKENS,AFD_KV_CAPACITY_TOKENS=$AFD_KV_CAPACITY_TOKENS,NOMINAL_AFD_KV_CAPACITY_TOKENS=$NOMINAL_AFD_KV_CAPACITY_TOKENS,CAPACITY_MAX_BATCH=$CAPACITY_MAX_BATCH,RAW_KV_MAX_BATCH=$RAW_KV_MAX_BATCH,SCHEDULER_ADMISSION_REQUIRED_TOKENS=$SCHEDULER_ADMISSION_REQUIRED_TOKENS,SCHEDULER_ADMISSION_UNUSED_TOKENS=$SCHEDULER_ADMISSION_UNUSED_TOKENS,SCHEDULER_RUNNING_RESERVATION_TOKENS=$SCHEDULER_RUNNING_RESERVATION_TOKENS,REQUIRE_CAPACITY_MAX=$REQUIRE_CAPACITY_MAX,ALLOW_OBSERVED_CAPACITY_PROBE=$ALLOW_OBSERVED_CAPACITY_PROBE,MAX_SEQ_LEN=$MAX_SEQ_LEN,NSYS_CUDA_GRAPH_TRACE=$NSYS_CUDA_GRAPH_TRACE,NSYS_CAPTURE_DECODE_STEPS=$NSYS_CAPTURE_DECODE_STEPS,MODEL_PATH=$MODEL_PATH,MODEL_SOURCE_PATH=$MODEL_SOURCE_PATH,MODEL_CONFIG_SHA256=$MODEL_CONFIG_SHA256,MODEL_SOURCE_CONFIG_SHA256=$MODEL_SOURCE_CONFIG_SHA256,MODEL_PROFILE_ID=$MODEL_PROFILE_ID,MODEL_PROFILE_MANIFEST=$MODEL_PROFILE_MANIFEST,ROPE_SCALING_FACTOR=$ROPE_SCALING_FACTOR,ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS=$ROPE_ORIGINAL_MAX_POSITION_EMBEDDINGS,MODEL_REVISION=$MODEL_REVISION,PRESET=$PRESET,NODES=$NODES,BATCH=$BATCH,GRAPH_BATCH=$GRAPH_BATCH,REFERENCE_TPS=$REFERENCE_TPS,AFD_ATTENTION_TO_FFN_TRAY_RATIO=$NORMALIZED_AF_RATIO,AFD_ATTN_TP_SIZE=$ATTENTION_TP,AFD_MLP_EP_SIZE=$FFN_EP,NORMALIZED_AF_RATIO=$NORMALIZED_AF_RATIO,ATTENTION_TRAYS=$ATTENTION_TRAYS,FFN_TRAYS=$FFN_TRAYS,ATTENTION_TP=$ATTENTION_TP,FFN_EP=$FFN_EP,ATTENTION_GPUS=$ATTENTION_GPUS,FFN_GPUS=$FFN_GPUS,ACTIVE_GPUS=$ACTIVE_GPUS,ALLOCATED_GPUS=$ALLOCATED_GPUS,SHARED_ROLE_TRAYS=$SHARED_ROLE_TRAYS,ATTENTION_DP_SIZE=$ATTENTION_DP_SIZE,ATTENTION_WORKERS=$ATTENTION_WORKERS,MLP_DP_SIZE=$MLP_DP_SIZE,MLP_TP_SIZE=$MLP_TP_SIZE,NUM_PROMPTS=$NUM_PROMPTS,PROMPT_BASE=$PROMPT_BASE,PROMPT_SHA256=$PROMPT_SHA256,PROMPT_SOURCE_CONTEXT=$PROMPT_SOURCE_CONTEXT,EXPECTED_HEAD=$EXPECTED_HEAD,ROOT=$ROOT,RESULTS_ROOT=$RESULTS_ROOT,SOURCE_REPO=$SOURCE_REPO,EXPECTED_SOURCE_MANIFEST=$EXPECTED_SOURCE_MANIFEST,EXPECTED_SOURCE_COORDINATOR_SHA256=$EXPECTED_SOURCE_COORDINATOR_SHA256,EXPECTED_SOURCE_PROFILER_SHA256=$EXPECTED_SOURCE_PROFILER_SHA256,EXPECTED_SOURCE_PROTOCOL_SHA256=$EXPECTED_SOURCE_PROTOCOL_SHA256,EXPECTED_SOURCE_PLACEMENT_SHA256=$EXPECTED_SOURCE_PLACEMENT_SHA256,EXPECTED_SOURCE_API_SHA256=$EXPECTED_SOURCE_API_SHA256,EXPECTED_SOURCE_ARGS_SHA256=$EXPECTED_SOURCE_ARGS_SHA256,CUDA_EXTRACT_SCRIPT=$CUDA_EXTRACT_SCRIPT,CUDA_METRIC_PLAN=$CUDA_METRIC_PLAN,CUDA_SPAN_MODULE=$CUDA_SPAN_MODULE,CUDA_METRICS_ROOT=$CUDA_METRICS_ROOT,CUDA_EXTRACT_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT,IMAGE=$IMAGE,EP_VENV_DIR=$EP_VENV_DIR,RUN_DIR=$RUN_DIR,JOB_SCRIPT=$(realpath "$0")" \
         "$(realpath "$0")")
     printf 'submitted job=%s model=%s context=%s batch=%s normalized_ratio=%s:1 attention_trays=%s ffn_trays=%s attention_tp=%s ffn_ep=%s attention_dp=%s active_gpus=%s allocated_gpus=%s shared_role_trays=%s nodes=%s run_dir=%s\n' \
         "$JOB" "$MODEL_KEY" "$CONTEXT" "$BATCH" "$NORMALIZED_AF_RATIO" \
@@ -865,6 +907,8 @@ if [[ "${FASTAFD_IN_CONTAINER:-0}" != 1 ]]; then
         --container-mounts=/lustre:/lustre --no-container-remap-root \
         --container-env=CUDA_LAUNCH_BLOCKING,NCCL_IB_TIMEOUT,NCCL_IB_SL,NCCL_DEBUG,NCCL_MNNVL_ENABLE,NCCL_CUMEM_ENABLE,NCCL_NET_GDR_C2C,NCCL_IB_HCA,NCCL_SOCKET_IFNAME,UCX_TLS,UCX_NET_DEVICES \
         env FASTAFD_IN_CONTAINER=1 FASTAFD_SWEEP_CONTRACT="$SWEEP_CONTRACT" \
+        FASTAFD_ATTENTION_GPUS_OVERRIDE="$ATTENTION_GPUS_OVERRIDE" \
+        FASTAFD_MAX_TOTAL_TRAYS="$MAX_TOTAL_TRAYS" \
         HEAD_HOST="$HEAD_HOST" MODEL_KEY="$MODEL_KEY" \
         PROMPT_MODE="$PROMPT_MODE" CONTEXT_SPEC="$CONTEXT_SPEC" \
         CONTEXT="$CONTEXT" CONTEXT_MIN="$CONTEXT_MIN" CONTEXT_MAX="$CONTEXT_MAX" \
@@ -882,10 +926,12 @@ if [[ "${FASTAFD_IN_CONTAINER:-0}" != 1 ]]; then
         MAX_SEQ_LEN="$MAX_SEQ_LEN" NSYS_CUDA_GRAPH_TRACE="$NSYS_CUDA_GRAPH_TRACE" \
         NSYS_CAPTURE_DECODE_STEPS="$NSYS_CAPTURE_DECODE_STEPS" \
         AFD_PERF_MODE="$AFD_PERF_MODE" AFD_PERF_CONTEXT_LEN="$AFD_PERF_CONTEXT_LEN" \
+        AFD_FORCE_MULTI_MB_GRAPH_OVERLAP="$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" \
         AFD_MODEL_PLACEMENT="$AFD_MODEL_PLACEMENT" \
         MINISGL_AFD_MOE_BACKEND="$MINISGL_AFD_MOE_BACKEND" \
         MINISGL_AFD_PERFECT_ROUTING="$MINISGL_AFD_PERFECT_ROUTING" \
         MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" \
+        MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH="$MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH" \
         MODEL_PATH="$MODEL_PATH" \
         MODEL_SOURCE_PATH="$MODEL_SOURCE_PATH" MODEL_CONFIG_SHA256="$MODEL_CONFIG_SHA256" \
         MODEL_SOURCE_CONFIG_SHA256="$MODEL_SOURCE_CONFIG_SHA256" \
@@ -1478,6 +1524,9 @@ if [[ -n "$AFD_NUM_PAGES" ]]; then
 else
     export AFD_SERVER_EXTRA_ARGS="--attention-backend trtllm --memory-ratio $AFD_MEMORY_RATIO"
 fi
+if [[ "$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP" == 1 ]]; then
+    export AFD_SERVER_EXTRA_ARGS="$AFD_SERVER_EXTRA_ARGS --afd-force-multi-mb-graph-overlap"
+fi
 export MINISGL_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S=${FASTAFD_AFD_WORKER_HOT_LOOP_SHUTDOWN_TIMEOUT_S:-300}
 export MINISGL_AFD_WORKER_SHUTDOWN_TIMEOUT_S=${FASTAFD_AFD_WORKER_SHUTDOWN_TIMEOUT_S:-120}
 export NSYS_TARGET_BATCH_PER_ATTN_DP=$BATCH
@@ -1704,6 +1753,7 @@ fi
 
 RUN_DIR=$RUN_DIR SWEEP_CONTRACT=$SWEEP_CONTRACT NUM_PROMPTS=$NUM_PROMPTS BATCH=$BATCH \
 AFD_PERF_MODE=$AFD_PERF_MODE AFD_PERF_CONTEXT_LEN=$AFD_PERF_CONTEXT_LEN \
+AFD_FORCE_MULTI_MB_GRAPH_OVERLAP=$AFD_FORCE_MULTI_MB_GRAPH_OVERLAP \
 AFD_MODEL_PLACEMENT_REQUESTED=$AFD_MODEL_PLACEMENT_REQUESTED \
 AFD_MODEL_PLACEMENT_POLICY=$AFD_MODEL_PLACEMENT_POLICY \
 AFD_MODEL_PLACEMENT=$AFD_MODEL_PLACEMENT AFD_NUM_MB=$AFD_NUM_MB \
@@ -1730,6 +1780,7 @@ AFD_MEMORY_RATIO=$AFD_MEMORY_RATIO \
 AFD_NUM_PAGES=$AFD_NUM_PAGES \
 OUTPUT_TOKENS=$OUTPUT_TOKENS TRACE_WARMUP_DECODE_STEPS=$TRACE_WARMUP_DECODE_STEPS \
 MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE \
+MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH=$MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH \
 "$PYTHON" - <<'PY'
 import json, os, re, statistics
 from pathlib import Path
@@ -1765,9 +1816,13 @@ model_placement_requested = os.environ["AFD_MODEL_PLACEMENT_REQUESTED"]
 model_placement_policy = os.environ["AFD_MODEL_PLACEMENT_POLICY"]
 moe_backend = os.environ["MINISGL_AFD_MOE_BACKEND"]
 megamoe_expert_weight_dtype = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE"]
+megamoe_expert_weight_path = os.environ["MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH"]
 num_mb = int(os.environ["AFD_NUM_MB"])
 nsys_enabled = bool(int(os.environ.get("NSYS", "0")))
 perf_mode = bool(int(os.environ["AFD_PERF_MODE"]))
+force_multi_mb_graph_overlap = bool(
+    int(os.environ["AFD_FORCE_MULTI_MB_GRAPH_OVERLAP"])
+)
 perfect_routing = bool(int(os.environ["MINISGL_AFD_PERFECT_ROUTING"]))
 mb_base, mb_remainder = divmod(batch, num_mb)
 if model_placement == "attn-only":
@@ -1885,7 +1940,8 @@ if nsys_enabled:
         if len(logs) != workers:
             raise RuntimeError((len(logs), workers))
         pattern = re.compile(
-            r"afd_ag_decode_graph:replay step_id=(\d+) bs=(\d+) num_mb=(\d+)"
+            r"afd_ag_decode_graph:replay step_id=(\d+) "
+            r"(?:real=\d+ )?bs=(\d+) num_mb=(\d+)"
         )
         worker_steps = []
         for path in logs:
@@ -1925,14 +1981,11 @@ if nsys_enabled:
     if len(steps) != 15 or steps != list(range(steps[0], steps[0] + 15)):
         raise RuntimeError(("target decode steps are not exactly consecutive", steps))
     trace_steps = [warmup_step, *steps]
-    if model_placement == "attn-only":
-        trace_step_set = set(trace_steps)
-        worker_trace_steps = [
-            [step for step in captured if step in trace_step_set]
-            for captured in worker_steps
-        ]
-    else:
-        worker_trace_steps = worker_steps
+    trace_step_set = set(trace_steps)
+    worker_trace_steps = [
+        [step for step in captured if step in trace_step_set]
+        for captured in worker_steps
+    ]
     if steps[0] != warmup_step + 1 or any(
         captured != trace_steps for captured in worker_trace_steps
     ):
@@ -1962,15 +2015,17 @@ result = {
     "afd_model_placement_policy": model_placement_policy,
     "afd_perf_mode": perf_mode,
     "afd_perf_context_len": int(os.environ["AFD_PERF_CONTEXT_LEN"]),
-    "perfect_routing_forced_by_perf_mode": perf_mode,
+    "afd_force_multi_mb_graph_overlap": force_multi_mb_graph_overlap,
+    "perfect_routing_forced_by_perf_mode": perf_mode and perfect_routing,
     "perfect_routing": perfect_routing,
     "perfect_routing_cost_contract": (
         "normal fused gate GEMM, softmax, and top-k retained; only final expert IDs "
         "are compile-time substituted; dispatch, expert, and combine work unchanged"
-        if perf_mode else None
+        if perf_mode and perfect_routing else None
     ),
     "afd_moe_backend": moe_backend,
     "megamoe_expert_weight_dtype": megamoe_expert_weight_dtype,
+    "megamoe_expert_weight_path": megamoe_expert_weight_path or None,
     "model_key": os.environ.get("MODEL_KEY"),
     "prompt_mode": os.environ["PROMPT_MODE"],
     "context_tokens": context,

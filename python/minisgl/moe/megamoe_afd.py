@@ -26,12 +26,14 @@ class MegaMoEAfdAdapter:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        num_layers: int,
         top_k: int,
         num_max_tokens_per_rank: int,
         num_lanes: int,
         tp_size: int,
         tp_rank: int,
         gate_renormalize: bool,
+        defer_route_dependent_launch: bool = False,
     ) -> None:
         if not dist.is_initialized():
             raise RuntimeError("MegaMoEAfdAdapter requires torch.distributed")
@@ -48,10 +50,12 @@ class MegaMoEAfdAdapter:
         self.num_experts = self.group_size * self.num_local_experts
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
+        self.num_layers = int(num_layers)
         self.top_k = int(top_k)
         self.bucket = int(num_max_tokens_per_rank)
         self.num_lanes = max(1, int(num_lanes))
         self.gate_renormalize = bool(gate_renormalize)
+        self.defer_route_dependent_launch = bool(defer_route_dependent_launch)
         perfect_routing = os.environ.get(
             "MINISGL_AFD_PERFECT_ROUTING", "0"
         ).strip()
@@ -78,6 +82,23 @@ class MegaMoEAfdAdapter:
         else:
             self.precision = "fp8_fp4"
             self._run_mega_moe = _mega.fp8_fp4_mega_moe
+        weight_path = os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH", "").strip()
+        if weight_path and self.expert_weight_dtype != "fp4":
+            raise RuntimeError(
+                "a preconverted MegaMoE expert checkpoint requires fp4 weights"
+            )
+        self._weight_loader = (
+            _weights.Mxfp4ExpertWeightLoader(
+                weight_path,
+                torch.device("cuda", torch.cuda.current_device()),
+                num_layers=self.num_layers,
+                num_experts=self.real_num_experts,
+                hidden=self.hidden_size,
+                intermediate_hidden=self.intermediate_size,
+            )
+            if weight_path
+            else None
+        )
         if self.group_size * self.tp_size * self.num_local_experts < self.real_num_experts:
             raise RuntimeError(
                 "MegaMoE rank group does not cover the model experts: "
@@ -115,6 +136,13 @@ class MegaMoEAfdAdapter:
 
     def register_layer_weights(self, layer_id: int, experts: Any) -> None:
         """Requantize Qwen FP8 block weights to the selected MegaMoE layout."""
+        if self._weight_loader is not None:
+            self.weights[int(layer_id)] = self._weight_loader.load_layer(
+                layer_id,
+                expert_offset=int(experts.local_expert_offset),
+                expert_count=self.num_local_experts,
+            )
+            return
         if getattr(experts, "_fp8_scale_format", None) != "block":
             raise RuntimeError("megamoe requires block-scaled FP8 expert weights")
         block_shape = tuple(
@@ -195,6 +223,7 @@ class MegaMoEAfdAdapter:
             out=(ids, weights),
             route_prepare=(buffer.route_prepare_args(rank_ready=True) if routes_prepared else None),
             perfect_balance=self.perfect_routing,
+            defer_route_dependent_launch=self.defer_route_dependent_launch,
         )
         y = buffer.y[:num_tokens]
         self._run_mega_moe(

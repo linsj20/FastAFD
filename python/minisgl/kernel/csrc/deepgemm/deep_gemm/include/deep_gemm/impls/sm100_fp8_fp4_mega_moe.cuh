@@ -368,6 +368,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     comm::cluster_sync_with_relaxed_arrive();
 
     // Rank-ready publication replaces the per-expert completion atomics.
+    // Its release/acquire epoch is the route-data dependency, so a PDL launch
+    // can overlap all descriptor and CTA-local setup above without adding a
+    // redundant full-selector-grid wait here.
     // Aggregate each local expert once per CTA, then share exact totals with
     // every scheduler role through the existing expert-count shared memory.
     if constexpr (kRankReadyRoutePublish) {
@@ -1586,9 +1589,186 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         // Combine: reduce top-k results and write back
+        constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
+        const unsigned long long combine_t0 =
+            do_timing_epi_leader ? clock64() : 0;
+
+        if constexpr (kNumTopk == 10 and kHidden == 4096) {
+            // Match TRT-LLM's small-batch combine geometry: one CTA owns one
+            // token, issues all top-k TMA loads back-to-back, and reduces the
+            // ten resident contributions with a shallow pairwise tree. The
+            // former one-warp/token path leaves only three CTAs active at hard
+            // MB2 rows 18/19 and serializes ten accumulator updates. Direct
+            // per-thread remote loads were also slower; keep TMA as the bulk
+            // movement engine while increasing token-level parallelism.
+            constexpr uint32_t kNumUint4 = kNumHiddenBytes / sizeof(uint4);
+            DG_STATIC_ASSERT(
+                kNumTopk <= kNumEpilogueWarps * 2,
+                "CTA combine requires one transaction barrier per top-k slot");
+            DG_STATIC_ASSERT(
+                kNumTopk * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE,
+                "CTA combine top-k staging exceeds shared memory");
+            auto* combine_masks = reinterpret_cast<uint32_t*>(smem_buffer);
+            auto* combine_tma_buffer = reinterpret_cast<uint4*>(smem_buffer);
+            uint32_t combine_phase = 0;
+            for (uint32_t token_idx = sm_idx;
+                 token_idx < num_tokens;
+                 token_idx += kNumSMs) {
+                if (epilogue_warp_idx == 0) {
+                    const int stored_expert_idx = lane_idx < kNumTopk
+                        ? static_cast<int>(__ldg(
+                              input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                              token_idx * kNumTopk + lane_idx))
+                        : -1;
+                    const uint32_t total_mask = __ballot_sync(
+                        0xffffffff, stored_expert_idx >= 0);
+                    if (lane_idx == 0)
+                        combine_masks[0] = total_mask;
+
+                    if constexpr (kRankGatedCombine) {
+                        const int expert_rank_idx = stored_expert_idx >= 0
+                            ? stored_expert_idx /
+                                  static_cast<int>(kNumExpertsPerRank)
+                            : -1;
+                        uint32_t required_rank_mask = 0;
+                        #pragma unroll
+                        for (uint32_t rank_idx = 0;
+                             rank_idx < kNumRanks;
+                             ++rank_idx) {
+                            if (__any_sync(
+                                    0xffffffff,
+                                    expert_rank_idx ==
+                                        static_cast<int>(rank_idx)))
+                                required_rank_mask |= 1u << rank_idx;
+                        }
+                        if (lane_idx == 0)
+                            combine_masks[1] = required_rank_mask;
+                    }
+                }
+                ptx::sync_aligned(
+                    kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                const uint32_t total_mask = combine_masks[0];
+
+                if constexpr (kRankGatedCombine) {
+                    const uint32_t required_rank_mask = combine_masks[1];
+                    if (epilogue_warp_idx == 0 and lane_idx < kNumRanks and
+                        (required_rank_mask & (1u << lane_idx)) != 0) {
+                        constexpr int64_t kNumTimeoutCycles =
+                            300ll * 2000000000ll;
+                        const auto ready_epoch_ptr =
+                            workspace.get_combine_ready_epoch_ptr(lane_idx);
+                        const auto start_clock = clock64();
+                        while (ptx::ld_acq_sys(ready_epoch_ptr) !=
+                               combine_ready_epoch) {
+                            if (clock64() - start_clock >= kNumTimeoutCycles) {
+                                printf("MegaMoE CTA combine timeout (300s): rank=%d token=%d expert_rank=%d ready=%llu target=%llu\n",
+                                       sym_buffer.rank_idx, token_idx,
+                                       lane_idx,
+                                       static_cast<unsigned long long>(
+                                           ptx::ld_acq_sys(ready_epoch_ptr)),
+                                       static_cast<unsigned long long>(
+                                           combine_ready_epoch));
+                                DG_DEVICE_ASSERT(false and
+                                    "CTA combine timeout");
+                            }
+                        }
+                    }
+                    // The producer epochs order every remote combine slot.
+                    // Make the warp-0 acquires visible to all CTA threads
+                    // before the elected lane issues bulk TMA loads.
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+
+                if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                    #pragma unroll
+                    for (uint32_t topk_idx = 0;
+                         topk_idx < kNumTopk;
+                         ++topk_idx) {
+                        if ((total_mask & (1u << topk_idx)) != 0) {
+                            const auto src_ptr = combine_token_buffer
+                                .get_rank_buffer(topk_idx)
+                                .get_data_buffer(token_idx)
+                                .get_base_ptr();
+                            auto* dst_ptr = combine_tma_buffer +
+                                topk_idx * kNumUint4;
+                            ptx::tma_load_1d(
+                                dst_ptr, src_ptr,
+                                combine_barriers[topk_idx], kNumHiddenBytes);
+                            ptx::mbarrier_arrive_and_set_tx(
+                                combine_barriers[topk_idx], kNumHiddenBytes);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (uint32_t topk_idx = 0;
+                     topk_idx < kNumTopk;
+                     ++topk_idx) {
+                    if ((total_mask & (1u << topk_idx)) != 0)
+                        combine_barriers[topk_idx]->wait(combine_phase);
+                }
+                ptx::sync_aligned(
+                    kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                for (uint32_t vector_idx = epilogue_thread_idx;
+                     vector_idx < kNumUint4;
+                     vector_idx += kNumEpilogueThreads) {
+                    uint4 contributions[kNumTopk] = {};
+                    #pragma unroll
+                    for (uint32_t topk_idx = 0;
+                         topk_idx < kNumTopk;
+                         ++topk_idx) {
+                        if ((total_mask & (1u << topk_idx)) != 0) {
+                            contributions[topk_idx] = combine_tma_buffer[
+                                topk_idx * kNumUint4 + vector_idx];
+                        }
+                    }
+
+                    uint4 casted;
+                    auto* casted_bf16 =
+                        reinterpret_cast<nv_bfloat162*>(&casted);
+                    constexpr uint32_t kNumBF16x2 =
+                        sizeof(uint4) / sizeof(nv_bfloat162);
+                    #pragma unroll
+                    for (uint32_t element = 0;
+                         element < kNumBF16x2;
+                         ++element) {
+                        float2 pair_sums[5];
+                        #pragma unroll
+                        for (uint32_t pair = 0; pair < 5; ++pair) {
+                            const auto lhs = __bfloat1622float2(
+                                reinterpret_cast<const nv_bfloat162*>(
+                                    &contributions[pair * 2])[element]);
+                            const auto rhs = __bfloat1622float2(
+                                reinterpret_cast<const nv_bfloat162*>(
+                                    &contributions[pair * 2 + 1])[element]);
+                            pair_sums[pair] =
+                                make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
+                        }
+                        pair_sums[0].x += pair_sums[1].x;
+                        pair_sums[0].y += pair_sums[1].y;
+                        pair_sums[2].x += pair_sums[3].x;
+                        pair_sums[2].y += pair_sums[3].y;
+                        pair_sums[0].x += pair_sums[2].x;
+                        pair_sums[0].y += pair_sums[2].y;
+                        pair_sums[0].x += pair_sums[4].x;
+                        pair_sums[0].y += pair_sums[4].y;
+                        casted_bf16[element] =
+                            __float22bfloat162_rn(pair_sums[0]);
+                    }
+                    reinterpret_cast<uint4*>(y)[
+                        static_cast<uint64_t>(token_idx) * kNumUint4 +
+                        vector_idx] = casted;
+                }
+                ptx::sync_aligned(
+                    kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                combine_phase ^= 1;
+            }
+        } else {
+        // Retain the established pipelined TMA path for every other model
+        // shape until an identical-input source comparison proves otherwise.
         // NOTES: reuse shared memory from start up to the barriers
         // 1 token, 1 topk latency: ~3 us
-        constexpr uint32_t kNumHiddenBytes = kHidden * sizeof(nv_bfloat16);
         constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 
         // 3 slots of chunk is needed: 2 load stages and 1 store
@@ -1625,8 +1805,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         });
 
         // Iterate over all tokens
-        const unsigned long long combine_t0 =
-            do_timing_epi_leader ? clock64() : 0;
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
@@ -1755,6 +1933,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+        }
         }
         if (do_timing_epi_leader)
             mega_detail::timing_store(

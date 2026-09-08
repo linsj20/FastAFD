@@ -218,12 +218,16 @@ class Qwen3_5AttnOnlyAttentionStage(BaseOP):
         self.model = _Qwen3_5AttnOnlyAttentionInner(config)
 
     def forward_linear(
-        self, layer_id: int, hidden_states: torch.Tensor
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        *,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = self.model.layers.op_list[layer_id]
         if not hasattr(layer, "linear_attn"):
             raise RuntimeError(f"Qwen3.5 layer {layer_id} is not linear attention")
-        return layer.linear_attn.forward(hidden_states)
+        return layer.linear_attn.forward(hidden_states, output=output)
 
 
 class Qwen3_5AttnOnlyModelLayer(BaseOP):

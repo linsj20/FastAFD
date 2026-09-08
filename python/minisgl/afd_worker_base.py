@@ -584,6 +584,7 @@ class BaseAfdWorker:
                 real_num_experts=int(mc.num_experts),
                 hidden_size=int(mc.hidden_size),
                 intermediate_size=int(mc.moe_intermediate_size),
+                num_layers=int(mc.num_layers),
                 top_k=int(mc.num_experts_per_tok),
                 num_max_dispatch_tokens_per_rank=bucket,
                 num_lanes=adapter_lanes,
@@ -601,6 +602,7 @@ class BaseAfdWorker:
                 self.log_path,
                 f"[{self.role} rank={self.tp_rank}] afd_megamoe_m2n_adapter "
                 f"lanes={adapter_lanes} afd_num_mb={int(self.afd_num_mb)} bucket={bucket} "
+                f"precision={mega_adapter.precision} "
                 f"remote_shared={int(remote_shared_experts)} "
                 f"eg_expected_tokens_override={mega_adapter.eg_expected_tokens_override} "
                 f"eg_expected_tokens_source={mega_adapter.eg_expected_tokens_source}",
@@ -728,8 +730,29 @@ class BaseAfdWorker:
             # classes explicitly disable MoELayer's internal A2A dispatcher.
             with torch.device("meta"), torch_dtype(config.dtype):
                 model = AfdExpertStage(mc)
+            use_preconverted_experts = bool(
+                self._afd_moe_backend == "megamoe_m2n"
+                and os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH", "").strip()
+            )
+            if is_qwen35 and self._afd_moe_backend == "megamoe_m2n" and not use_preconverted_experts:
+                raise RuntimeError(
+                    "Qwen3.5 MegaMoE requires MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH"
+                )
+            if use_preconverted_experts:
+                for layer in model.model.layers.op_list:
+                    experts = layer.mlp.experts
+                    experts.gate_up_proj = None
+                    experts.gate_up_proj_scale = None
+                    experts.down_proj = None
+                    experts.down_proj_scale = None
             full = _cast_full(
-                load_weight(config.model_path, runtime_state.device, skip_non_expert_weights=True)
+                ()
+                if use_preconverted_experts
+                else load_weight(
+                    config.model_path,
+                    runtime_state.device,
+                    skip_non_expert_weights=True,
+                )
             )
             model.load_state_dict(extract_stage_state_dict(model, full))
             del full

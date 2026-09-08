@@ -136,34 +136,45 @@ def _jit_fp8_to_uint8():
 
 
 @functools.cache
-def _jit_add_rmsnorm_fp8_quant():
-    """JIT-load the fused add-RMSNorm + per-128 UE8M0 FP8 quant kernel."""
+def _jit_fp8_quant_shared_gate():
+    """JIT-load shared-input quantization, scalar gate, and lane release."""
     from .utils import load_jit
 
     return load_jit(
-        "add_rmsnorm_fp8_quant",
-        cuda_files=["add_rmsnorm_fp8_quant.cu"],
-        cuda_wrappers=[("launch", "AddRMSNormFp8QuantKernel::run")],
+        "fp8_quant_shared_gate",
+        cuda_files=["fp8_quant_shared_gate.cu"],
+        cuda_wrappers=[("launch", "Fp8QuantSharedGateKernel::run")],
     )
 
 
-def fused_add_rmsnorm_fp8_quant(
+def fp8_quant_shared_gate(
     x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused (residual-add) RMSNorm + per-128-group packed-UE8M0 FP8 quant.
+    shared_gate_weight: torch.Tensor,
+    *,
+    completion_counter: torch.Tensor,
+    release_turn: torch.Tensor,
+    next_turn: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize an established BF16 norm output and compute its gate scale.
 
-    In-place updates ``residual`` to ``x + residual`` (bf16) and returns the
-    normed activations as FP8 e4m3 + packed UE8M0 scales (DeepGEMM TMA layout,
-    identical to ``per_token_cast_to_fp8_cuda``), replacing the
-    ``fused_add_rmsnorm`` + ``per_token_cast`` two-kernel chain for the decode
-    attention path.  Requires H % 512 == 0 and H <= 4096.
+    FlashInfer remains responsible for residual-add/RMSNorm so its aligned
+    reduction arithmetic is unchanged. This kernel reads that rounded BF16
+    output once to produce packed-UE8M0 FP8 shared-expert input and the BF16
+    sigmoid of its BF16 scalar gate, then releases the peer CUDA-graph lane
+    without an event or a standalone release kernel. Requires H % 1024 == 0
+    and H <= 4096.
     """
     assert x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2
-    assert residual.shape == x.shape and residual.dtype == torch.bfloat16
-    assert weight.dtype == torch.bfloat16
+    assert shared_gate_weight.dtype == torch.bfloat16
+    assert tuple(shared_gate_weight.shape) == (1, x.shape[1])
+    assert x.is_contiguous()
+    assert shared_gate_weight.is_cuda and shared_gate_weight.device == x.device
+    assert shared_gate_weight.is_contiguous()
+    assert completion_counter.is_cuda and completion_counter.dtype == torch.int32
+    assert completion_counter.numel() == 1 and completion_counter.is_contiguous()
+    assert release_turn.is_cuda and release_turn.dtype == torch.int64
+    assert release_turn.numel() == 1 and release_turn.is_contiguous()
+    assert int(next_turn) >= 0
     m, n = x.shape
     groups = _ceil_div(n, 128)
     packed_groups = _ceil_div(groups, 4)
@@ -171,11 +182,20 @@ def fused_add_rmsnorm_fp8_quant(
     s = torch.empty_strided(
         (m, packed_groups), (1, _align(m, 4)), dtype=torch.int32, device=x.device
     )
-    _jit_add_rmsnorm_fp8_quant().launch(
-        residual, x.contiguous(), weight.contiguous(),
-        y.view(torch.uint8), s, float(eps),
+    shared_gate_scale = torch.empty(
+        (m, 1), dtype=torch.bfloat16, device=x.device
     )
-    return y, s
+    _jit_fp8_quant_shared_gate().launch(
+        x,
+        shared_gate_weight,
+        y.view(torch.uint8),
+        s,
+        shared_gate_scale,
+        completion_counter,
+        release_turn,
+        int(next_turn),
+    )
+    return y, s, shared_gate_scale
 
 
 @functools.cache

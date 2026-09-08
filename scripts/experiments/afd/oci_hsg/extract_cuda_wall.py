@@ -222,7 +222,21 @@ def load_matching_plan(
             if len(rows) != 1 or rows[0]["status"] != "needs_corrected_target_batch_rerun":
                 raise RuntimeError(f"future plan match is not unique: {case_id} {rows}")
             rows[0]["plan_index"] = rows[0]["rerun_index"]
-            rows[0]["active_gpus"] = str((ratio + 1) * ffn_ep)
+            explicit_active_gpus = rows[0].get("active_gpus", "")
+            if explicit_active_gpus:
+                try:
+                    active_gpus = int(explicit_active_gpus)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "plan active_gpus must be a positive integer"
+                    ) from exc
+                if active_gpus < 1:
+                    raise RuntimeError(
+                        "plan active_gpus must be a positive integer"
+                    )
+                rows[0]["active_gpus"] = str(active_gpus)
+            else:
+                rows[0]["active_gpus"] = str((ratio + 1) * ffn_ep)
             return rows[0]
     coordinate = (
         int(data["context_tokens"]),
@@ -378,13 +392,10 @@ def fmha_profile_launches_per_step(
 ) -> tuple[int, int]:
     """Return attention/model graph launches for the grouped attention-only path."""
 
-    if (
-        attention_dp_size < 1
-        or mlp_dp_size < 1
-        or attention_dp_size % mlp_dp_size
-    ):
+    if attention_dp_size < 1 or mlp_dp_size < 1 or attention_dp_size < mlp_dp_size:
         raise RuntimeError(
-            "FMHA attention/model DP fan-in is not integral: "
+            "FMHA profile requires positive DP sizes and at least as many "
+            "attention lanes as model lanes: "
             f"attention_dp={attention_dp_size} model_dp={mlp_dp_size}"
         )
     # Every attention DP owns one graph. Each model DP now receives one grouped
@@ -568,8 +579,11 @@ def main() -> None:
             "plan outlier policy must partition the complete 15-step window: "
             f"retained={required_retained_steps} outliers={max_outlier_count}"
         )
-    if data.get("sweep_contract") != "comprehensive":
-        raise RuntimeError("result is not from the comprehensive sweep contract")
+    sweep_contract = data.get("sweep_contract")
+    if sweep_contract not in {"comprehensive", "pmap"}:
+        raise RuntimeError(
+            f"result has unsupported sweep contract: {sweep_contract!r}"
+        )
     cuda_graph = data.get("cuda_graph")
     if not isinstance(cuda_graph, dict):
         raise RuntimeError("result lacks CUDA graph contract")

@@ -18,13 +18,135 @@ symmetric buffer is allocated with ``torch.distributed._symmetric_memory``
 
 from __future__ import annotations
 
+import json
 import types
+from collections import defaultdict
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 from . import deepgemm as _dg
+
+
+class Mxfp4ExpertWeightLoader:
+    """Load one rank's experts from a preconverted Qwen3.5 MXFP4 checkpoint."""
+
+    _PREFIX = "model.language_model.layers"
+    _PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+    def __init__(
+        self,
+        path: str,
+        device: torch.device,
+        *,
+        num_layers: int,
+        num_experts: int,
+        hidden: int,
+        intermediate_hidden: int,
+    ) -> None:
+        self.path = Path(path)
+        self.device = device
+        self.num_layers = int(num_layers)
+        self.num_experts = int(num_experts)
+        self.hidden = int(hidden)
+        self.intermediate_hidden = int(intermediate_hidden)
+        manifest = json.loads((self.path / "conversion_manifest.json").read_text())
+        if manifest.get("expert_weight_format") != "MXFP4 E2M1 packed uint8":
+            raise RuntimeError(
+                "MegaMoE W4 checkpoint has unsupported expert weight format: "
+                f"{manifest.get('expert_weight_format')!r}"
+            )
+        if manifest.get("expert_scale_format") != "UE8M0 group-32":
+            raise RuntimeError(
+                "MegaMoE W4 checkpoint has unsupported expert scale format: "
+                f"{manifest.get('expert_scale_format')!r}"
+            )
+        expected_weights = self.num_layers * self.num_experts * len(self._PROJECTIONS)
+        if int(manifest.get("expert_weights", -1)) != expected_weights:
+            raise RuntimeError(
+                "MegaMoE W4 checkpoint expert count mismatch: "
+                f"manifest={manifest.get('expert_weights')} expected={expected_weights}"
+            )
+        index = json.loads((self.path / "model.safetensors.index.json").read_text())
+        self.weight_map: dict[str, str] = index["weight_map"]
+
+    def _key(self, layer_id: int, expert_id: int, projection: str, suffix: str) -> str:
+        return (
+            f"{self._PREFIX}.{int(layer_id)}.mlp.experts.{int(expert_id)}."
+            f"{projection}.{suffix}"
+        )
+
+    def load_layer(
+        self,
+        layer_id: int,
+        *,
+        expert_offset: int,
+        expert_count: int,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+    ]:
+        """Return transformed FP4 L1/L2 weights for a contiguous expert shard."""
+        import safetensors
+
+        layer_id = int(layer_id)
+        expert_offset = int(expert_offset)
+        expert_count = int(expert_count)
+        if not 0 <= layer_id < self.num_layers:
+            raise RuntimeError(f"invalid MegaMoE W4 layer {layer_id}")
+        if expert_count < 1 or not 0 <= expert_offset <= self.num_experts - expert_count:
+            raise RuntimeError(
+                "invalid MegaMoE W4 expert shard: "
+                f"offset={expert_offset} count={expert_count} total={self.num_experts}"
+            )
+
+        h, i = self.hidden, self.intermediate_hidden
+        l1_weight = torch.empty(
+            (expert_count, 2 * i, h // 2), dtype=torch.uint8, device=self.device
+        )
+        l1_scale = torch.empty(
+            (expert_count, 2 * i, h // 32), dtype=torch.uint8, device=self.device
+        )
+        l2_weight = torch.empty(
+            (expert_count, h, i // 2), dtype=torch.uint8, device=self.device
+        )
+        l2_scale = torch.empty(
+            (expert_count, h, i // 32), dtype=torch.uint8, device=self.device
+        )
+        requests: dict[str, list[tuple[str, torch.Tensor]]] = defaultdict(list)
+        for local_id, expert_id in enumerate(
+            range(expert_offset, expert_offset + expert_count)
+        ):
+            destinations = {
+                "gate_proj": (l1_weight[local_id, :i], l1_scale[local_id, :i]),
+                "up_proj": (l1_weight[local_id, i:], l1_scale[local_id, i:]),
+                "down_proj": (l2_weight[local_id], l2_scale[local_id]),
+            }
+            for projection, (weight_dest, scale_dest) in destinations.items():
+                for suffix, dest in (("weight", weight_dest), ("weight_scale", scale_dest)):
+                    key = self._key(layer_id, expert_id, projection, suffix)
+                    try:
+                        shard = self.weight_map[key]
+                    except KeyError as exc:
+                        raise RuntimeError(f"MegaMoE W4 checkpoint is missing {key}") from exc
+                    requests[shard].append((key, dest))
+        for shard, tensors in requests.items():
+            with safetensors.safe_open(
+                str(self.path / shard), framework="pt", device=str(self.device)
+            ) as handle:
+                for key, dest in tensors:
+                    value = handle.get_tensor(key)
+                    if value.dtype != torch.uint8 or tuple(value.shape) != tuple(dest.shape):
+                        raise RuntimeError(
+                            "invalid MegaMoE W4 tensor: "
+                            f"key={key} shape={tuple(value.shape)} dtype={value.dtype} "
+                            f"expected_shape={tuple(dest.shape)} expected_dtype=torch.uint8"
+                        )
+                    dest.copy_(value)
+        return prepare_mxfp4_weights(
+            (l1_weight, l1_scale), (l2_weight, l2_scale)
+        )
 
 
 def _ext():
@@ -389,6 +511,38 @@ def requant_qwen_fp8_weights_to_fp4(
     return packed, transformed_scales
 
 
+def prepare_mxfp4_weights(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Convert serialized packed-MXFP4 tensors to the MegaMoE device layout."""
+    prepared = []
+    for label, (weight, packed_scale) in (("l1", l1_weights), ("l2", l2_weights)):
+        if weight.dtype != torch.uint8 or packed_scale.dtype != torch.uint8:
+            raise RuntimeError(
+                f"MegaMoE W4 {label} requires uint8 weight and scale, "
+                f"got {weight.dtype} and {packed_scale.dtype}"
+            )
+        if weight.dim() != 3 or packed_scale.dim() != 3:
+            raise RuntimeError(
+                f"MegaMoE W4 {label} requires rank-3 tensors, "
+                f"got {tuple(weight.shape)} and {tuple(packed_scale.shape)}"
+            )
+        experts, n, packed_k = map(int, weight.shape)
+        k = packed_k * 2
+        if tuple(packed_scale.shape) != (experts, n, k // 32):
+            raise RuntimeError(
+                f"MegaMoE W4 {label} scale mismatch: weight={tuple(weight.shape)} "
+                f"scale={tuple(packed_scale.shape)}"
+            )
+        float_scale = (packed_scale.to(torch.int32) << 23).view(torch.float32)
+        transformed_scale = _dg.transform_sf_into_required_layout(
+            float_scale, n, k, (1, 32), experts
+        )
+        prepared.append((weight.view(torch.int8), transformed_scale))
+    return transform_weights_for_mega_moe(prepared[0], prepared[1])
+
+
 def dequant_fp8_per32(w_fp8: torch.Tensor, sf32: torch.Tensor) -> torch.Tensor:
     """Dequantize [N, K] fp8 with per-32 float scales [N, K/32] (reference)."""
     return w_fp8.float() * torch.repeat_interleave(sf32.float(), 32, dim=1)
@@ -437,6 +591,7 @@ def transform_weights_for_mega_moe(
 
 
 __all__ = [
+    "Mxfp4ExpertWeightLoader",
     "MegaMoEM2NSymmBuffer",
     "cast_weights_to_fp4",
     "dequant_fp4",
@@ -445,6 +600,7 @@ __all__ = [
     "mega_moe_m2n_ag",
     "mega_moe_m2n_eg",
     "per_token_cast_to_fp4",
+    "prepare_mxfp4_weights",
     "requant_qwen_fp8_weights_per32",
     "requant_qwen_fp8_weights_to_fp4",
     "transform_weights_for_mega_moe",

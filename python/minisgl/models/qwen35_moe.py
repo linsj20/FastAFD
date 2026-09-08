@@ -6,12 +6,13 @@ import torch
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.kernel.qwen35_gdn import (
-    qwen35_causal_conv1d_decode,
+    qwen35_causal_conv1d_decode_packed,
     qwen35_causal_conv1d_prefill,
     qwen35_gdn_decode,
     qwen35_gdn_gates,
     qwen35_gdn_prefill,
     qwen35_rmsnorm_gated,
+    qwen35_rmsnorm_gated_fp8,
 )
 from minisgl.layers import (
     AttentionLayer,
@@ -38,6 +39,25 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+_GDN_PROJECTION_AUX_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
+
+
+def _qwen35_gdn_projection_aux_stream(
+    main_stream: torch.cuda.Stream, device: torch.device
+) -> torch.cuda.Stream:
+    """Return one persistent projection side stream per decode lane."""
+
+    device_index = (
+        int(device.index) if device.index is not None else torch.cuda.current_device()
+    )
+    key = (device_index, int(main_stream.cuda_stream))
+    stream = _GDN_PROJECTION_AUX_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _GDN_PROJECTION_AUX_STREAMS[key] = stream
+    return stream
+
+
 class _Qwen3_5DepthwiseConv1d(BaseOP):
     def __init__(self, channels: int, kernel_size: int):
         self.weight = torch.empty(channels, 1, kernel_size)
@@ -61,29 +81,23 @@ class Qwen3_5LinearAttention(BaseOP):
         )
         module_prefix = f"model.layers.{layer_id}.linear_attn"
 
-        self.in_proj_qkv = LinearColParallelMerged(
+        self.in_proj_qkvz = LinearColParallelMerged(
             config.hidden_size,
-            [key_dim, key_dim, value_dim],
+            [key_dim, key_dim, value_dim, value_dim],
             has_bias=False,
-            quant=config.quant_for_modules(f"{module_prefix}.in_proj_qkv"),
+            quant=config.quant_for_modules(
+                f"{module_prefix}.in_proj_qkv",
+                f"{module_prefix}.in_proj_z",
+            ),
         )
-        self.in_proj_z = LinearColParallelMerged(
+        self.in_proj_ba = LinearColParallelMerged(
             config.hidden_size,
-            [value_dim],
+            [config.linear_num_value_heads, config.linear_num_value_heads],
             has_bias=False,
-            quant=config.quant_for_modules(f"{module_prefix}.in_proj_z"),
-        )
-        self.in_proj_b = LinearColParallelMerged(
-            config.hidden_size,
-            [config.linear_num_value_heads],
-            has_bias=False,
-            quant=config.quant_for_modules(f"{module_prefix}.in_proj_b"),
-        )
-        self.in_proj_a = LinearColParallelMerged(
-            config.hidden_size,
-            [config.linear_num_value_heads],
-            has_bias=False,
-            quant=config.quant_for_modules(f"{module_prefix}.in_proj_a"),
+            # Qwen3.5 keeps these narrow projections in BF16. Their independent
+            # checkpoint scales cannot be represented by one shared 128-row
+            # FP8 block when b/a are packed together.
+            quant=None,
         )
         self.conv1d = _Qwen3_5DepthwiseConv1d(
             local_conv_dim, config.linear_conv_kernel_dim
@@ -105,8 +119,62 @@ class Qwen3_5LinearAttention(BaseOP):
         self._local_value_dim = local_value_heads * self._value_head_dim
         self._norm_eps = config.rms_norm_eps
         self._layer_id = layer_id
+        self._projection_events: dict[
+            int, tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]
+        ] = {}
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _project_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.cuda.Event | None,
+    ]:
+        """Fuse projections and overlap BA plus gate preparation with QKVZ."""
+
+        if not hidden_states.is_cuda:
+            projected_qkvz = self.in_proj_qkvz.forward(hidden_states)
+            projected_ba = self.in_proj_ba.forward(hidden_states)
+            b, a = projected_ba.view(-1, 2 * self._num_value_heads).split(
+                self._num_value_heads, dim=-1
+            )
+            g, beta = qwen35_gdn_gates(a, b, self.A_log, self.dt_bias)
+            return projected_qkvz, projected_ba, g, beta, None
+
+        main_stream = torch.cuda.current_stream(hidden_states.device)
+        stream_key = int(main_stream.cuda_stream)
+        sync = self._projection_events.get(stream_key)
+        if sync is None:
+            aux_stream = _qwen35_gdn_projection_aux_stream(
+                main_stream, hidden_states.device
+            )
+            sync = (aux_stream, torch.cuda.Event(), torch.cuda.Event())
+            self._projection_events[stream_key] = sync
+        aux_stream, start_event, done_event = sync
+
+        start_event.record(main_stream)
+        projected_qkvz = self.in_proj_qkvz.forward(hidden_states)
+        with torch.cuda.stream(aux_stream):
+            aux_stream.wait_event(start_event)
+            projected_ba = self.in_proj_ba.forward(hidden_states)
+            b, a = projected_ba.view(-1, 2 * self._num_value_heads).split(
+                self._num_value_heads, dim=-1
+            )
+            g, beta = qwen35_gdn_gates(a, b, self.A_log, self.dt_bias)
+            done_event.record(aux_stream)
+        projected_ba.record_stream(main_stream)
+        g.record_stream(main_stream)
+        beta.record_stream(main_stream)
+        return projected_qkvz, projected_ba, g, beta, done_event
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
         state_pool = ctx.gdn_state_pool
@@ -114,20 +182,30 @@ class Qwen3_5LinearAttention(BaseOP):
             raise RuntimeError("Qwen3.5 GDN state pool is not initialized")
         layer_state = state_pool.layer_state(self._layer_id)
 
-        mixed_qkv = self.in_proj_qkv.forward(hidden_states)
-        z = self.in_proj_z.forward(hidden_states).view(
+        projected_qkvz, projected_ba, g, beta, side_done_event = (
+            self._project_inputs(hidden_states)
+        )
+        qkv_width = 2 * self._local_key_dim + self._local_value_dim
+        mixed_qkv = projected_qkvz[:, :qkv_width]
+        z = projected_qkvz[:, qkv_width:].view(
             -1, self._num_value_heads, self._value_head_dim
         )
-        b = self.in_proj_b.forward(hidden_states).view(-1, self._num_value_heads)
-        a = self.in_proj_a.forward(hidden_states).view(-1, self._num_value_heads)
+        b, a = projected_ba.view(-1, 2 * self._num_value_heads).split(
+            self._num_value_heads, dim=-1
+        )
 
         if batch.is_decode:
-            mixed_qkv = qwen35_causal_conv1d_decode(
-                mixed_qkv,
-                self.conv1d.weight,
-                layer_state.conv,
-                batch.state_indices,
-                batch.positions,
+            query, key, value, q_norm_scale, k_norm_scale = (
+                qwen35_causal_conv1d_decode_packed(
+                    mixed_qkv,
+                    self.conv1d.weight,
+                    layer_state.conv,
+                    batch.state_indices,
+                    batch.positions,
+                    key_dim=self._local_key_dim,
+                    value_dim=self._local_value_dim,
+                    key_head_dim=self._key_head_dim,
+                )
             )
         else:
             cu_seqlens, sequence_slots, first_positions = self._prefill_state_plan(batch)
@@ -140,14 +218,18 @@ class Qwen3_5LinearAttention(BaseOP):
                 first_positions,
             )
             layer_state.conv.index_copy_(0, sequence_slots, final_conv)
-
-        query, key, value = mixed_qkv.split(
-            [self._local_key_dim, self._local_key_dim, self._local_value_dim],
-            dim=-1,
-        )
+            query, key, value = mixed_qkv.split(
+                [self._local_key_dim, self._local_key_dim, self._local_value_dim],
+                dim=-1,
+            )
         query = query.view(-1, self._num_key_heads, self._key_head_dim)
         key = key.view(-1, self._num_key_heads, self._key_head_dim)
         value = value.view(-1, self._num_value_heads, self._value_head_dim)
+
+        # Keep the independent BA GEMM and fused gate preparation behind QKVZ
+        # plus causal convolution; only recurrent-state update needs to join.
+        if side_done_event is not None:
+            torch.cuda.current_stream(hidden_states.device).wait_event(side_done_event)
 
         if batch.is_decode:
             core_output = qwen35_gdn_decode(
@@ -161,9 +243,12 @@ class Qwen3_5LinearAttention(BaseOP):
                 layer_state.recurrent,
                 batch.state_indices,
                 batch.positions,
+                q_norm_scale,
+                k_norm_scale,
+                g,
+                beta,
             )
         else:
-            g, beta = qwen35_gdn_gates(a, b, self.A_log, self.dt_bias)
             initial_recurrent = layer_state.recurrent.index_select(0, sequence_slots)
             keep = (first_positions != 0).to(initial_recurrent.dtype)
             initial_recurrent = initial_recurrent * keep[:, None, None, None]
@@ -178,9 +263,24 @@ class Qwen3_5LinearAttention(BaseOP):
             )
             layer_state.recurrent.index_copy_(0, sequence_slots, final_recurrent)
 
-        gated = qwen35_rmsnorm_gated(
-            core_output, z, self.norm.weight, self._norm_eps
-        )
+        if batch.is_decode and self.out_proj.weight.dtype == torch.float8_e4m3fn:
+            gated_fp8, gated_scale = qwen35_rmsnorm_gated_fp8(
+                core_output, z, self.norm.weight, self._norm_eps
+            )
+            return self.out_proj.forward_fp8_prequant(
+                gated_fp8.flatten(1),
+                gated_scale,
+                output_shape_prefix=(core_output.shape[0],),
+                output_dtype=core_output.dtype,
+                output=output,
+            )
+
+        if output is not None:
+            raise RuntimeError(
+                "Qwen3.5 direct linear-attention output requires the decode "
+                "FP8 out-projection path"
+            )
+        gated = qwen35_rmsnorm_gated(core_output, z, self.norm.weight, self._norm_eps)
         return self.out_proj.forward(gated.flatten(1))
 
     @staticmethod
@@ -296,6 +396,22 @@ class Qwen3_5SharedExpert(BaseOP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(hidden_states)))
+
+    def forward_fp8_prequant(
+        self,
+        input_fp8: torch.Tensor,
+        input_scale: torch.Tensor,
+        *,
+        output_shape_prefix: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Run gate/up from a caller-produced normalized FP8 activation."""
+        gate_up = self.gate_up_proj.forward_fp8_prequant(
+            input_fp8,
+            input_scale,
+            output_shape_prefix=output_shape_prefix,
+            output_dtype=torch.bfloat16,
+        )
+        return self.down_proj.forward(silu_and_mul(gate_up))
 
 
 def qwen35_shared_output(

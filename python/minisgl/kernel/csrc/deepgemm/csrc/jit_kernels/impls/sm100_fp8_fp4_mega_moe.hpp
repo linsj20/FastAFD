@@ -252,7 +252,11 @@ static void sm100_fp8_mega_moe_impl(
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build(
         use_fp8_weights ? "sm100_fp8_fp8_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
-    SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+    // Only the route-ready producer has an independent release/acquire epoch
+    // that lets MegaMoE consume data without waiting for the whole selector
+    // grid. Other callers retain ordinary stream ordering.
+    SM100FP8FP4MegaMoERuntime::launch(
+        runtime, args, /* force_pdl */ route_ready_dispatch);
 }
 
 static void sm100_fp8_fp4_mega_moe(

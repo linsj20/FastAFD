@@ -77,6 +77,27 @@ __device__ __forceinline__ int atom_add_acqrel_gpu(int* p, int v) {
   return old;
 }
 
+// Blackwell warp reduction used by TRT-LLM's MoE top-k. Encode the float as
+// an unsigned monotonic key, then resolve equal values by the same lower-lane
+// rule as the original shuffle tree. A pair of REDUX instructions replaces
+// five value shuffles, five lane shuffles, and their comparisons.
+__device__ __forceinline__ uint32_t ordered_float_key(float value) {
+  uint32_t bits = __float_as_uint(value);
+  // CUDA float comparisons consider -0 and +0 equal. Canonicalize them so the
+  // packed reduction preserves the selector's existing tie behavior.
+  if ((bits & 0x7fffffffu) == 0) bits = 0;
+  const uint32_t mask =
+      static_cast<uint32_t>(static_cast<int32_t>(bits) >> 31) | 0x80000000u;
+  return bits ^ mask;
+}
+
+__device__ __forceinline__ uint32_t warp_redux_max_u32(uint32_t value) {
+  uint32_t result;
+  asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;\n"
+               : "=r"(result) : "r"(value));
+  return result;
+}
+
 inline constexpr int kQuantSplits = 16;
 inline constexpr int kStages = 4;   // cp.async pipeline depth (latency-bound kernel)
 
@@ -259,14 +280,18 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
     block_logits[(tid / 8) * kMaxExperts + n_base + (tid % 8)] = v;
   }
 
-  return;
+  // Let the dependent selector become resident while the tail of the gate
+  // grid drains. Its grid-dependency wait below preserves the full producer
+  // barrier before any logit is consumed.
+  device::PDL::launch<true>();
 }
 
 // Second kernel: top-k over the assembled logits (one block per token tile,
 // one warp per token).  The kernel boundary is the cheapest device-wide
 // barrier — much faster than an in-kernel ticket + memory fence round.
 template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
-          bool kRankReadyRoutePublish, bool kPerfectBalance>
+          bool kRankReadyRoutePublish, bool kPerfectBalance,
+          bool kRenormalize>
 __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_kernel(
     const float* __restrict__ logits_gmem,  // [mtiles, 16, kMaxExperts]
     float* __restrict__ topk_weights,
@@ -280,11 +305,12 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     const int route_rank, const int route_num_ranks,
     const int route_bucket, const int route_num_sms,
     const int num_tokens, const int num_experts, const int topk,
-    const bool renormalize) {
+    const bool defer_route_dependent_launch) {
   const int mtile = blockIdx.x;
   const int m0 = mtile * kTokensPerBlock;
   const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
   const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
+  device::PDL::wait<true>();
   const float* block_logits =
       logits_gmem + static_cast<size_t>(mtile) * kTokensPerBlock * kMaxExperts;
 
@@ -318,20 +344,25 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
                      : -FLT_MAX;
     }
 
+    // Qwen3.5 renormalizes only the selected experts.  Specializing this
+    // policy at launch time avoids an otherwise unused 512-way softmax while
+    // keeping the non-renormalized model path bit-for-bit unchanged.
     float m_all = -FLT_MAX;
-    #pragma unroll
-    for (int i = 0; i < kMaxExpertsPerLane; ++i)
-      m_all = fmaxf(m_all, logit[i]);
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      m_all = fmaxf(m_all, __shfl_xor_sync(0xffffffffu, m_all, off));
     float denom_all = 0.f;
-    #pragma unroll
-    for (int i = 0; i < kMaxExpertsPerLane; ++i)
-      denom_all += logit[i] > -FLT_MAX ? __expf(logit[i] - m_all) : 0.f;
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      denom_all += __shfl_xor_sync(0xffffffffu, denom_all, off);
+    if constexpr (!kRenormalize) {
+      #pragma unroll
+      for (int i = 0; i < kMaxExpertsPerLane; ++i)
+        m_all = fmaxf(m_all, logit[i]);
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        m_all = fmaxf(m_all, __shfl_xor_sync(0xffffffffu, m_all, off));
+      #pragma unroll
+      for (int i = 0; i < kMaxExpertsPerLane; ++i)
+        denom_all += logit[i] > -FLT_MAX ? __expf(logit[i] - m_all) : 0.f;
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        denom_all += __shfl_xor_sync(0xffffffffu, denom_all, off);
+    }
 
     uint32_t used = 0;
     float my_logit = -FLT_MAX;
@@ -347,17 +378,13 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
           best_i = i;
         }
       }
-      float v = best;
-      uint32_t src = lane;
-      #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, v, off);
-        const uint32_t os = __shfl_xor_sync(0xffffffffu, src, off);
-        if (ov > v || (ov == v && os < src)) {
-          v = ov;
-          src = os;
-        }
-      }
+      const uint32_t value_key = ordered_float_key(best);
+      const uint32_t max_value_key = warp_redux_max_u32(value_key);
+      const uint32_t lane_key = value_key == max_value_key
+                                    ? 0xffffffffu - lane
+                                    : 0;
+      const uint32_t src = 0xffffffffu - warp_redux_max_u32(lane_key);
+      const float v = __shfl_sync(0xffffffffu, best, src);
       const int wbi = __shfl_sync(0xffffffffu, best_i, src);
       if (lane == static_cast<int>(src)) used |= 1u << wbi;
       if (j == 0) top0 = v;
@@ -382,7 +409,8 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
       }
     }
 
-    float w = lane < topk ? __expf(my_logit - (renormalize ? top0 : m_all)) : 0.f;
+    const float normalization_max = kRenormalize ? top0 : m_all;
+    float w = lane < topk ? __expf(my_logit - normalization_max) : 0.f;
     float w_sum = w;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -393,7 +421,7 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
                                      : __ldg(expert_map + my_expert);
       const auto token_topk_idx = static_cast<size_t>(token) * topk + lane;
       topk_ids[token_topk_idx] = static_cast<IndexT>(mapped_expert);
-      const float w_out = renormalize ? w / w_sum : w / denom_all;
+      const float w_out = kRenormalize ? w / w_sum : w / denom_all;
       topk_weights[token_topk_idx] = w_out;
       if (w_stage != nullptr)
         w_stage[token_topk_idx] = w_out;
@@ -433,6 +461,13 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     // lets one block finalize the per-source and aggregate expert counts
     // without another kernel or a cooperative grid launch.
     __syncthreads();
+    // DeepGEMM launches MegaMoE as a programmatic dependent. All selector
+    // blocks have published their route indices/count increments at this
+    // point, so MegaMoE may overlap descriptor/barrier initialization with
+    // the last block's remote count and readiness publication. MegaMoE polls
+    // route_ready before consuming any of those values.
+    if (!defer_route_dependent_launch)
+      device::PDL::launch<true>();
     const auto workspace = deep_gemm::layout::Workspace(
         route_workspace, route_num_ranks, num_experts, route_bucket, topk);
     __shared__ int is_last_block;
@@ -496,6 +531,235 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
   }
 }
 
+// Qwen3.5's 512-expert/top-10 selector otherwise exposes only one warp per
+// token in a two-block grid at the hard-MB2 rows. Give each token a full CTA:
+// every thread owns two logits, warp 0 reduces the eight candidates for each
+// original selector lane, and the ten exact winners publish routes in
+// parallel. Ties retain the original lower-local-index/lower-lane rule and
+// routing remains data-dependent.
+template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
+          bool kRankReadyRoutePublish, bool kPerfectBalance>
+__launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
+    const float* __restrict__ logits_gmem,
+    float* __restrict__ topk_weights,
+    IndexT* __restrict__ topk_ids,
+    const MapT* __restrict__ expert_map,
+    const int64_t* __restrict__ valid_token_count,
+    int valid_count_size,
+    float* __restrict__ w_stage,
+    void* __restrict__ route_workspace,
+    const int64_t* __restrict__ route_buffer_ptrs,
+    const int route_rank, const int route_num_ranks,
+    const int route_bucket, const int route_num_sms,
+    const int num_tokens, const bool defer_route_dependent_launch) {
+  constexpr int kExperts = 512;
+  constexpr int kTopK = 10;
+  constexpr int kWarps = kTPB / kWarpSize;
+  const int token = static_cast<int>(blockIdx.x);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp = tid / kWarpSize;
+  const int lane = tid % kWarpSize;
+  device::PDL::wait<true>();
+
+  __shared__ float warp_values[kWarps * kWarpSize];
+  __shared__ int warp_experts[kWarps * kWarpSize];
+  __shared__ int selected_experts[kTopK];
+  __shared__ float selected_logits[kTopK];
+  const int valid_tokens = valid_count_size == 0
+                               ? num_tokens
+                               : min(static_cast<int>(valid_token_count[0]),
+                                     num_tokens);
+  const bool valid = token < valid_tokens;
+
+  if (valid) {
+    const float* token_logits =
+        logits_gmem + static_cast<size_t>(token) * kMaxExperts;
+    // Warp `w` owns local-index pairs (2w, 2w+1) for every one of the
+    // original selector's 32 lanes. Reducing warps in ascending order below
+    // reconstructs that lane's strict-`>` scan over all 16 local experts.
+    const int expert0 = lane + (warp * 2) * kWarpSize;
+    const int expert1 = expert0 + kWarpSize;
+    const float value0 = token_logits[expert0];
+    const float value1 = token_logits[expert1];
+    uint32_t used = 0;
+
+    #pragma unroll
+    for (int j = 0; j < kTopK; ++j) {
+      float best = -FLT_MAX;
+      int best_expert = -1;
+      if ((used & 1u) == 0 && value0 > best) {
+        best = value0;
+        best_expert = expert0;
+      }
+      if ((used & 2u) == 0 && value1 > best) {
+        best = value1;
+        best_expert = expert1;
+      }
+
+      const int candidate_index = warp * kWarpSize + lane;
+      warp_values[candidate_index] = best;
+      warp_experts[candidate_index] = best_expert;
+      __syncthreads();
+
+      if (warp == 0) {
+        float lane_best = -FLT_MAX;
+        int lane_expert = -1;
+        #pragma unroll
+        for (int candidate_warp = 0; candidate_warp < kWarps;
+             ++candidate_warp) {
+          const int index = candidate_warp * kWarpSize + lane;
+          const float candidate = warp_values[index];
+          if (candidate > lane_best) {
+            lane_best = candidate;
+            lane_expert = warp_experts[index];
+          }
+        }
+        const uint32_t value_key = ordered_float_key(lane_best);
+        const uint32_t max_key = warp_redux_max_u32(value_key);
+        const uint32_t lane_key = value_key == max_key
+                                      ? 0xffffffffu - lane
+                                      : 0;
+        const uint32_t src_lane =
+            0xffffffffu - warp_redux_max_u32(lane_key);
+        const int winner = __shfl_sync(
+            0xffffffffu, lane_expert, static_cast<int>(src_lane));
+        const float winner_value = __shfl_sync(
+            0xffffffffu, lane_best, static_cast<int>(src_lane));
+        if (lane == 0) {
+          selected_experts[j] = winner;
+          selected_logits[j] = winner_value;
+        }
+      }
+      __syncthreads();
+      const int winner = selected_experts[j];
+      if (winner == expert0) used |= 1u;
+      if (winner == expert1) used |= 2u;
+    }
+
+    if (tid < kWarpSize) {
+      float w = tid < kTopK
+                    ? __expf(selected_logits[tid] - selected_logits[0])
+                    : 0.f;
+      float w_sum = w;
+      #pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        w_sum += __shfl_xor_sync(0xffffffffu, w_sum, off);
+      if (tid < kTopK) {
+        int expert = selected_experts[tid];
+        if constexpr (kPerfectBalance) {
+          expert = ((route_rank * valid_tokens + token) * kTopK + tid) &
+                   (kExperts - 1);
+        }
+        const auto mapped_expert = expert_map == nullptr
+                                       ? static_cast<MapT>(expert)
+                                       : __ldg(expert_map + expert);
+        const auto token_topk_idx =
+            static_cast<size_t>(token) * kTopK + tid;
+        topk_ids[token_topk_idx] = static_cast<IndexT>(mapped_expert);
+        const float w_out = w / w_sum;
+        topk_weights[token_topk_idx] = w_out;
+        if (w_stage != nullptr)
+          w_stage[token_topk_idx] = w_out;
+
+        if constexpr (kPrepareMegaMoERoutes) {
+          if (mapped_expert >= 0 && mapped_expert < kExperts) {
+            const auto workspace = deep_gemm::layout::Workspace(
+                route_workspace, route_num_ranks, kExperts,
+                route_bucket, kTopK);
+            auto* send_count = reinterpret_cast<unsigned int*>(
+                workspace.get_expert_send_count_ptr(
+                    static_cast<uint32_t>(mapped_expert)));
+            const auto dst_slot = atomicAdd(send_count, 1u);
+            const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
+                                  workspace.num_experts_per_rank;
+            const auto dst_local_expert =
+                static_cast<uint32_t>(mapped_expert) %
+                workspace.num_experts_per_rank;
+            auto* local_dst = workspace.get_src_token_topk_idx_ptr(
+                dst_local_expert, route_rank, dst_slot);
+            const auto byte_offset =
+                reinterpret_cast<uintptr_t>(local_dst) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_dst = reinterpret_cast<uint32_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+                byte_offset);
+            *remote_dst = static_cast<uint32_t>(token_topk_idx);
+          }
+        }
+      }
+    }
+  } else if (tid < kTopK) {
+    const auto token_topk_idx = static_cast<size_t>(token) * kTopK + tid;
+    topk_ids[token_topk_idx] = static_cast<IndexT>(-1);
+    topk_weights[token_topk_idx] = 0.0f;
+    if (w_stage != nullptr)
+      w_stage[token_topk_idx] = 0.0f;
+  }
+
+  if constexpr (kPrepareMegaMoERoutes) {
+    __syncthreads();
+    if (!defer_route_dependent_launch)
+      device::PDL::launch<true>();
+    const auto workspace = deep_gemm::layout::Workspace(
+        route_workspace, route_num_ranks, kExperts, route_bucket, kTopK);
+    __shared__ int is_last_block;
+    if (tid == 0) {
+      is_last_block = atom_add_acqrel_gpu(
+          reinterpret_cast<int*>(workspace.get_route_prepare_counter_ptr()), 1) ==
+          gridDim.x - 1;
+    }
+    __syncthreads();
+    if (is_last_block) {
+      for (int expert = tid; expert < kExperts; expert += kTPB) {
+        const auto count = static_cast<uint32_t>(
+            *workspace.get_expert_send_count_ptr(expert));
+        const auto dst_rank = expert / workspace.num_experts_per_rank;
+        const auto dst_local_expert =
+            expert % workspace.num_experts_per_rank;
+        const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
+            route_rank, dst_local_expert);
+        const auto recv_count_offset =
+            reinterpret_cast<uintptr_t>(recv_count_ptr) -
+            reinterpret_cast<uintptr_t>(route_workspace);
+        auto* remote_recv_count = reinterpret_cast<uint64_t*>(
+            static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+            recv_count_offset);
+        *remote_recv_count = count;
+
+        if constexpr (not kRankReadyRoutePublish) {
+          const auto recv_sum_ptr =
+              workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
+          const auto recv_sum_offset =
+              reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+              recv_sum_offset);
+          const uint64_t completed_count =
+              (static_cast<uint64_t>(route_num_sms) << 32) | count;
+          deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+        }
+      }
+      __syncthreads();
+      if constexpr (kRankReadyRoutePublish) {
+        if (tid < route_num_ranks) {
+          const auto route_ready_offset =
+              reinterpret_cast<uintptr_t>(
+                  workspace.get_route_ready_count_ptr()) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_route_ready = reinterpret_cast<uint64_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[tid]) +
+              route_ready_offset);
+          deep_gemm::ptx::atomic_add_rel_sys(remote_route_ready, 1);
+        }
+        __syncthreads();
+      }
+      if (tid == 0)
+        *workspace.get_route_prepare_counter_ptr() = 0;
+    }
+  }
+}
+
 }  // namespace
 
 struct GateTopkFusedKernel {
@@ -519,7 +783,8 @@ struct GateTopkFusedKernel {
       int route_bucket,
       int route_num_sms,
       bool route_rank_ready,
-      bool perfect_balance) {
+      bool perfect_balance,
+      bool defer_route_dependent_launch) {
     using namespace host;
     auto num_tokens = SymbolicSize{"M"};
     auto topk = SymbolicSize{"K"};
@@ -585,6 +850,8 @@ struct GateTopkFusedKernel {
                  "rank-ready publication requires route preparation");
     RuntimeCheck(prepare_routes || !perfect_balance,
                  "perfect balance requires route preparation");
+    RuntimeCheck(prepare_routes || !defer_route_dependent_launch,
+                 "deferred route dependent launch requires route preparation");
     RuntimeCheck(!perfect_balance ||
                      (experts > 0 && (experts & (experts - 1)) == 0),
                  "perfect balance requires a power-of-two expert count");
@@ -671,36 +938,61 @@ struct GateTopkFusedKernel {
           ? static_cast<const int64_t*>(route_buffer_ptrs.value().data_ptr())
           : nullptr;
       const auto launch = [&](auto prepare_tag, auto rank_ready_tag,
-                              auto perfect_tag) {
+                              auto perfect_tag, auto renormalize_tag) {
         constexpr bool kPrepareRoutes = decltype(prepare_tag)::value;
         constexpr bool kRankReady = decltype(rank_ready_tag)::value;
         constexpr bool kPerfect = decltype(perfect_tag)::value;
-        gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>
-            <<<num_mtiles,
-               std::min(kTokensPerBlock, rows) * kWarpSize,
-               0, stream>>>(
+        constexpr bool kRenormalize = decltype(renormalize_tag)::value;
+        if constexpr (kRenormalize) {
+          if (experts == 512 && topk_value == 10) {
+            const auto kernel = gate_topk_select_qwen35_cta_kernel<
+                IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>;
+            LaunchKernel(rows, kTPB, stream).with_attr(true)(kernel,
                 static_cast<const float*>(partials.data_ptr()),
                 static_cast<float*>(topk_weights.data_ptr()),
                 static_cast<IndexT*>(topk_indices.data_ptr()),
                 map_ptr, count_ptr, count_size, w_stage_ptr,
                 route_workspace_ptr, route_buffer_ptrs_ptr,
                 route_rank, route_num_ranks, route_bucket, route_num_sms,
-                rows, experts, topk_value, renormalize);
+                rows, defer_route_dependent_launch);
+            return;
+          }
+        }
+        const auto kernel =
+            gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady,
+                                    kPerfect, kRenormalize>;
+        LaunchKernel(num_mtiles,
+                     std::min(kTokensPerBlock, rows) * kWarpSize,
+                     stream).with_attr(true)(kernel,
+            static_cast<const float*>(partials.data_ptr()),
+            static_cast<float*>(topk_weights.data_ptr()),
+            static_cast<IndexT*>(topk_indices.data_ptr()),
+            map_ptr, count_ptr, count_size, w_stage_ptr,
+            route_workspace_ptr, route_buffer_ptrs_ptr,
+            route_rank, route_num_ranks, route_bucket, route_num_sms,
+            rows, experts, topk_value, defer_route_dependent_launch);
+      };
+      const auto launch_policy = [&](auto prepare_tag, auto rank_ready_tag,
+                                     auto perfect_tag) {
+        if (renormalize)
+          launch(prepare_tag, rank_ready_tag, perfect_tag, std::true_type{});
+        else
+          launch(prepare_tag, rank_ready_tag, perfect_tag, std::false_type{});
       };
       if (prepare_routes) {
         if (route_rank_ready) {
           if (perfect_balance)
-            launch(std::true_type{}, std::true_type{}, std::true_type{});
+            launch_policy(std::true_type{}, std::true_type{}, std::true_type{});
           else
-            launch(std::true_type{}, std::true_type{}, std::false_type{});
+            launch_policy(std::true_type{}, std::true_type{}, std::false_type{});
         } else {
           if (perfect_balance)
-            launch(std::true_type{}, std::false_type{}, std::true_type{});
+            launch_policy(std::true_type{}, std::false_type{}, std::true_type{});
           else
-            launch(std::true_type{}, std::false_type{}, std::false_type{});
+            launch_policy(std::true_type{}, std::false_type{}, std::false_type{});
         }
       } else {
-        launch(std::false_type{}, std::false_type{}, std::false_type{});
+        launch_policy(std::false_type{}, std::false_type{}, std::false_type{});
       }
     };
     if (use_int32_indices && use_int32_map) {

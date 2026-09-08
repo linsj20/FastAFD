@@ -156,7 +156,14 @@ class AfdFmhaProtocolTest(unittest.TestCase):
         )
 
     def test_model_dp_fanin_covers_each_attention_lane_once(self) -> None:
-        for attn_dp_size, mlp_dp_size in ((1, 1), (2, 1), (3, 1), (15, 1), (8, 4)):
+        for attn_dp_size, mlp_dp_size in (
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (15, 1),
+            (8, 4),
+            (7, 2),
+        ):
             topology = AfdTopology(
                 attn_dp_size=attn_dp_size,
                 mlp_dp_size=mlp_dp_size,
@@ -170,6 +177,10 @@ class AfdFmhaProtocolTest(unittest.TestCase):
             self.assertEqual(
                 tuple(attn_dp for group in groups for attn_dp in group),
                 tuple(range(attn_dp_size)),
+            )
+            self.assertEqual(
+                max(len(group) for group in groups),
+                topology.attn_fanin_per_mlp_dp,
             )
             for mlp_dp_rank, group in enumerate(groups):
                 self.assertTrue(group)

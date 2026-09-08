@@ -11,6 +11,68 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GB200OverlapContractTests(unittest.TestCase):
+    def test_fmha_runtime_uniformly_sizes_nondivisible_fanin_buffers(self) -> None:
+        runtime = (ROOT / "python/minisgl/afd_fmha_runtime.py").read_text()
+        self.assertIn("self.fanin = len(self._mapped_attn_dp_ranks)", runtime)
+        self.assertIn("int(topology.attn_fanin_per_mlp_dp)", runtime)
+        self.assertIn(
+            "self.max_rows = self.source_max_rows * self.fanin_capacity",
+            runtime,
+        )
+        self.assertIn("if self.fanin > self.fanin_capacity:", runtime)
+
+    def test_comprehensive_launcher_supports_explicit_attention_gpu_count(self) -> None:
+        launcher = (
+            ROOT / "scripts/experiments/afd/oci_hsg/run_afd.sh"
+        ).read_text()
+        self.assertIn(
+            "ATTENTION_GPUS_OVERRIDE=${FASTAFD_ATTENTION_GPUS_OVERRIDE:-}",
+            launcher,
+        )
+        self.assertIn(
+            '[[ "$SWEEP_CONTRACT" == comprehensive ]]',
+            launcher,
+        )
+        override = launcher.index("if [[ -n \"$ATTENTION_GPUS_OVERRIDE\" ]]")
+        tray_limit = launcher.index("if [[ \"$SWEEP_CONTRACT\" == comprehensive ||")
+        self.assertLess(override, tray_limit)
+        self.assertIn("NODES=$(( (ACTIVE_GPUS + 3) / 4 ))", launcher[override:])
+        self.assertIn("ATTENTION_GPUS=$ATTENTION_GPUS_OVERRIDE", launcher[override:])
+        self.assertEqual(
+            launcher.count(
+                "FASTAFD_ATTENTION_GPUS_OVERRIDE=$ATTENTION_GPUS_OVERRIDE"
+            ),
+            1,
+        )
+        self.assertEqual(
+            launcher.count(
+                'FASTAFD_ATTENTION_GPUS_OVERRIDE="$ATTENTION_GPUS_OVERRIDE"'
+            ),
+            1,
+        )
+        self.assertEqual(
+            launcher.count("FASTAFD_MAX_TOTAL_TRAYS=$MAX_TOTAL_TRAYS"),
+            1,
+        )
+        self.assertEqual(
+            launcher.count('FASTAFD_MAX_TOTAL_TRAYS="$MAX_TOTAL_TRAYS"'),
+            1,
+        )
+
+    def test_qwen35_selector_uses_one_cta_per_token_without_changing_routing(self) -> None:
+        kernel = (
+            ROOT / "python/minisgl/kernel/csrc/jit/gate_topk_fused.cu"
+        ).read_text()
+        self.assertIn("gate_topk_select_qwen35_cta_kernel", kernel)
+        self.assertIn("constexpr int kExperts = 512", kernel)
+        self.assertIn("constexpr int kTopK = 10", kernel)
+        self.assertIn("if (experts == 512 && topk_value == 10)", kernel)
+        self.assertIn("LaunchKernel(rows, kTPB, stream)", kernel)
+        self.assertIn("const bool valid = token < valid_tokens", kernel)
+        self.assertIn("if constexpr (kPerfectBalance)", kernel)
+        self.assertIn("if (mapped_expert >= 0 && mapped_expert < kExperts)", kernel)
+        self.assertIn("atomic_add_rel_sys(remote_route_ready", kernel)
+
     def test_perfect_routing_preserves_router_work_and_balances_ids(self) -> None:
         kernel = (
             ROOT / "python/minisgl/kernel/csrc/jit/gate_topk_fused.cu"
@@ -18,9 +80,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         select = kernel[kernel.index("gate_topk_select_kernel") :]
         self.assertIn("if constexpr (kPerfectBalance)", select)
         self.assertIn(
-            "gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>",
+            "gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady,",
             select,
         )
+        self.assertIn("kPerfect, kRenormalize>", select)
+        self.assertIn("if constexpr (!kRenormalize)", select)
+        self.assertIn("if (renormalize)", select)
         perfect_start = select.index("if constexpr (kPerfectBalance)")
         normal_start = select.index("float logit[kMaxExpertsPerLane]")
         topk_start = select.index("for (int j = 0; j < topk; ++j)")
@@ -242,6 +307,8 @@ class GB200OverlapContractTests(unittest.TestCase):
         )
         self.assertIn('r"warmup_step_id=(\\d+) step_ids=([0-9,]+) "', source)
         self.assertIn("int(trace_count_text) != 16", source)
+        self.assertIn('r"(?:real=\\d+ )?bs=(\\d+) num_mb=(\\d+)"', source)
+        self.assertIn("trace_step_set = set(trace_steps)", source)
         self.assertIn("steps[0] != warmup_step + 1", source)
         self.assertIn('"trace_decode_step_ids": trace_steps', source)
         self.assertIn("trace first exact full-resident decode as warmup", source)
@@ -322,6 +389,116 @@ class GB200OverlapContractTests(unittest.TestCase):
             'MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$case_expert_weight_dtype"',
             bundle,
         )
+        self.assertIn("per-case AFD perf contract is incomplete", bundle)
+        self.assertIn(
+            'FASTAFD_AFD_PERF_MODE="$case_perf_mode"',
+            bundle,
+        )
+        self.assertIn(
+            'MINISGL_AFD_PERFECT_ROUTING="$case_perfect_routing"',
+            bundle,
+        )
+        self.assertIn(
+            'argv[0] not in {"qwen3", "qwen35", "minimax"}', bundle
+        )
+        self.assertIn(
+            'bash "$CASE_RUNNER" "$case_model" "$context"', bundle
+        )
+        self.assertNotIn(
+            'bash "$CASE_RUNNER" qwen3 "$context"', bundle
+        )
+
+    def test_qwen35_gdn_fuses_and_overlaps_input_projections(self) -> None:
+        model_source = (ROOT / "python/minisgl/models/qwen35_moe.py").read_text()
+        project_start = model_source.index("    def _project_inputs(")
+        project_end = model_source.index("    def forward(", project_start)
+        project_source = model_source[project_start:project_end]
+        start_record = project_source.index("start_event.record(main_stream)")
+        qkvz_launch = project_source.index(
+            "projected_qkvz = self.in_proj_qkvz.forward(hidden_states)",
+            start_record,
+        )
+        ba_launch = project_source.index(
+            "projected_ba = self.in_proj_ba.forward(hidden_states)", qkvz_launch
+        )
+        self.assertLess(start_record, qkvz_launch)
+        self.assertLess(qkvz_launch, ba_launch)
+        self.assertIn("with torch.cuda.stream(aux_stream):", project_source)
+        self.assertIn("aux_stream.wait_event(start_event)", project_source)
+        self.assertIn("done_event.record(aux_stream)", project_source)
+        gate_launch = project_source.rindex(
+            "g, beta = qwen35_gdn_gates(a, b, self.A_log, self.dt_bias)"
+        )
+        self.assertLess(ba_launch, gate_launch)
+        self.assertLess(gate_launch, project_source.index("done_event.record(aux_stream)"))
+        self.assertIn("projected_ba.record_stream(main_stream)", project_source)
+        self.assertIn("g.record_stream(main_stream)", project_source)
+        self.assertIn("beta.record_stream(main_stream)", project_source)
+        self.assertNotIn("main_stream.wait_event(done_event)", project_source)
+
+        forward_start = model_source.index("    def forward(", project_start)
+        forward_end = model_source.index("    @staticmethod", forward_start)
+        forward_source = model_source[forward_start:forward_end]
+        self.assertLess(
+            forward_source.index("qwen35_causal_conv1d_decode_packed("),
+            forward_source.index("wait_event(side_done_event)"),
+        )
+
+        weight_source = (ROOT / "python/minisgl/models/weight.py").read_text()
+        for old_name, fused_name in (
+            ("in_proj_qkv", "in_proj_qkvz"),
+            ("in_proj_z", "in_proj_qkvz"),
+            ("in_proj_b", "in_proj_ba"),
+            ("in_proj_a", "in_proj_ba"),
+        ):
+            self.assertIn(f'".{old_name}": (".{fused_name}"', weight_source)
+
+        gdn_source = (ROOT / "python/minisgl/kernel/qwen35_gdn.py").read_text()
+        decode_start = gdn_source.index("def qwen35_gdn_decode(")
+        decode_end = gdn_source.index("\n\n__all__", decode_start)
+        decode_source = gdn_source[decode_start:decode_end]
+        self.assertNotIn("a = a.contiguous()", decode_source)
+        self.assertNotIn("b = b.contiguous()", decode_source)
+        self.assertIn("a.stride(0)", decode_source)
+        self.assertIn("b.stride(0)", decode_source)
+        kernel_start = gdn_source.index("def _qwen35_gdn_decode_kernel(")
+        kernel_end = gdn_source.index("\n\ndef qwen35_gdn_decode(", kernel_start)
+        kernel_source = gdn_source[kernel_start:kernel_end]
+        self.assertIn("token_idx * a_row_stride + value_head", kernel_source)
+        self.assertIn("token_idx * b_row_stride + value_head", kernel_source)
+        conv_start = gdn_source.index("def qwen35_causal_conv1d_decode_packed(")
+        conv_end = gdn_source.index("\n\ndef _qwen35_rmsnorm_gated(", conv_start)
+        conv_source = gdn_source[conv_start:conv_end]
+        self.assertIn("PACK_QKV=True", conv_source)
+        self.assertIn("q = packed[:q_elements]", conv_source)
+        self.assertIn("k = packed[q_elements : 2 * q_elements]", conv_source)
+        self.assertIn("v = packed[2 * q_elements", conv_source)
+        self.assertIn("q_norm_scale = torch.empty(", conv_source)
+        self.assertIn("COMPUTE_QK_SCALES=True", conv_source)
+        self.assertIn("z.stride(0)", gdn_source)
+
+        self.assertIn("HAS_QK_NORM_SCALES", kernel_source)
+        self.assertIn("q_norm_scale_ptr + norm_offset", kernel_source)
+        self.assertIn("k_norm_scale_ptr + norm_offset", kernel_source)
+        self.assertIn("HAS_PRECOMPUTED_GATES", kernel_source)
+        self.assertIn("g = tl.load(g_ptr + gate_offset)", kernel_source)
+        self.assertIn("beta = tl.load(beta_ptr + gate_offset)", kernel_source)
+        self.assertIn("delta = (v - memory) * beta", kernel_source)
+
+        self.assertIn("qwen35_rmsnorm_gated_fp8(", forward_source)
+        self.assertIn("self.out_proj.forward_fp8_prequant(", forward_source)
+        linear_source = (ROOT / "python/minisgl/layers/linear.py").read_text()
+        o_proj_start = linear_source.index("class LinearOProj(")
+        o_proj_end = linear_source.index("\n\nclass LinearRowParallel", o_proj_start)
+        o_proj_source = linear_source[o_proj_start:o_proj_end]
+        self.assertIn("output: torch.Tensor | None = None", o_proj_source)
+        self.assertIn("output=output", o_proj_source)
+        fp8_start = gdn_source.index("def _qwen35_rmsnorm_gated_fp8_kernel(")
+        fp8_end = gdn_source.index("\n\ndef qwen35_rmsnorm_gated(", fp8_start)
+        fp8_source = gdn_source[fp8_start:fp8_end]
+        self.assertIn("rounded = (normalized * gate).to(", fp8_source)
+        self.assertIn("scale.to(tl.int32, bitcast=True) >> 23", fp8_source)
+        self.assertIn("local_row_id.to(tl.int32) * 8", fp8_source)
 
     def test_trtllm_decode_matches_original_source_policy(self) -> None:
         path = ROOT / "python/minisgl/attention/trtllm.py"
@@ -548,12 +725,89 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn('lane_stream.wait_event(previous_compute_event)', runtime_source)
         self.assertIn('prepare_and_publish_qkv(next_round, compute_done_event)', runtime_source)
         self.assertIn('compute_done_event.record(lane_stream)', runtime_source)
+        self.assertIn("self._model_compute_turn = (", runtime_source)
+        self.assertIn("self._shared_expert_turns = (", runtime_source)
+        self.assertIn("self._shared_expert_norm_counters = (", runtime_source)
+        self.assertNotIn("MINISGL_AFD_QWEN_SHARED_EXPERT_OVERLAP", runtime_source)
+        self.assertNotIn("self._shared_expert_streams", runtime_source)
+        self.assertNotIn("extra_streams=", runtime_source)
+        moe_start = runtime_source.index("    def _run_model_moe")
+        moe_end = runtime_source.index("    def warmup_decode_graphs", moe_start)
+        moe_source = runtime_source[moe_start:moe_end]
+        shared_wait = moe_source.index("wait_turn(")
+        routed_start = moe_source.index("output = mega_moe.forward(")
+        self.assertLess(shared_wait, routed_start)
+        self.assertIn("shared_expert.forward_fp8_prequant(", moe_source)
+        self.assertNotIn("release_turn(\n                shared_ready_turn", moe_source)
+        self.assertIn("shared.record_stream(main_stream)", moe_source)
+        self.assertNotIn("torch.cuda.Event", moe_source)
+        self.assertNotIn("wait_event", moe_source)
+        self.assertIn(
+            "return output, shared, deferred_shared_gate", moe_source
+        )
+        overlap_shared_start = moe_source.index(
+            "shared = layer.mlp.shared_expert.forward_fp8_prequant("
+        )
+        overlap_shared_end = moe_source.index(
+            "output = mega_moe.forward(", overlap_shared_start
+        )
+        self.assertNotIn(
+            "qwen35_shared_output(",
+            moe_source[overlap_shared_start:overlap_shared_end],
+        )
+        self.assertIn(
+            "deferred_shared_gate = shared_gate_scale", moe_source
+        )
+        self.assertNotIn("output = output + shared", moe_source)
+        self.assertIn("pending_shared:", runtime_source)
+        self.assertIn("qwen35_shared_add_rmsnorm(", runtime_source)
+        exact_norm = runtime_source.index(
+            "layer.post_attention_layernorm.forward(",
+            runtime_source.index("if shared_expert_turns:"),
+        )
+        fused_shared_input = runtime_source.index(
+            "fp8_quant_shared_gate(", exact_norm
+        )
+        shared_call = runtime_source.index("self._run_model_moe(", fused_shared_input)
+        self.assertLess(exact_norm, fused_shared_input)
+        self.assertLess(fused_shared_input, shared_call)
+        self.assertIn("shared_input_fp8=shared_input_fp8", runtime_source)
         self.assertNotIn('pending_odd_combine', runtime_source)
         self.assertNotIn('cleanup_turn', runtime_source)
-        self.assertNotIn('wait_turn(', runtime_source)
         self.assertNotIn('cleanup_ready_events', runtime_source)
         self.assertNotIn('reset_sentinel', runtime_source)
         self.assertIn('"mb_exclusive_compute_ping_pong"', runtime_source)
+
+        qwen35_transport = (
+            ROOT / "python/minisgl/kernel/csrc/jit/qwen35_qkv_transport.cu"
+        ).read_text()
+        self.assertIn("release_peer_lane(params);", qwen35_transport)
+        self.assertEqual(qwen35_transport.count("release_peer_lane(params);"), 2)
+        self.assertIn("st.release.gpu.global.u64", qwen35_transport)
+        norm_quant_source = (
+            ROOT / "python/minisgl/kernel/csrc/jit/fp8_quant_shared_gate.cu"
+        ).read_text()
+        self.assertNotIn("residual", norm_quant_source)
+        self.assertIn("const __nv_bfloat16* x_row", norm_quant_source)
+        self.assertIn("atomicAdd(completion_counter, 1u)", norm_quant_source)
+        self.assertIn("st.release.gpu.global.u64", norm_quant_source)
+        self.assertIn("template <int kGroupsPerWarp>", norm_quant_source)
+        self.assertNotIn("#pragma unroll 1", norm_quant_source)
+        self.assertIn("shared_gate_sum += value", norm_quant_source)
+        self.assertIn(
+            "shared_gate_scale[row] = __float2bfloat16_rn", norm_quant_source
+        )
+        self.assertIn("shared_gate_scale=shared_gate_scale", runtime_source)
+        self.assertIn("shared_gate=pending_shared_gate[mb]", runtime_source)
+        self.assertIn("shared_scale = load_bf16_shared_scale", qwen35_transport)
+        self.assertIn("const __nv_bfloat16 scaled_shared", qwen35_transport)
+        self.assertNotIn("expf(", qwen35_transport)
+        self.assertIn("const __nv_bfloat16 gate_logit", norm_quant_source)
+        self.assertIn("expf(-gate_value)", norm_quant_source)
+        self.assertLess(
+            norm_quant_source.index('"st.release.gpu.global.u64'),
+            norm_quant_source.index("expf(-gate_value)"),
+        )
         self.assertNotIn("mb3", runtime_source.lower())
         self.assertNotIn("self.num_mb not in (1, 2)", runtime_source)
         self.assertEqual(runtime_source.count("retained_batch: Any"), 2)
@@ -631,8 +885,12 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertEqual(source.count("single_ready and edges.unwrap() == 1"), 5)
         self.assertIn("publish_qkv_kernel<kHeadDim, true, true>", source)
         self.assertIn("publish_qkv_kernel<kHeadDim, false, false>", source)
-        self.assertIn("publish_o_kernel<kHeadDim, true, true>", source)
-        self.assertIn("publish_o_kernel_release_turn<kHeadDim, true, true>", source)
+        self.assertIn("publish_o_kernel<kHeadDim, true, true, true>", source)
+        self.assertIn(
+            "publish_o_kernel_release_turn<kHeadDim, true, true, true>", source
+        )
+        self.assertIn("__float2bfloat16_rn", source)
+        self.assertIn("expf(-gate_value)", source)
         self.assertIn("publish_o_fp8_kernel<kHeadDim, true, true>", source)
         self.assertIn(
             "publish_o_fp8_kernel_release_turn<kHeadDim, true, true>", source
@@ -843,6 +1101,25 @@ class GB200OverlapContractTests(unittest.TestCase):
             kernel_source,
         )
         self.assertIn("st_release_sys", kernel_source)
+        self.assertIn(
+            "if constexpr (kNumTopk == 10 and kHidden == 4096)",
+            kernel_source,
+        )
+        self.assertIn(
+            "kNumTopk * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE",
+            kernel_source,
+        )
+        self.assertIn("combine_barriers[topk_idx], kNumHiddenBytes", kernel_source)
+        self.assertIn(
+            "combine_barriers[topk_idx]->wait(combine_phase)", kernel_source
+        )
+        self.assertIn("uint4 contributions[kNumTopk] = {};", kernel_source)
+        self.assertIn("float2 pair_sums[5];", kernel_source)
+        self.assertIn(
+            "reinterpret_cast<uint4*>(y)[\n"
+            "                        static_cast<uint64_t>(token_idx) * kNumUint4 +",
+            kernel_source,
+        )
 
         scheduler_source = (
             ROOT / "python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/"
@@ -861,6 +1138,9 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("atom_add_acqrel_gpu", router_source)
         self.assertIn("atomic_add_rel_sys(remote_route_ready", router_source)
         self.assertIn("atomic_add_rel_sys(remote_recv_sum", router_source)
+        self.assertEqual(
+            router_source.count("if (!defer_route_dependent_launch)"), 2
+        )
 
         adapter_source = (
             ROOT / "python/minisgl/moe/megamoe_afd.py"
@@ -877,6 +1157,10 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("rank_gated_combine=True", adapter_source)
         self.assertIn("route_ready_dispatch=routes_prepared", adapter_source)
         self.assertIn("rank_ready_route_publish=routes_prepared", adapter_source)
+        self.assertIn(
+            "defer_route_dependent_launch=self.defer_route_dependent_launch",
+            adapter_source,
+        )
 
         wrapper_source = (
             ROOT / "python/minisgl/kernel/megamoe_mega.py"
@@ -911,6 +1195,18 @@ class GB200OverlapContractTests(unittest.TestCase):
             ROOT / "python/minisgl/kernel/megamoe_m2n_mega.py"
         ).read_text()
         self.assertIn("def requant_qwen_fp8_weights_to_fp4(", weight_source)
+        self.assertIn("class Mxfp4ExpertWeightLoader", weight_source)
+        self.assertIn("def prepare_mxfp4_weights(", weight_source)
+        self.assertIn("packed_scale.to(torch.int32) << 23", weight_source)
+
+        m2n_adapter_source = (
+            ROOT / "python/minisgl/moe/megamoe_m2n_afd.py"
+        ).read_text()
+        self.assertIn("self._weight_loader.load_layer(", m2n_adapter_source)
+        self.assertEqual(
+            m2n_adapter_source.count("use_fp8_weights=self.use_fp8_weights"), 3
+        )
+        self.assertIn('self.precision = "fp8_fp8" if', m2n_adapter_source)
 
         m2n_kernel_source = (
             ROOT / "python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/"
@@ -957,6 +1253,10 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("megamoe_m2n requires legacy placement", campaign)
         self.assertIn("afd_moe_backend=%s", campaign)
         self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", campaign)
+        self.assertIn("MINISGL_MEGAMOE_EXPERT_WEIGHT_PATH", campaign)
+        self.assertIn("Qwen3.5-397B-A17B-FP8-MXFP4-MoE", campaign)
+        self.assertIn("attn-only:megamoe", campaign)
+        self.assertIn("legacy:megamoe_m2n", campaign)
         self.assertIn("FASTAFD_CASE_ID must identify the shape", campaign)
         self.assertIn('--case-id "$CASE_ID"', campaign)
         self.assertNotIn("CASE_ID=single", campaign)
@@ -1015,6 +1315,66 @@ class GB200OverlapContractTests(unittest.TestCase):
             ROOT / "python/minisgl/kernel/csrc/jit/afd_fmha_transport.cu"
         ).read_text()
         self.assertNotIn("printf(", transport_source)
+        self.assertIn("release_turn_kernel", transport_source)
+        self.assertIn("signal_direct_o_release_turn_kernel", transport_source)
+        self.assertIn("__threadfence_system()", transport_source)
+
+        attention_start = runtime_source.index("    def run_attention_fmha(")
+        attention_end = runtime_source.index(
+            "    def receive_attention_o(", attention_start
+        )
+        attention_source = runtime_source[attention_start:attention_end]
+        for marker in (
+            "Make the next microbatch runnable",
+            "Qwen3.5 has no O quantization dependency",
+        ):
+            ordering_source = attention_source[
+                attention_source.index(marker) :
+            ]
+            self.assertLess(
+                ordering_source.index("release_turn("),
+                ordering_source.index("publish_o("),
+            )
+        self.assertNotIn("publish_o_release_turn(", attention_source)
+        self.assertIn("self._direct_linear_o_output(", attention_source)
+        self.assertIn("signal_direct_o_release_turn(", attention_source)
+
+        qwen35_transport = (
+            ROOT / "python/minisgl/kernel/csrc/jit/qwen35_qkv_transport.cu"
+        ).read_text()
+        self.assertIn("normalize_and_rope", qwen35_transport)
+        self.assertIn("params.q_gate", qwen35_transport)
+        self.assertIn("qwen35_publish_linear_input_kernel", qwen35_transport)
+        self.assertIn("qwen35_shared_add_rmsnorm_kernel", qwen35_transport)
+        self.assertIn("params.has_shared", qwen35_transport)
+        self.assertIn("params.residual", qwen35_transport)
+        self.assertIn("__threadfence_system()", qwen35_transport)
+        self.assertNotIn("printf(", qwen35_transport)
+
+        publish_start = runtime_source.index("    def publish_model_qkv(")
+        publish_end = runtime_source.index("    def prepare_model_qkv(", publish_start)
+        publish_source = runtime_source[publish_start:publish_end]
+        self.assertIn("if self.is_hybrid_attention:", publish_source)
+        self.assertIn("self.publish_qwen35_full_attention_qkv(", publish_source)
+        # Qwen3 retains its established preparation and generic publisher.
+        self.assertIn("q, k, v = self.prepare_model_qkv", publish_source)
+        self.assertIn("self.publish_model_qkv_payload(", publish_source)
+
+        ping_pong_start = runtime_source.index(
+            "        def prepare_and_publish_qkv("
+        )
+        ping_pong_end = runtime_source.index(
+            "        total_rounds =", ping_pong_start
+        )
+        ping_pong_source = runtime_source[ping_pong_start:ping_pong_end]
+        linear_start = ping_pong_source.index(
+            "self.publish_qwen35_linear_attention_input("
+        )
+        handoff_start = ping_pong_source.rfind(
+            "handoff_event.record", 0, linear_start
+        )
+        self.assertNotEqual(handoff_start, -1)
+        self.assertLess(handoff_start, linear_start)
 
 
 if __name__ == "__main__":

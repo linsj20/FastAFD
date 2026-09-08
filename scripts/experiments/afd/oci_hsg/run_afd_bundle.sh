@@ -298,12 +298,15 @@ PY
         continue
     fi
 
-    IFS=$'\t' read -r case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays case_memory_ratio case_num_pages case_kv_capacity case_require_capacity_max case_expert_weight_dtype < <(
+    IFS=$'\t' read -r case_model case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays case_memory_ratio case_num_pages case_kv_capacity case_require_capacity_max case_expert_weight_dtype case_perf_mode case_perf_context_len case_perfect_routing case_perf_state_source < <(
         python3 - "$action" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
 r = c["case"]
-expected = f"qwen3 {r['context_spec']} {r['batch_per_attention_dp_lane']} {r['normalized_af_ratio']}:1 {r['attention_tp']} {r['ffn_ep']}"
+argv = r["run_afd_argv"].split()
+if len(argv) != 6 or argv[0] not in {"qwen3", "qwen35", "minimax"}:
+    raise SystemExit("run_afd_argv must contain a supported model and five arguments")
+expected = f"{argv[0]} {r['context_spec']} {r['batch_per_attention_dp_lane']} {r['normalized_af_ratio']}:1 {r['attention_tp']} {r['ffn_ep']}"
 if r["run_afd_argv"] != expected:
     raise SystemExit("run_afd_argv drift")
 memory = [
@@ -317,10 +320,26 @@ if precision not in ("fp8", "fp4"):
     raise SystemExit("per-case MegaMoE expert weight dtype must be fp8 or fp4")
 if not c["case_id"].endswith(f"-{precision}"):
     raise SystemExit("case_id must end with its MegaMoE expert weight dtype")
+perf = [
+    r.get("afd_perf_mode", ""), r.get("afd_perf_context_len", ""),
+    r.get("perfect_routing", ""), r.get("perf_state_source", ""),
+]
+if not all(perf):
+    raise SystemExit("per-case AFD perf contract is incomplete")
+if r["afd_perf_mode"] not in ("0", "1"):
+    raise SystemExit("per-case afd_perf_mode must be 0 or 1")
+if not r["afd_perf_context_len"].isdigit():
+    raise SystemExit("per-case afd_perf_context_len must be a positive integer")
+if int(r["afd_perf_context_len"]) != int(r["isl_tokens"]):
+    raise SystemExit("per-case perf context must equal the fixed ISL")
+if r["perfect_routing"] not in ("0", "1"):
+    raise SystemExit("per-case perfect_routing must be 0 or 1")
+if r["afd_perf_mode"] == "1" and r["perf_state_source"] != "randomized_resident_kv_and_gdn":
+    raise SystemExit("perf mode requires randomized resident KV and GDN state")
 print("\t".join([
-    c["case_id"], r["context_spec"], r["batch_per_attention_dp_lane"],
+    argv[0], c["case_id"], r["context_spec"], r["batch_per_attention_dp_lane"],
     r["normalized_af_ratio"], r["attention_tp"], r["ffn_ep"],
-    r["prompt_mode"], r["allocated_trays"], *memory, precision,
+    r["prompt_mode"], r["allocated_trays"], *memory, precision, *perf,
 ]))
 PY
     )
@@ -330,6 +349,12 @@ PY
     [[ "$case_kv_capacity" =~ ^[1-9][0-9]*$ ]]
     [[ "$case_require_capacity_max" == 0 || "$case_require_capacity_max" == 1 ]]
     [[ "$case_expert_weight_dtype" == fp8 || "$case_expert_weight_dtype" == fp4 ]]
+    [[ "$case_perf_mode" == 0 || "$case_perf_mode" == 1 ]]
+    [[ "$case_perf_context_len" == "$context" ]]
+    [[ "$case_perfect_routing" == 0 || "$case_perfect_routing" == 1 ]]
+    if [[ "$case_perf_mode" == 1 ]]; then
+        [[ "$case_perf_state_source" == randomized_resident_kv_and_gdn ]]
+    fi
     if [[ "$case_num_pages" == none ]]; then
         case_num_pages=""
     fi
@@ -375,14 +400,15 @@ PY
         FASTAFD_AFD_KV_CAPACITY_TOKENS="$case_kv_capacity" \
         FASTAFD_AFD_MODEL_PLACEMENT="$MODEL_PLACEMENT" \
         FASTAFD_AFD_NUM_MB="$case_num_mb" \
+        FASTAFD_AFD_PERF_MODE="$case_perf_mode" \
         MINISGL_AFD_MOE_BACKEND="$MOE_BACKEND" \
-        MINISGL_AFD_PERFECT_ROUTING="$PERFECT_ROUTING" \
+        MINISGL_AFD_PERFECT_ROUTING="$case_perfect_routing" \
         FASTAFD_PROMPT_BASE_FILE="$PROMPT_BASE_FILE" \
         FASTAFD_PROMPT_CACHE_ROOT="$PROMPT_CACHE_ROOT" \
         MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$case_expert_weight_dtype" \
         PROMPT_MODE="$prompt_mode" \
         RUN_DIR="$run_dir" JOB_SCRIPT="$CASE_RUNNER" \
-        bash "$CASE_RUNNER" qwen3 "$context" "$batch" "$ratio:1" "$attention_tp" "$ffn_ep"
+        bash "$CASE_RUNNER" "$case_model" "$context" "$batch" "$ratio:1" "$attention_tp" "$ffn_ep"
     case_exit=$?
     set -e
     printf '%s\n' "$case_exit" > "$status_dir/rank-$RANK.exit"

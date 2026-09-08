@@ -136,14 +136,14 @@ public:
     }
 
     template <typename Args>
-    static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args) {
+    static void launch(const std::shared_ptr<KernelRuntime>& kernel_runtime, const Args& args,
+                       const bool force_pdl = false) {
         const auto kernel = kernel_runtime->kernel;
         const auto stream = at::cuda::getCurrentCUDAStream();
         LaunchArgs launch_args = args.launch_args;
 
-        // Allow runtime override from Python.
-        // NOTES: the default is enabled.
-        launch_args.enable_pdl = device_runtime->get_pdl();
+        // Allow either a scoped call-site request or the global Python opt-in.
+        launch_args.enable_pdl = force_pdl or device_runtime->get_pdl();
 
         const dim3 grid_dim = {static_cast<unsigned>(launch_args.grid_dim.first),
                                static_cast<unsigned>(launch_args.grid_dim.second),

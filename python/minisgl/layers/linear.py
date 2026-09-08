@@ -230,6 +230,7 @@ class _LinearTPImpl(BaseOP):
         *,
         output_shape_prefix: tuple[int, ...],
         output_dtype: torch.dtype = torch.bfloat16,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run an FP8 dense linear from an already quantized activation.
 
@@ -244,11 +245,29 @@ class _LinearTPImpl(BaseOP):
         from minisgl.kernel import deepgemm as deep_gemm
 
         weight, weight_scale = self._fp8_weight_for_deepgemm()
-        output = torch.empty(
-            (input_fp8.size(0), weight.size(0)),
-            dtype=torch.bfloat16,
-            device=input_fp8.device,
-        )
+        output_shape = (input_fp8.size(0), weight.size(0))
+        if output is not None and self.bias is not None:
+            raise RuntimeError(
+                "caller-owned FP8 linear output does not support a separate bias"
+            )
+        if output is None:
+            output = torch.empty(
+                output_shape,
+                dtype=torch.bfloat16,
+                device=input_fp8.device,
+            )
+        elif (
+            tuple(output.shape) != output_shape
+            or output.dtype != torch.bfloat16
+            or not output.is_cuda
+            or not output.is_contiguous()
+        ):
+            raise ValueError(
+                "forward_fp8_prequant output must be a contiguous BF16 tensor "
+                f"with shape {output_shape} in CUDA memory, got "
+                f"shape={tuple(output.shape)} dtype={output.dtype} "
+                f"device={output.device} contiguous={output.is_contiguous()}"
+            )
         deep_gemm.fp8_gemm_nt(
             (input_fp8, input_scale),
             (weight, weight_scale),
@@ -398,6 +417,7 @@ class LinearOProj(_LinearTPImpl):
         *,
         output_shape_prefix: tuple[int, ...],
         output_dtype: torch.dtype = torch.bfloat16,
+        output: torch.Tensor | None = None,
         skip_allreduce: bool = False,
     ) -> torch.Tensor:
         y = super().forward_fp8_prequant(
@@ -405,6 +425,7 @@ class LinearOProj(_LinearTPImpl):
             input_scale,
             output_shape_prefix=output_shape_prefix,
             output_dtype=output_dtype,
+            output=output,
         )
         if self._tp_size > 1 and not skip_allreduce:
             y = self._comm.all_reduce(y)
