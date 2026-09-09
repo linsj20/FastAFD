@@ -17,6 +17,20 @@
 #include <deep_gemm/ptx/tma.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+#ifdef IKET_BUILD_ENABLED
+#define IKET_DEFAULT_INSTR_METHOD_WITHOUT_PAYLOAD_PMTRIG5
+#include <iket/iket_device_apis.cuh>
+CREATE_IKET_MARKER(MegaDispatchStart);
+CREATE_IKET_MARKER(MegaDispatchEnd);
+CREATE_IKET_MARKER(MegaComputeStart);
+CREATE_IKET_MARKER(MegaComputeEnd);
+CREATE_IKET_MARKER(MegaCombineStart);
+CREATE_IKET_MARKER(MegaCombineEnd);
+#define MEGAMOE_IKET_MARK(name) IKET_MARK(name)
+#else
+#define MEGAMOE_IKET_MARK(name) ((void)0)
+#endif
+
 namespace deep_gemm {
 
 namespace mega_detail {
@@ -124,6 +138,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
+    if (warp_idx < kNumDispatchWarps)
+        MEGAMOE_IKET_MARK(MegaDispatchStart);
     const bool do_timing_leader =
         kEnableDebugTiming and sm_idx == 0 and lane_idx == 0;
     const unsigned long long kernel_t0 =
@@ -693,6 +709,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
 
+            // Start the independent routing-weight read before the SF wait.
+            // All lanes address the same word, so this is one coalesced read.
+            // Keep the request above the warp synchronization at the PTX level.
+            const auto remote_weight_ptr = sym_buffer.map(
+                input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
+                current_rank_in_expert_idx);
+            float weight;
+            asm volatile("ld.global.f32 %0, [%1];" : "=f"(weight)
+                         : "l"(remote_weight_ptr) : "memory");
+
             // Load and store SF (overlaps with TMA token load)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
@@ -713,10 +739,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Store weights and token data
             const uint32_t pool_token_idx = expert_pool_block_offset * BLOCK_M + token_idx_in_expert;
             if (cute::elect_one_sync()) {
-                // Load weights
-                const auto weight = *sym_buffer.map(
-                    input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
                 *l1_topk_weights_buffer.get_data_buffer(pool_token_idx).get_base_ptr<float>() = weight;
 
                 // Wait for TMA token load to complete
@@ -747,6 +769,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 clock64() - timing_t0);
             timing_t0 = clock64();
         }
+
+        MEGAMOE_IKET_MARK(MegaDispatchEnd);
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -1103,6 +1127,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Wait TMA load completion
                     wait_t0 = do_timing_mma_leader ? clock64() : 0;
                     full_barriers[stage_idx]->wait(phase);
+#ifdef IKET_BUILD_ENABLED
+                    if (current_iter_idx == 1 and k_block_idx == 0)
+                        MEGAMOE_IKET_MARK(MegaComputeStart);
+#endif
                     if (do_timing_mma_leader) {
                         const auto wait_cycles = clock64() - wait_t0;
                         full_wait_cycles += wait_cycles;
@@ -1237,6 +1265,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             const unsigned long long wait_t0 =
                 do_timing_epi_leader ? clock64() : 0;
             tmem_full_barriers[accum_stage_idx]->wait(accum_phase);
+            // The accumulator is complete here, not when the MMA issue warp
+            // exits. Keep every L2 tile; the analyzer takes the final event.
+            if (block_phase == sched::BlockPhase::Linear2)
+                MEGAMOE_IKET_MARK(MegaComputeEnd);
             if (do_timing_epi_leader)
                 tmem_full_wait_cycles += clock64() - wait_t0;
             ptx::tcgen05_after_thread_sync();
@@ -1438,6 +1470,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     do_timing_epi_leader ? clock64() : 0;
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
+                // This phase includes BF16 packing, remote writes, readiness,
+                // and source-side reduction; it overlaps later compute tiles.
+                MEGAMOE_IKET_MARK(MegaCombineStart);
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     // Early break if the entire store block is beyond the valid token range
@@ -1593,14 +1628,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const unsigned long long combine_t0 =
             do_timing_epi_leader ? clock64() : 0;
 
-        if constexpr (kNumTopk == 10 and kHidden == 4096) {
-            // Match TRT-LLM's small-batch combine geometry: one CTA owns one
-            // token, issues all top-k TMA loads back-to-back, and reduces the
-            // ten resident contributions with a shallow pairwise tree. The
-            // former one-warp/token path leaves only three CTAs active at hard
-            // MB2 rows 18/19 and serializes ten accumulator updates. Direct
-            // per-thread remote loads were also slower; keep TMA as the bulk
-            // movement engine while increasing token-level parallelism.
+        // A warp cannot represent EP>32 with one rank bit per lane. In those
+        // worlds let each valid top-k lane acquire its own producer instead.
+        // Duplicate producer acquires are harmless; every contributing slot
+        // is ordered before the warp/CTA proceeds to bulk loads.
+        const auto wait_combine_producer = [&](const int expert_rank_idx,
+                                               const uint32_t token_idx) {
+            if (expert_rank_idx >= 0) {
+                constexpr int64_t kNumTimeoutCycles = 300ll * 2000000000ll;
+                const auto ready_epoch_ptr =
+                    workspace.get_combine_ready_epoch_ptr(expert_rank_idx);
+                const auto start_clock = clock64();
+                while (ptx::ld_acq_sys(ready_epoch_ptr) != combine_ready_epoch) {
+                    if (clock64() - start_clock >= kNumTimeoutCycles) {
+                        printf("MegaMoE producer combine timeout (300s): rank=%d token=%d expert_rank=%d ready=%llu target=%llu\n",
+                               sym_buffer.rank_idx, token_idx, expert_rank_idx,
+                               static_cast<unsigned long long>(ptx::ld_acq_sys(ready_epoch_ptr)),
+                               static_cast<unsigned long long>(combine_ready_epoch));
+                        DG_DEVICE_ASSERT(false and "Producer combine timeout");
+                    }
+                }
+            }
+        };
+
+        if constexpr ((kNumTopk == 8 or kNumTopk == 10) and kHidden == 4096) {
+            // Small-batch combine geometry: one CTA owns one token, issues all
+            // top-k TMA loads back-to-back, and reduces the resident
+            // contributions in the original slot order for top-k 8. The former
+            // one-warp/token path leaves only three CTAs active at 24 rows.
+            // Direct per-thread remote
+            // loads were also slower; keep TMA as the bulk movement engine
+            // while increasing token-level parallelism.
             constexpr uint32_t kNumUint4 = kNumHiddenBytes / sizeof(uint4);
             DG_STATIC_ASSERT(
                 kNumTopk <= kNumEpilogueWarps * 2,
@@ -1630,26 +1688,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             ? stored_expert_idx /
                                   static_cast<int>(kNumExpertsPerRank)
                             : -1;
-                        uint32_t required_rank_mask = 0;
-                        #pragma unroll
-                        for (uint32_t rank_idx = 0;
-                             rank_idx < kNumRanks;
-                             ++rank_idx) {
-                            if (__any_sync(
-                                    0xffffffff,
-                                    expert_rank_idx ==
-                                        static_cast<int>(rank_idx)))
-                                required_rank_mask |= 1u << rank_idx;
+                        if constexpr (kNumRanks > 32) {
+                            wait_combine_producer(expert_rank_idx, token_idx);
+                        } else {
+                            uint32_t required_rank_mask = 0;
+                            #pragma unroll
+                            for (uint32_t rank_idx = 0;
+                                 rank_idx < kNumRanks;
+                                 ++rank_idx) {
+                                if (__any_sync(
+                                        0xffffffff,
+                                        expert_rank_idx ==
+                                            static_cast<int>(rank_idx)))
+                                    required_rank_mask |= 1u << rank_idx;
+                            }
+                            if (lane_idx == 0)
+                                combine_masks[1] = required_rank_mask;
                         }
-                        if (lane_idx == 0)
-                            combine_masks[1] = required_rank_mask;
                     }
                 }
                 ptx::sync_aligned(
                     kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 const uint32_t total_mask = combine_masks[0];
 
-                if constexpr (kRankGatedCombine) {
+                if constexpr (kRankGatedCombine and kNumRanks <= 32) {
                     const uint32_t required_rank_mask = combine_masks[1];
                     if (epilogue_warp_idx == 0 and lane_idx < kNumRanks and
                         (required_rank_mask & (1u << lane_idx)) != 0) {
@@ -1733,28 +1795,45 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t element = 0;
                          element < kNumBF16x2;
                          ++element) {
-                        float2 pair_sums[5];
-                        #pragma unroll
-                        for (uint32_t pair = 0; pair < 5; ++pair) {
-                            const auto lhs = __bfloat1622float2(
-                                reinterpret_cast<const nv_bfloat162*>(
-                                    &contributions[pair * 2])[element]);
-                            const auto rhs = __bfloat1622float2(
-                                reinterpret_cast<const nv_bfloat162*>(
-                                    &contributions[pair * 2 + 1])[element]);
-                            pair_sums[pair] =
-                                make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
+                        if constexpr (kNumTopk == 8) {
+                            // Match the original warp combine exactly: start at
+                            // +0 and accumulate valid slots in ascending order.
+                            float2 reduced = {};
+                            #pragma unroll
+                            for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                if ((total_mask & (1u << slot)) != 0) {
+                                    ptx::accumulate(
+                                        reduced,
+                                        reinterpret_cast<const nv_bfloat162*>(
+                                            &contributions[slot])[element]);
+                                }
+                            }
+                            casted_bf16[element] =
+                                __float22bfloat162_rn(reduced);
+                        } else {
+                            float2 pair_sums[5];
+                            #pragma unroll
+                            for (uint32_t pair = 0; pair < 5; ++pair) {
+                                const auto lhs = __bfloat1622float2(
+                                    reinterpret_cast<const nv_bfloat162*>(
+                                        &contributions[pair * 2])[element]);
+                                const auto rhs = __bfloat1622float2(
+                                    reinterpret_cast<const nv_bfloat162*>(
+                                        &contributions[pair * 2 + 1])[element]);
+                                pair_sums[pair] =
+                                    make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
+                            }
+                            pair_sums[0].x += pair_sums[1].x;
+                            pair_sums[0].y += pair_sums[1].y;
+                            pair_sums[2].x += pair_sums[3].x;
+                            pair_sums[2].y += pair_sums[3].y;
+                            pair_sums[0].x += pair_sums[2].x;
+                            pair_sums[0].y += pair_sums[2].y;
+                            pair_sums[0].x += pair_sums[4].x;
+                            pair_sums[0].y += pair_sums[4].y;
+                            casted_bf16[element] =
+                                __float22bfloat162_rn(pair_sums[0]);
                         }
-                        pair_sums[0].x += pair_sums[1].x;
-                        pair_sums[0].y += pair_sums[1].y;
-                        pair_sums[2].x += pair_sums[3].x;
-                        pair_sums[2].y += pair_sums[3].y;
-                        pair_sums[0].x += pair_sums[2].x;
-                        pair_sums[0].y += pair_sums[2].y;
-                        pair_sums[0].x += pair_sums[4].x;
-                        pair_sums[0].y += pair_sums[4].y;
-                        casted_bf16[element] =
-                            __float22bfloat162_rn(pair_sums[0]);
                     }
                     reinterpret_cast<uint4*>(y)[
                         static_cast<uint64_t>(token_idx) * kNumUint4 +
@@ -1820,37 +1899,39 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const int expert_rank_idx = stored_expert_idx >= 0
                     ? stored_expert_idx / static_cast<int>(kNumExpertsPerRank)
                     : -1;
-                uint32_t required_rank_mask = 0;
-                #pragma unroll
-                for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
-                    if (__any_sync(0xffffffff,
-                                   expert_rank_idx == static_cast<int>(rank_idx)))
-                        required_rank_mask |= 1u << rank_idx;
-                }
-                if (lane_idx < kNumRanks and
-                    (required_rank_mask & (1u << lane_idx)) != 0) {
-                    constexpr int64_t kNumTimeoutCycles =
-                        300ll * 2000000000ll;
-                    const auto ready_epoch_ptr =
-                        workspace.get_combine_ready_epoch_ptr(lane_idx);
-                    const auto start_clock = clock64();
-                    while (ptx::ld_acq_sys(ready_epoch_ptr) !=
-                           combine_ready_epoch) {
-                        if (clock64() - start_clock >= kNumTimeoutCycles) {
-                            printf("MegaMoE rank-gated combine timeout (300s): rank=%d token=%d expert_rank=%d ready=%llu target=%llu\n",
-                                   sym_buffer.rank_idx, token_idx, lane_idx,
-                                   static_cast<unsigned long long>(
-                                       ptx::ld_acq_sys(ready_epoch_ptr)),
-                                   static_cast<unsigned long long>(
-                                       combine_ready_epoch));
-                            DG_DEVICE_ASSERT(false and
-                                "Rank-gated combine timeout");
+                if constexpr (kNumRanks > 32) {
+                    wait_combine_producer(expert_rank_idx, token_idx);
+                } else {
+                    uint32_t required_rank_mask = 0;
+                    #pragma unroll
+                    for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx) {
+                        if (__any_sync(0xffffffff,
+                                       expert_rank_idx == static_cast<int>(rank_idx)))
+                            required_rank_mask |= 1u << rank_idx;
+                    }
+                    if (lane_idx < kNumRanks and
+                        (required_rank_mask & (1u << lane_idx)) != 0) {
+                        constexpr int64_t kNumTimeoutCycles =
+                            300ll * 2000000000ll;
+                        const auto ready_epoch_ptr =
+                            workspace.get_combine_ready_epoch_ptr(lane_idx);
+                        const auto start_clock = clock64();
+                        while (ptx::ld_acq_sys(ready_epoch_ptr) !=
+                               combine_ready_epoch) {
+                            if (clock64() - start_clock >= kNumTimeoutCycles) {
+                                printf("MegaMoE rank-gated combine timeout (300s): rank=%d token=%d expert_rank=%d ready=%llu target=%llu\n",
+                                       sym_buffer.rank_idx, token_idx, lane_idx,
+                                       static_cast<unsigned long long>(
+                                           ptx::ld_acq_sys(ready_epoch_ptr)),
+                                       static_cast<unsigned long long>(
+                                           combine_ready_epoch));
+                                DG_DEVICE_ASSERT(false and
+                                    "Rank-gated combine timeout");
+                            }
                         }
                     }
                 }
-                // Only the first kNumRanks lanes perform epoch waits. Keep the
-                // remaining lanes from issuing combine loads until those
-                // dependencies are visible.
+                // All producer acquires must finish before combine loads.
                 __syncwarp();
             }
 
@@ -1935,6 +2016,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
         }
+        MEGAMOE_IKET_MARK(MegaCombineEnd);
         if (do_timing_epi_leader)
             mega_detail::timing_store(
                 debug_timings, mega_detail::TimingSlot::Combine,
@@ -1947,3 +2029,5 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 }
 
 } // namespace deep_gemm
+
+#undef MEGAMOE_IKET_MARK

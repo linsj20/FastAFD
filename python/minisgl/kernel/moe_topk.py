@@ -132,6 +132,11 @@ def gate_topk(
     ranks, aligned token capacity, MegaMoE SMs, rank-ready publication) groups
     and remotely publishes the selected routes before MegaMoE starts.
 
+    ``num_token_non_padded`` is a scalar valid-prefix count, or a CUDA tensor
+    [total_real_tokens, compact_index_for_each_row], with -1 for padding.
+    For [RRRP][RRRP], this is [6, 0, 1, 2, -1, 3, 4, 5, -1]. The CPU
+    prepares the map once per step; the GPU does no source-span arithmetic.
+
     ``defer_route_dependent_launch`` retains the route-ready protocol but lets
     CUDA release the dependent MegaMoE launch when the selector completes.
     This gives a peer-lane shared-expert tail launch priority in Qwen3.5's
@@ -439,6 +444,7 @@ def _valid_token_count_tensor(
     device: torch.device,
     num_tokens: int,
 ) -> torch.Tensor:
+    """Normalize a scalar count or CPU-prepared row map without a GPU read."""
     if num_token_non_padded is None:
         return _empty_valid_count(device)
     if isinstance(num_token_non_padded, int):
@@ -446,14 +452,15 @@ def _valid_token_count_tensor(
             return _empty_valid_count(device)
         return torch.tensor([num_token_non_padded], dtype=torch.int64, device=device)
     assert num_token_non_padded.is_cuda, "num_token_non_padded must be on CUDA"
-    if num_token_non_padded.numel() != 1:
+    count_size = num_token_non_padded.numel()
+    if count_size not in (1, num_tokens + 1):
         raise RuntimeError(
-            "num_token_non_padded tensor must contain one element, "
-            f"got shape={tuple(num_token_non_padded.shape)}"
+            "valid-token metadata must be a scalar or [total, row map], "
+            f"got counts={count_size} rows={num_tokens}"
         )
     if num_token_non_padded.dtype != torch.int64:
         num_token_non_padded = num_token_non_padded.to(torch.int64)
-    return num_token_non_padded.reshape(1)
+    return num_token_non_padded.reshape(count_size).contiguous()
 
 
 def topk_softmax_group_local(

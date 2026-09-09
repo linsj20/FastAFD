@@ -1,9 +1,11 @@
-"""Four-GPU correctness and exact-Qwen-shape smoke for same-rank MegaMoE."""
+"""Correctness and exact-Qwen-shape smoke for same-rank MegaMoE."""
 
 from __future__ import annotations
 
 import json
+import math
 import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -15,6 +17,50 @@ from minisgl.kernel import megamoe_mega
 from minisgl.kernel import megamoe_m2n_mega as weight_utils
 from minisgl.kernel.fp8_quant import per_token_cast_to_fp8
 from minisgl.kernel.moe_topk import gate_topk
+
+
+def _check_source_results(case: str, rank: int, **values: Any) -> None:
+    """Compare raw tensor bytes across source trees, outside timed regions."""
+    root = os.environ.get("MEGAMOE_RESULT_REFERENCE_DIR", "")
+    mode = os.environ.get("MEGAMOE_RESULT_MODE", "")
+    if not root and not mode:
+        return
+    if not root or mode not in ("record", "compare"):
+        raise RuntimeError("result comparison requires a directory and record/compare mode")
+    tensors: dict[str, torch.Tensor] = {}
+
+    def collect(name: str, value: Any) -> None:
+        if isinstance(value, torch.Tensor):
+            tensors[name] = value.detach().cpu().contiguous()
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                collect(f"{name}.{index}", item)
+        else:
+            raise TypeError(f"unsupported result snapshot value: {name}")
+
+    for name, value in values.items():
+        collect(name, value)
+    path = Path(root) / f"{case}_rank{rank}.pt"
+    if mode == "record":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Never silently replace the control with candidate data.
+        with path.open("xb") as stream:
+            torch.save(tensors, stream)
+    else:
+        reference = torch.load(path, map_location="cpu", weights_only=True)
+        if reference.keys() != tensors.keys():
+            raise RuntimeError(f"result snapshot keys differ: {path}")
+        for name, actual in tensors.items():
+            expected = reference[name]
+            if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                raise RuntimeError(f"result metadata differs: {path} tensor={name}")
+            different = actual.view(torch.uint8) != expected.view(torch.uint8)
+            if different.any():
+                raise RuntimeError(
+                    f"result bytes differ: {path} tensor={name} "
+                    f"mismatched_bytes={int(different.sum())}"
+                )
+    print(f"MEGAMOE_RESULT_{mode.upper()}_OK case={case} rank={rank}", flush=True)
 
 
 _MEGAMOE_TIMING_SLOTS = (
@@ -74,6 +120,11 @@ def _time_graph(
         graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
+    profiler_range = int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0"))
+    if profiler_range not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE must be 0 or 1")
+    if profiler_range:
+        torch.cuda.profiler.start()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -81,6 +132,8 @@ def _time_graph(
         graph.replay()
     end.record()
     end.synchronize()
+    if profiler_range:
+        torch.cuda.profiler.stop()
     elapsed = torch.tensor(
         [start.elapsed_time(end) / iterations], dtype=torch.float64, device="cuda"
     )
@@ -211,6 +264,35 @@ def _make_weights(
     return l1_reference, l2_reference, transformed
 
 
+def _make_or_load_transformed_weights(
+    local_experts: int,
+    hidden: int,
+    intermediate: int,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    weight_cache_input = os.environ.get("MEGAMOE_SMOKE_WEIGHT_CACHE_INPUT", "")
+    weight_cache_output = os.environ.get("MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT", "")
+    if weight_cache_input and weight_cache_output:
+        raise RuntimeError("MegaMoE smoke weight cache input and output are exclusive")
+    if weight_cache_input:
+        transformed = torch.load(
+            weight_cache_input, map_location="cuda", weights_only=True
+        )
+        if (
+            not isinstance(transformed, tuple)
+            or len(transformed) != 2
+            or any(not isinstance(stage, tuple) or len(stage) != 2 for stage in transformed)
+            or any(not tensor.is_cuda for stage in transformed for tensor in stage)
+        ):
+            raise RuntimeError("invalid MegaMoE smoke transformed-weight cache")
+        return transformed
+
+    _l1, _l2, transformed = _make_weights(local_experts, hidden, intermediate)
+    del _l1, _l2
+    if weight_cache_output:
+        torch.save(transformed, weight_cache_output)
+    return transformed
+
+
 def _stage(
     buffer: megamoe_mega.MegaMoESymmBuffer,
     hidden: torch.Tensor,
@@ -310,11 +392,16 @@ def _numeric_case(rank: int, world_size: int) -> dict[str, float]:
         if os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp8") == "fp4"
         else 0.98
     )
-    if not torch.isfinite(actual).all() or cosine < min_cosine:
+    if not math.isfinite(cosine) or not torch.isfinite(actual).all() or cosine < min_cosine:
         raise RuntimeError(
             f"same-rank MegaMoE numeric mismatch rank={rank} "
             f"max_abs={max_abs:.6f} cosine={cosine:.6f}"
         )
+    _check_source_results(
+        "numeric", rank, hidden=hidden_states, transformed=transformed,
+        x=buffer.x[:rows], sf=buffer.x_sf[:rows], ids=ids,
+        weights=weights, output=output,
+    )
     return {"max_abs": max_abs, "cosine": cosine}
 
 
@@ -359,6 +446,10 @@ def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]
     )
     expert_map = torch.arange(
         num_experts, dtype=torch.int64, device="cuda"
+    )
+    _check_source_results(
+        "numeric_rows_inputs", rank, hidden=hidden_states,
+        gate=gate_weight, transformed=transformed,
     )
 
     def reference_for(
@@ -470,19 +561,47 @@ def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]
             rank_ready_route_publish=prepared,
         )
         torch.cuda.synchronize()
+        # Independently check producer coverage, not only MoE math against
+        # whatever data happened to reach the registered input buffer.
+        expected_x, expected_sf = per_token_cast_to_fp8(
+            hidden_states[:rows], use_ue8m0=True, gran_k=32,
+            use_packed_ue8m0=True, backend="torch",
+        )
+        if not torch.equal(
+            buffer.x[:rows].view(torch.uint8), expected_x.view(torch.uint8)
+        ) or not torch.equal(
+            buffer.x_sf[:rows].view(torch.uint8), expected_sf.view(torch.uint8)
+        ):
+            raise RuntimeError(
+                f"fused producer quantization mismatch rank={rank} "
+                f"rows={rows} prepared={int(prepared)}"
+            )
         expected = reference_for(buffer, rows)
         actual = output.float()
         max_abs = float((actual - expected).abs().max())
         cosine = float(
             F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
         )
-        if not torch.isfinite(actual).all() or cosine < 0.96:
+        if not math.isfinite(cosine) or not torch.isfinite(actual).all() or cosine < 0.96:
+            nonfinite_by_row = (~torch.isfinite(actual)).sum(dim=1).tolist()
+            reference_nonfinite = int((~torch.isfinite(expected)).sum())
+            input_nonfinite = int((~torch.isfinite(buffer.x[:rows].float())).sum())
+            weight_nonfinite = int((~torch.isfinite(weights)).sum())
+            sf_nan_codes = int((buffer.x_sf[:rows].view(torch.uint8) == 255).sum())
             raise RuntimeError(
                 "same-rank MegaMoE row sweep mismatch "
                 f"rank={rank} bucket={bucket} rows={rows} "
                 f"prepared={int(prepared)} max_abs={max_abs:.6f} "
-                f"cosine={cosine:.6f}"
+                f"cosine={cosine:.6f} nonfinite_by_row={nonfinite_by_row} "
+                f"reference_nonfinite={reference_nonfinite} "
+                f"input_nonfinite={input_nonfinite} weight_nonfinite={weight_nonfinite} "
+                f"sf_nan_codes={sf_nan_codes}"
             )
+        _check_source_results(
+            f"numeric_bucket{bucket}_rows{rows}_prepared{int(prepared)}", rank,
+            x=buffer.x[:rows], sf=buffer.x_sf[:rows], ids=ids,
+            weights=weights, output=output,
+        )
         return {"max_abs": max_abs, "cosine": cosine}
 
     results: dict[str, dict[str, float]] = {}
@@ -504,6 +623,181 @@ def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]
                 torch.cuda.synchronize()
                 dist.barrier()
     return results
+
+
+def _exact_qwen_fixed_perfect_case(
+    rank: int, world_size: int
+) -> dict[str, dict[str, Any]]:
+    row_counts = _positive_int_list("MEGAMOE_SMOKE_ROWS", "3")
+    sm_counts = _positive_int_list(
+        "MEGAMOE_SMOKE_SMS",
+        str(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count),
+    )
+    if len(row_counts) != 1 or len(sm_counts) != 1:
+        raise RuntimeError("fixed-perfect MegaMoE smoke requires one row and SM count")
+    rows, num_sms = row_counts[0], sm_counts[0]
+    warmups = int(os.environ.get("MEGAMOE_SMOKE_WARMUPS", "10"))
+    iterations = int(os.environ.get("MEGAMOE_SMOKE_ITERATIONS", "100"))
+    bucket = int(os.environ.get("MEGAMOE_SMOKE_BUCKET", str(rows)))
+    hidden = int(os.environ.get("MEGAMOE_SMOKE_HIDDEN", "4096"))
+    intermediate = int(os.environ.get("MEGAMOE_SMOKE_INTERMEDIATE", "1536"))
+    num_experts = int(os.environ.get("MEGAMOE_SMOKE_NUM_EXPERTS", "128"))
+    top_k = int(os.environ.get("MEGAMOE_SMOKE_TOP_K", "8"))
+    production_routes = int(
+        os.environ.get("MEGAMOE_SMOKE_PRODUCTION_ROUTES", "0")
+    )
+    if warmups < 0 or iterations <= 0 or bucket < rows:
+        raise RuntimeError("invalid fixed-perfect MegaMoE timing dimensions")
+    if int(os.environ.get("MEGAMOE_SMOKE_DEBUG_TIMINGS", "0")) != 0:
+        raise RuntimeError("fixed-perfect MegaMoE profiling forbids kernel timing")
+    if num_experts <= 0 or num_experts % world_size:
+        raise RuntimeError("fixed-perfect experts must be divisible by EP world size")
+    if not 0 < top_k <= num_experts:
+        raise RuntimeError("fixed-perfect top-k is out of range")
+    if production_routes not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_PRODUCTION_ROUTES must be 0 or 1")
+
+    local_experts = num_experts // world_size
+    global_tokens = int(os.environ.get("MEGAMOE_SMOKE_GLOBAL_TOKENS", str(rows * world_size)))
+    if global_tokens <= 0 or (global_tokens + world_size - 1) // world_size != rows:
+        raise RuntimeError("global token count must match the balanced padded row shape")
+    base_rows, extra_rows = divmod(global_tokens, world_size)
+    valid_rows = base_rows + int(rank < extra_rows)
+    token_offset = rank * base_rows + min(rank, extra_rows)
+    valid_count = (torch.tensor([valid_rows], dtype=torch.int64, device="cuda")
+                   if extra_rows else None)
+    hidden_states = torch.randn(
+        (rows, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    transformed = _make_or_load_transformed_weights(
+        local_experts, hidden, intermediate
+    )
+    buffer = megamoe_mega.MegaMoESymmBuffer(
+        dist.group.WORLD,
+        num_experts=num_experts,
+        num_max_tokens_per_rank=bucket,
+        num_topk=top_k,
+        hidden=hidden,
+        intermediate_hidden=intermediate,
+    )
+    flat = torch.arange(rows * top_k, dtype=torch.int64, device="cuda")
+    fixed_ids = ((flat + token_offset * top_k) % num_experts).view(rows, top_k)
+    balance_ranks = int(os.environ.get("MEGAMOE_SMOKE_BALANCE_RANKS", "0"))
+    if balance_ranks not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_BALANCE_RANKS must be 0 or 1")
+    if balance_ranks:
+        fixed_ids = (fixed_ids % world_size) * local_experts + fixed_ids // world_size
+    fixed_ids[valid_rows:] = -1
+    ids = buffer.topk_idx[:rows]
+    weights = buffer.topk_weights[:rows]
+    if production_routes:
+        gate_weight = torch.zeros(
+            (num_experts, hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        expert_map = torch.arange(
+            num_experts, dtype=torch.int64, device="cuda"
+        )
+        # The production perfect router starts at rank*valid_rows. Rotate its
+        # existing map to the prefix of the balanced, possibly unequal counts.
+        expert_map = (expert_map + (token_offset - rank * valid_rows) * top_k) % num_experts
+        if balance_ranks:
+            expert_map = (expert_map % world_size) * local_experts + expert_map // world_size
+
+        def prepare_input() -> None:
+            gate_topk(
+                hidden_states,
+                gate_weight,
+                top_k,
+                renormalize=True,
+                expert_map=expert_map,
+                num_token_non_padded=valid_count,
+                topk_idx_dtype=torch.int64,
+                quant_out=(buffer.x[:rows], buffer.x_sf[:rows], None),
+                out=(ids, weights),
+                route_prepare=buffer.route_prepare_args(rank_ready=True),
+                perfect_balance=True,
+            )
+    else:
+        fixed_weights = torch.full(
+            (rows, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
+        )
+        _stage(buffer, hidden_states, fixed_ids, fixed_weights)
+
+        def prepare_input() -> None:
+            pass
+
+    output = buffer.y[:rows]
+    deepgemm.set_num_sms(num_sms)
+    rank_gated_combine = True
+
+    def run_megamoe() -> None:
+        prepare_input()
+        megamoe_mega.fp8_fp8_mega_moe(
+            output,
+            transformed[0],
+            transformed[1],
+            buffer,
+            routes_prepared=bool(production_routes),
+            rank_gated_combine=rank_gated_combine,
+            route_ready_dispatch=bool(production_routes),
+            rank_ready_route_publish=bool(production_routes),
+        )
+
+    dist.barrier()
+    output.fill_(float("nan"))
+    run_megamoe()
+    torch.cuda.synchronize()
+    if not torch.isfinite(output).all():
+        raise RuntimeError("fixed-perfect MegaMoE output is non-finite")
+    if not torch.equal(ids, fixed_ids):
+        raise RuntimeError("fixed-perfect route producer emitted unexpected IDs")
+    compare_combine = int(os.environ.get("MEGAMOE_SMOKE_COMPARE_COMBINE", "0"))
+    if compare_combine not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_COMPARE_COMBINE must be 0 or 1")
+    if compare_combine:
+        expected_output = output.clone()
+        rank_gated_combine = False
+        run_megamoe()
+        torch.cuda.synchronize()
+        if not torch.equal(output.view(torch.uint8), expected_output.view(torch.uint8)):
+            raise RuntimeError("rank-gated combine differs from full-barrier output")
+        rank_gated_combine = True
+        dist.barrier()
+        print(f"MEGAMOE_COMBINE_EXACT_OK rank={rank} global_tokens={global_tokens}", flush=True)
+    _check_source_results(
+        f"fixed_bucket{bucket}_rows{rows}_sms{num_sms}", rank,
+        hidden=hidden_states, transformed=transformed,
+        x=buffer.x[:rows], sf=buffer.x_sf[:rows], ids=ids,
+        weights=weights, output=output,
+    )
+    max_active = _max_active_experts(fixed_ids, local_experts, world_size)
+    elapsed, output_max = _time_graph(
+        run_megamoe, output, warmups=warmups, iterations=iterations
+    )
+    return {
+        f"bucket{bucket}_rows{rows}_sms{num_sms}": {
+            "ep_size": world_size,
+            "rows_per_rank": rows,
+            "global_tokens": global_tokens,
+            "valid_rows_per_rank": [base_rows + int(r < extra_rows) for r in range(world_size)],
+            "combine_exact_checked": bool(compare_combine),
+            "timing_warmups": warmups,
+            "timing_iterations": iterations,
+            "milliseconds": elapsed,
+            "output_max": output_max,
+            "max_active_experts": max_active,
+            "timed_scope": (
+                "route_producer_and_megamoe"
+                if production_routes
+                else "megamoe_kernel_only"
+            ),
+            "routing": (
+                "fixed_global_sequence_rank_interleaved_balance"
+                if balance_ranks else "fixed_global_sequence_perfect_balance"
+            ),
+            "routes_prepared": bool(production_routes),
+        }
+    }
 
 
 def _exact_qwen_case(
@@ -633,8 +927,9 @@ def _exact_qwen_case(
         )
     del probe_hidden, probe_gate, probe_ids, expected_probe_ids
     local_experts = num_experts // world_size
-    _l1, _l2, transformed = _make_weights(local_experts, hidden, intermediate)
-    del _l1, _l2
+    transformed = _make_or_load_transformed_weights(
+        local_experts, hidden, intermediate
+    )
     buffer = megamoe_mega.MegaMoESymmBuffer(
         dist.group.WORLD,
         num_experts=num_experts,
@@ -650,6 +945,10 @@ def _exact_qwen_case(
         (num_experts, hidden), dtype=torch.bfloat16, device="cuda"
     )
     expert_map = torch.arange(num_experts, dtype=torch.int64, device="cuda")
+    _check_source_results(
+        "exact_inputs", rank, hidden=hidden_states,
+        gate=gate_weight, transformed=transformed,
+    )
     results: dict[str, dict[str, Any]] = {}
 
     for rows in row_counts:
@@ -720,6 +1019,14 @@ def _exact_qwen_case(
                         f"for rows={rows} sms={num_sms}"
                     )
                 current = (ids.clone(), weights.clone(), output.clone())
+                result_case = (
+                    f"exact_bucket{bucket}_rows{rows}_sms{num_sms}"
+                    f"_trial{specialization_trial}"
+                )
+                _check_source_results(
+                    result_case, rank, x=buffer.x[:rows],
+                    sf=buffer.x_sf[:rows], result=current,
+                )
                 if perfect_routing:
                     expected_ids = (
                         torch.arange(
@@ -756,6 +1063,10 @@ def _exact_qwen_case(
                         f"for alternate input rows={rows} sms={num_sms}"
                     )
                 current_alt = (ids.clone(), weights.clone(), output.clone())
+                _check_source_results(
+                    result_case + "_alternate", rank, x=buffer.x[:rows],
+                    sf=buffer.x_sf[:rows], result=current_alt,
+                )
                 if reference_alt is None:
                     reference_alt = current_alt
                 elif not all(
@@ -788,6 +1099,7 @@ def _exact_qwen_case(
                     "milliseconds": elapsed,
                     "output_max": output_max,
                     "max_active_experts": max_active,
+                    "timed_scope": "router_and_megamoe",
                 }
                 if debug_timings:
                     timing_tensor = torch.zeros(
@@ -902,9 +1214,9 @@ def _exact_qwen_case(
 def main() -> None:
     rank = int(os.environ["SLURM_PROCID"])
     world_size = int(os.environ["SLURM_NTASKS"])
-    if world_size not in (4, 8):
+    if world_size not in (2, 4, 8, 16, 32, 64):
         raise RuntimeError(
-            "same-rank MegaMoE smoke supports four- or eight-rank topology "
+            "same-rank MegaMoE smoke supports EP2/4/8/16/32/64 topology "
             f"checks, got {world_size}"
         )
     local_rank = int(os.environ["SLURM_LOCALID"])
@@ -917,6 +1229,14 @@ def main() -> None:
         raise RuntimeError("MegaMoE smoke expert weight dtype must be fp8 or fp4")
     if expert_weight_dtype == "fp4":
         megamoe_mega.fp8_fp8_mega_moe = megamoe_mega.fp8_fp4_mega_moe
+    profile_only = int(os.environ.get("MEGAMOE_SMOKE_PROFILE_ONLY", "0"))
+    if profile_only not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_PROFILE_ONLY must be 0 or 1")
+    fixed_perfect_only = int(
+        os.environ.get("MEGAMOE_SMOKE_FIXED_PERFECT_ONLY", "0")
+    )
+    if fixed_perfect_only not in (0, 1):
+        raise RuntimeError("MEGAMOE_SMOKE_FIXED_PERFECT_ONLY must be 0 or 1")
     dist.init_process_group(
         "gloo",
         rank=rank,
@@ -927,19 +1247,32 @@ def main() -> None:
         torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     )
     torch.manual_seed(20260825 + rank)
-    numeric = _numeric_case(rank, world_size)
-    dist.barrier()
-    numeric_rows = _numeric_row_sweep(rank, world_size)
-    dist.barrier()
-    exact = _exact_qwen_case(rank, world_size)
+    numeric = None
+    numeric_rows = None
+    if not profile_only:
+        numeric = _numeric_case(rank, world_size)
+        dist.barrier()
+        numeric_rows = _numeric_row_sweep(rank, world_size)
+        dist.barrier()
+    exact = (
+        _exact_qwen_fixed_perfect_case(rank, world_size)
+        if fixed_perfect_only
+        else _exact_qwen_case(rank, world_size)
+    )
     if rank == 0:
-        print(json.dumps({
+        payload = {
             "status": "ok",
             "expert_weight_dtype": expert_weight_dtype,
             "numeric": numeric,
             "numeric_rows": numeric_rows,
             "exact_qwen": exact,
-        }, sort_keys=True))
+        }
+        output_path = os.environ.get("MEGAMOE_SMOKE_OUTPUT")
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                json.dump(payload, output_file, indent=2, sort_keys=True)
+                output_file.write("\n")
+        print(json.dumps(payload, sort_keys=True))
     dist.destroy_process_group()
 
 

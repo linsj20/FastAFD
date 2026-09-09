@@ -236,6 +236,58 @@ class _FakeEvent:
 
 
 class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
+    def test_decode_replay_preserves_each_sources_padding(self) -> None:
+        runtime = object.__new__(AfdFmhaRuntime)
+        runtime.role = "mlp"
+        runtime.num_mb = 2
+        runtime.config = SimpleNamespace(max_running_req=16)
+        for name in (
+            "input_ids", "positions", "out_loc", "state_indices",
+            "last_indices", "wb_table", "wb_position", "wb_batch",
+        ):
+            setattr(runtime, f"_graph_{name}", torch.zeros(16, dtype=torch.int64))
+        subs = [
+            SimpleNamespace(afd_fmha_source_token_offsets=(0, 4, 8)) for _ in range(2)
+        ]
+        batch = SimpleNamespace(
+            positions=torch.zeros(16, dtype=torch.int64),
+            out_loc=torch.zeros(16, dtype=torch.int64),
+            state_indices=torch.zeros(16, dtype=torch.int64),
+            input_ids=torch.zeros(16, dtype=torch.int64),
+            afd_last_indices=torch.arange(14),
+            afd_writeback={
+                key: torch.zeros(14, dtype=torch.int64)
+                for key in ("table_indices", "write_positions", "batch_indices")
+            },
+            afd_mb_subbatches=subs,
+            afd_microbatch_token_offsets=(0, 8, 16),
+        )
+        entry = SimpleNamespace(
+            batch=batch,
+            valid_token_counts=tuple(torch.zeros(9, dtype=torch.int64) for _ in range(2)),
+            valid_token_counts_host=tuple(torch.zeros(9, dtype=torch.int64) for _ in range(2)),
+            valid_token_iota_host=torch.arange(8).numpy(),
+        )
+        # Balanced batch7, unequal source counts, and an empty source reuse the
+        # same graph buffers. The last real row of source1 must stay valid.
+        for source_counts in (((3, 4), (3, 4)), ((1, 3), (3, 4)), ((0, 0), (2, 4))):
+            plan = SimpleNamespace(
+                microbatch_real_token_counts=tuple(map(sum, zip(*source_counts))),
+                microbatch_token_offsets=(0, 8, 16),
+                source_plans=tuple(
+                    SimpleNamespace(microbatch_real_token_counts=c) for c in source_counts
+                ),
+            )
+            runtime._prepare_graph_replay(entry, batch, plan, 16)
+            for mb in range(2):
+                expected = [sum(c[mb] for c in source_counts)]
+                prefix = 0
+                for counts in source_counts:
+                    expected.extend(range(prefix, prefix + counts[mb]))
+                    expected.extend([-1] * (4 - counts[mb]))
+                    prefix += counts[mb]
+                self.assertEqual(entry.valid_token_counts[mb].tolist(), expected)
+
     def test_selected_weight_uses_parameter_dtype_for_bf16_checkpoint_scale(self) -> None:
         key = "model.layers.0.linear_attn.in_proj_qkv.weight_scale"
         runtime = object.__new__(AfdFmhaRuntime)

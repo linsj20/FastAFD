@@ -60,6 +60,11 @@ public:
             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))
             flags += " -Xcompiler -rdynamic -lineinfo";
+        if (const auto iket_include = get_env<std::string>("DG_JIT_IKET_INCLUDE");
+            not iket_include.empty()) {
+            DG_HOST_ASSERT(std::filesystem::exists(iket_include + "/iket/iket_device_apis.cuh"));
+            flags += " -DIKET_BUILD_ENABLED=1 -I" + iket_include;
+        }
     }
 
     virtual ~Compiler() = default;

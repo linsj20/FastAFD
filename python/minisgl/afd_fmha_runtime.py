@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -112,6 +113,7 @@ class _FmhaDecodeGraph:
     next_tokens: torch.Tensor | None
     valid_token_counts: tuple[torch.Tensor, ...]
     valid_token_counts_host: tuple[torch.Tensor, ...]
+    valid_token_iota_host: np.ndarray
     bootstrap_compute_events: tuple[torch.cuda.Event, ...] = ()
     compute_done_events: tuple[tuple[torch.cuda.Event, ...], ...] = ()
 
@@ -1896,10 +1898,15 @@ class AfdFmhaRuntime:
         sampling_batch = (
             self.worker.runtime.build_sampling_batch(bs) if self.role == "mlp" else None
         )
+        merged_rows = int(per_mb_bs) * graph_fanin
         valid_token_counts_host = (
             tuple(
                 torch.tensor(
-                    [int(per_mb_bs) * graph_fanin],
+                    (
+                        [merged_rows]
+                        if graph_fanin == 1
+                        else [merged_rows, *range(merged_rows)]
+                    ),
                     dtype=torch.int64,
                     pin_memory=True,
                 )
@@ -1909,8 +1916,8 @@ class AfdFmhaRuntime:
             else ()
         )
         valid_token_counts = tuple(
-            torch.empty((1,), dtype=torch.int64, device=self.device)
-            for _ in valid_token_counts_host
+            torch.empty_like(host_count, device=self.device)
+            for host_count in valid_token_counts_host
         )
         # Legacy Qwen3 retains its accepted CUDA-event schedule. Qwen3.5 uses
         # device turns embedded in the publication kernels instead: event edges
@@ -1988,6 +1995,7 @@ class AfdFmhaRuntime:
             next_tokens=output[0],
             valid_token_counts=valid_token_counts,
             valid_token_counts_host=valid_token_counts_host,
+            valid_token_iota_host=np.arange(merged_rows, dtype=np.int64),
             bootstrap_compute_events=bootstrap_compute_events,
             compute_done_events=compute_done_events,
         )
@@ -2797,13 +2805,35 @@ class AfdFmhaRuntime:
                     "FMHA-only model decode source layout does not match its graph: "
                     f"mb={mb} actual={real_spans} captured={capture_spans}"
                 )
-        for device_count, host_count, valid_count in zip(
-            entry.valid_token_counts,
-            entry.valid_token_counts_host,
-            valid_counts,
-            strict=True,
-        ):
-            host_count[0] = valid_count
+            # Sources retain padding inside the merged tensor. A scalar total
+            # incorrectly masks real rows after the first source's padding.
+            # Prepare row validity and compact route IDs on CPU, reusing the
+            # existing graph-stable H2D copy. No source division on the GPU.
+            host_count = entry.valid_token_counts_host[mb]
+            device_count = entry.valid_token_counts[mb]
+            source_count = len(plan.source_plans)
+            expected_size = 1 if source_count == 1 else real_offsets[-1] + 1
+            if host_count.numel() != expected_size:
+                raise RuntimeError("decode graph valid-token metadata size changed")
+            host_view = host_count.numpy()
+            prefix = 0
+            for source_plan, left, span in zip(
+                plan.source_plans, real_offsets[:-1], real_spans, strict=True
+            ):
+                count = int(source_plan.microbatch_real_token_counts[mb])
+                if not 0 <= count <= span:
+                    raise RuntimeError("decode source valid count exceeds its graph span")
+                if source_count > 1:
+                    np.add(
+                        entry.valid_token_iota_host[:count],
+                        prefix,
+                        out=host_view[1 + left : 1 + left + count],
+                    )
+                    host_view[1 + left + count : 1 + left + span] = -1
+                prefix += count
+            if prefix != valid_counts[mb]:
+                raise RuntimeError("decode source valid counts disagree with merged total")
+            host_view[0] = prefix
             device_count.copy_(host_count, non_blocking=True)
         self._graph_input_ids[:bs].copy_(batch.input_ids)
         self._copy_and_pad(

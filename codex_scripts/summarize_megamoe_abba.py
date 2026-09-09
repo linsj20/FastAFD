@@ -1,11 +1,47 @@
 #!/usr/bin/env python3
-"""Summarize control/candidate MegaMoE ABBA JSON records from a Slurm log."""
+"""Summarize MegaMoE ABBA Nsight kernel timings or legacy harness log timings."""
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 from pathlib import Path
+
+
+def summarize_nsys(root: Path) -> dict:
+    records = {}
+    contracts = set()
+    for label in ("control_trial0", "candidate_trial1", "candidate_trial2", "control_trial3"):
+        paths = list((root / label / "nsys").glob("*.cuda_gpu_kern_sum.csv"))
+        if len(paths) != 1:
+            raise ValueError(f"{root / label}: expected exactly one Nsight kernel CSV")
+        raw = paths[0].read_text()
+        header = raw.index("Time (%),")
+        rows = [row for row in csv.DictReader(io.StringIO(raw[header:]))
+                if "sm100_fp8_fp4_mega_moe_impl" in row["Name"]]
+        if len(rows) != 1 or int(rows[0]["Instances"]) <= 0:
+            raise ValueError(f"{paths[0]}: expected one measured MegaMoE specialization")
+        row = rows[0]
+        contracts.add((row["Name"], int(row["Instances"])))
+        records[label] = {
+            key: float(row[column]) / 1000
+            for key, column in (("median_us", "Med (ns)"), ("mean_us", "Avg (ns)"),
+                                ("min_us", "Min (ns)"), ("max_us", "Max (ns)"))
+        }
+    if len(contracts) != 1:
+        raise ValueError(f"{root}: kernel specialization or sample counts differ")
+    control = (records["control_trial0"]["median_us"] + records["control_trial3"]["median_us"]) / 2
+    candidate = (records["candidate_trial1"]["median_us"] + records["candidate_trial2"]["median_us"]) / 2
+    return {
+        "timing_source": "Nsight GPU kernel duration",
+        "instances_per_capture": next(iter(contracts))[1],
+        "records": records, "control_us": control, "candidate_us": candidate,
+        "delta_us": candidate - control,
+        "delta_percent": (candidate / control - 1) * 100,
+        "control_drift_us": records["control_trial3"]["median_us"] - records["control_trial0"]["median_us"],
+    }
 
 
 def parse_records(log_path: Path) -> list[tuple[str, dict[str, object]]]:
@@ -25,8 +61,15 @@ def parse_records(log_path: Path) -> list[tuple[str, dict[str, object]]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logs", nargs="+", type=Path)
+    parser.add_argument("logs", nargs="*", type=Path)
+    parser.add_argument("--nsys-root", nargs="+", type=Path,
+                        help="ABBA artifact roots containing trial directories")
     args = parser.parse_args()
+    if bool(args.logs) == bool(args.nsys_root):
+        parser.error("provide either Slurm logs or --nsys-root directories")
+    if args.nsys_root:
+        print(json.dumps({str(root): summarize_nsys(root) for root in args.nsys_root}, indent=2))
+        return
 
     expected = ["control_trial0", "candidate_trial1", "candidate_trial2", "control_trial3"]
     records: list[tuple[str, dict[str, object]]] = []

@@ -1,6 +1,7 @@
 #include <minisgl/tensor.h>
 #include <minisgl/utils.cuh>
 #include <minisgl/utils.h>
+#include <minisgl/valid_tokens.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -418,11 +419,9 @@ __launch_bounds__(WARPS_PER_CTA * kWarpSize) __global__ void topk_gating_softmax
   }
 
   const int thread_group_idx = threadIdx.x % THREADS_PER_ROW;
-  bool row_is_valid = true;
-  if (valid_count_size != 0) {
-    const int valid_count = min(static_cast<int>(valid_token_count[0]), num_rows);
-    row_is_valid = thread_row < valid_count;
-  }
+  const bool row_is_valid =
+      minisgl::token_validity(thread_row, num_rows, valid_token_count, valid_count_size)
+          .valid;
   if (!row_is_valid) {
     if (thread_group_idx == 0) {
 #pragma unroll
@@ -1373,8 +1372,9 @@ struct MoeTopkSoftmaxGroupLocalKernel {
         "topk must be <= num_experts, got topk=", topk.unwrap(),
         " num_experts=", num_experts.unwrap());
     RuntimeCheck(
-        valid_token_count.size(0) == 0 || valid_token_count.size(0) == 1,
-        "valid_token_count must be empty or shape [1], got ",
+        valid_token_count.size(0) == 0 || valid_token_count.size(0) == 1 ||
+            valid_token_count.size(0) == num_tokens.unwrap() + 1,
+        "valid-token metadata must be empty, scalar, or [total, row map], got ",
         valid_token_count.size(0));
 
     const auto num_rows = static_cast<int>(num_tokens.unwrap());

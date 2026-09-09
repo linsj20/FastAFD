@@ -1,5 +1,496 @@
 # Qwen3 FMHA-Only Attention Worker and FFN Pipeline
 
+## Validated MegaMoE latency result (2026-09-09 UTC)
+
+The requested optimization and final validation are complete; no GPU jobs
+remain active for this task. Main code and local-mirror retain the early
+routing-weight read, CTA bulk-TMA combine with original ascending valid-slot
+PTX accumulation, and the validated short-K producer prefill correction.
+Pairwise top-k8 summation is removed because it can change results. Prefix
+lookup was rejected: its 0.112 us apparent gain was below 0.416 us control drift.
+Included in the MegaMoE progress checkpoint; unrelated Qwen3.5 work is preserved.
+
+- Byte-exact source comparison 7019473 passed on 8 ranks: original control,
+  control repeat, ordered combine/early-weight and prefix each had 56 records.
+  Independent producer quantization also passed. No extra numeric matrix.
+- Final six-point profile 7019787: Nsight kernel median 44.064 us; dispatch
+  span 10.304 us; compute span 26.336 us; exposed combine 7.296 us;
+  post-CombineEnd tail 0.512 us median / 0.800 us max. One dispatch startup
+  outlier of 16.224 us is retained. The 6–7 us dispatch aspiration is still
+  unmet; the interim ~8 us exposed-combine/no-long-tail target is met.
+- Final A1:F1/EP8/batch6, 128K, ATP1, MB2, attn-only, FP8xFP4 generation
+  7019832 passed. Official scorer 7020231 passed all 48 prompts/816 tokens:
+  top-1/top-10/top-100 = 1.0, average/max vLLM rank = 1.0. Individual steps
+  checked. Initial scorer 7019850 failed before scoring on a too-long Unix
+  socket path; fixed only transient IPC location and reused the same sample.
+- Same-allocation perf-mode source pair 7019851: old 24.098079 ms versus
+  retained 23.553900 ms, improving 2.258%; TPS/active GPU 124.491253 to
+  127.367442 (+2.310%). Both use perfect balance and all 16 GPUs; unchanged
+  policy retains 14/15 control steps (1 outlier) and 15/15 candidate steps.
+  This is one paired result, not an extrapolation from standalone timings.
+
+Full concise results: scratch/megamoe_latency_20260908/RESULTS.md.
+Resume details, source/artifact paths and historical evidence:
+scratch/HANDOFF_megamoe_latency_20260908.md. Local compact proof is under
+scratch/megamoe_latency_20260908/results/{final_e2e,final_ordered_iket,exact_results}.
+The earlier fixed-global-work EP4/8/16 test supports roughly inverse-EP compute;
+its 22.128 us fitted fixed term is from earlier code and is not pure wire latency.
+An unrelated E<128 quantization-coverage correction remains isolated and untested
+on GPU; it was deliberately not expanded under the minimum-checking instruction.
+
+Earlier investigation records below describe their dated state; the result above is authoritative.
+
+## Historical early-weight and pairwise experiments (2026-09-08)
+
+User target: best-case12–14us exposed fixed cost (6–7us per communication
+leg);~8us combine is acceptable with no long post-CombineEnd tail. Dispatch
+startup and first-to-last completion remain the priority. No shape/SM/threshold
+specialization; preserve arbitrary routes, empty experts, and uneven counts.
+
+Accepted early routing-weight read: coissue the independent uniform float load
+with the scale reads before consuming either, retaining TMA payload transfer,
+Linear-1 global staging/reuse, and release publication. Exact tested kernel
+promoted locally after validation; no commits. This builds on the previously
+accepted CTA-per-token combine (47.936->45.104us, ABBA7014107).
+
+| Rows per rank | Control us | Early-weight us | Change |
+|---|---|---|---|
+|12|43.808|42.144|-3.80%|
+|24 reference|45.776|43.760|-4.40%|
+|48|48.912|48.144|-1.57%|
+
+Same-allocation Nsight ABBA7018117 completed0:0 in19:07. Mean durations also
+improve at all3 sizes; control drifts0.000/0.224/-0.224us. Initial exact
+ABBA7017907 corroborates45.584->43.984us (-3.51%,control drift0.480us).
+Numeric topk8,rows3/6/24,buckets518/1036,prepared/unprepared routes passed all12
+combinations; rank0 cosine>=0.9997816. Tests exercise ordinary uneven routes.
+Remote source is source/megamoe_early_route_weight_20260908, artifacts matching;
+local complete CSVs/log/summary under scratch/megamoe_latency_20260908/results/early_route_weight.
+
+Clean six-marker7018327 COMPLETED0:0 in3:38: Nsight43.552us; median dispatch
+10.496us, compute starts8.992us and spans25.344us, exposed combine7.360us,
+post-combine tail0.832us (max0.864us). All3 measured launches have expected
+600/600/75/4096/4096/1200 marker counts and ordered boundaries. No startup
+outlier in these3 captures. Original same-six-marker control7017202 has
+11.616us dispatch,11.104us first compute,24.448us compute,8.064us exposed
+combine,1.344us tail. Separate allocations: phase evidence corroborates the
+mechanism; same-allocation Nsight comparisons establish wall-time improvement.
+
+CPU SModel disassembly verifies SF load0x2100 and weight LDG0x21a0 are issued
+before SF store0x21e0 waits on its scoreboard; weight store0x2280 waits on a
+separate scoreboard. Compiler schedules SF load first but overlaps the reads.
+Nsight reports128 registers/thread and0 local-memory bytes for both control
+and candidate. Normal binary has0 PMTRIG.
+
+Nsight SQLite reveals local selector overlap with MegaMoE start:~3.04us in
+control/candidate exact comparisons; EP4/8/16 scaling medians3.872/3.008/3.712us.
+Selector source launches MegaMoE programmatically before final remote count /
+rank-ready release publication. Thus dispatch startup overlaps producer work;
+local selector END is not an exact all-rank input-ready timestamp. Do not
+subtract this overlap mechanically or change the timing oracle. Preserve the
+12–14us target while separating producer readiness from payload communication.
+Local producer_overlap.json records exist under EP scaling and validation/rows24.
+
+Initial detailed control7017711 pairs160 remote messages/launch: issue spread
+2.400/2.464us, observed-arrival spread2.432/2.336us, per-request observed latency
+4.016/4.064us, local staging0.736/0.704us. One29us pre-issue outlier retained.
+Candidate detail7018115 FAILED only extra-marker pairing: some warps emit two
+arrival/publication markers. Reject per-message timing; no deduplication. Its
+six markers validate, but clean7018327 supersedes that phase evidence.
+Prepared local dispatch_prefix_detail variant uses one observer lane per warp;
+uncompiled/unvalidated/not submitted. Use only if further detail is warranted.
+
+**Active prefix experiment7018428**: source/megamoe_dispatch_prefix_20260908,
+artifacts matching. Uses early-weight source as control, changing only serial
+preceding-expert traversal to warp prefix/ballot lookup. Existing rank min-peeling,
+exact token ownership/pool offsets/readiness unchanged. CPU mapping equivalence
+passed108 layouts/110575 slots including all-empty/zero-count experts and
+1/2/8/16/31/32/33/64/128 experts. SASS confirms the old dependent count
+shuffle/add/compare/branch. GPU job runs E128/topk8 numeric rows3/24 with both
+route modes, then exact24-row Nsight ABBA. Source frozen; not accepted yet.
+If it wins, validate nearby/EP behavior and phase timing; otherwise retain the
+original lookup. Extra registers and prefix startup can offset its benefit.
+
+Workflow: summarize_megamoe_abba.py --nsys-root handles kernel CSVs and checks
+identical specialization/sample counts; legacy harness-log mode stays separate.
+Summarize_megamoe_scaling.py ran successfully on EP4/8/16 real records. Both
+launchers now default DG_JIT_CACHE_DIR under artifact caches; live frozen sources
+unchanged and new jobs explicitly export this directory. Native unittest27/27,
+shell syntax and diff whitespace pass. Main kernel matches the remotely tested
+candidate byte-for-byte. Accepted task code, workflows, and memories synchronized to local-mirror;
+unrelated Qwen3.5 edits preserved. No commit requested.
+
+## Completed EP scaling and dispatch priority (2026-09-08)
+
+User's best-case target is12–14us total exposed fixed cost (6–7us per leg),
+with~8us combine acceptable for now if no long post-combine tail. Dispatch
+startup and first-to-last publication remain the optimization priority; avoid
+shape/SM/threshold specialization and preserve arbitrary routing/counts.
+
+Fixed192 global tokens, EP4/8/16 on1/2/4 trays, all GPUs active:
+
+| EP | Job | Nsight kernel us | IKET compute us | Exposed combine us | Post-combine tail us |
+|---|---|---|---|---|---|
+|4|7017624|70.240|50.208|7.936|0.256|
+|8|7017712|45.696|25.280|7.584|0.608|
+|16|7017713|34.400|13.920|6.944|1.216|
+
+All jobs completed0:0. Medians of3 measured launches;1 warmup. Nsight captures
+uninstrumented kernel duration; IKET spans are separate overlapping measurements.
+Fit T=191.8903/EP+22.128us (R²0.999595), compute=194.3771/EP+1.456us.
+Compute doubling ratios0.5035/0.5506; pairwise total intercepts21.152/23.104us.
+Approximately22us non-scaling exposed cost leaves8–10us to recover versus target.
+C includes setup/synchronization/non-scaling compute, not pure wire latency or
+proof of an infinite-EP limit. Large IKET startup outliers96.064/122.688us remain
+in raw EP8/16 records; post-combine tails stay<=1.792us in these captures.
+Reusable summarizer ran successfully on real records:
+`codex_scripts/summarize_megamoe_scaling.py`; full local data and summary under
+`scratch/megamoe_latency_20260908/results/ep_scaling`.
+
+Dispatch diagnostic7017711 completed: normal requests issued over2.400/2.464us,
+observed arrivals over2.432/2.336us, local publications over3.456/3.072us.
+Per-request issue->observed-arrival median4.016/4.064us; local staging0.736/0.704us.
+One29us pre-issue outlier retained. Software arrival follows SF/weight work,
+not exact wire completion. At EP8 each active dispatch warp handles one message.
+Actual remote routed rows vary by rank[160,176,160,176,176,160,176,160]; rank0
+has675840B dispatch and1310720B return. Expert balance does not equal identical
+remote fractions. Preserve the input distribution.
+
+Early-weight-read ABBA7017907 completed45.584->43.984us; validation7018117
+and clean six-marker7018327 remain active (see current top section). Independent scalar weight load moves before SF-copy synchronization;
+no routing/publication/shape change. Early-weight change is now accepted; prefix remains isolated.
+See `scratch/HANDOFF_megamoe_latency_20260908.md` for source/artifact paths.
+
+## Historical continuation results (2026-09-08 evening PDT)
+
+Direct register-copy dispatch job7016924 passed arbitrary-route numerical
+checks and showed47.632 ->45.984us (-3.46%), but its control drift2.464us
+exceeded the gain. Validation7017020 repeats24 then12/48 rows in one
+allocation. The completed24-row ABBA is **neutral**: control medians46.432/
+46.240, candidate46.304/46.368, both means46.336us. Do not promote this
+candidate. Job completed0:0 in15:34. Nearby12-row medians44.464 ->44.512us;
+48 rows49.296 ->49.072us, but mean durations49.147 ->49.440us regress.
+Reject direct copy as neutral/noisy across the three cases. Local12 CSVs and
+summary: `scratch/megamoe_latency_20260908/results/direct_dispatch/validation`.
+This supports retaining
+TMA: removing a staging hop can trade asynchronous hardware copies for extra
+register/LSU work without shortening the critical path.
+
+Marker retry7016973 failed143:0 in3:53 because PMTRIG5 requires missing
+SModel. The SDK's `docs/ghost_slot_and_predicated_pmtrig.md` explains the first
+NativeDump failure: predicated-off markers can advance the buffer pointer,
+leaving zero slots and overflowing64 slots in the MMA loop. Reject that raw
+capture. SModel0.4.2 and its dependencies were installed into isolated
+`FastAFD/source/iket-smodel` from the official compute PyPI index, using only
+the login CPU. Extracted the installed IKET package from the image into
+`artifacts/iket_dependencies/container-package` and successfully selected
+resources for all six markers in7016973's captured kernel binary.
+
+Retry7017202 completed0:0 in3:02 using512 slots/warp and unchanged PMTRIG5
+kernel source. `FASTAFD_IKET_PYTHON_DEPS` modifies only the profiler interpreter;
+workload children retain the original Python environment. Two-pass peers are
+required. All three measured launches have2400 warp lifetimes and marker
+counts600/600/75/4096/4096/1200 for dispatch-start/end,compute-start/end,
+combine-start/end. The analyzer now validates timestamp bounds and ordering
+and records counts; replaying it on the real trace passes.
+
+Median six points relative to first warp start (us): dispatch0.448 ->12.064,
+compute11.104 ->35.552, combine24.640 ->43.712. Median per-launch spans:
+11.616/24.448/18.976us; kernel envelope44.928us. Postcompute combine exposure
+8.064us, precompute dispatch intersection10.656us. The latter is temporal
+intersection, not proof that dispatch alone causes the first-compute delay
+(weight loads and other dependencies also contribute). Phases overlap; do not
+sum them or call them pure NVLink timings. Marker overhead is not calibrated
+by cross-node Nsight comparison. Nsight remains the wall-time oracle.
+
+Local trace, baseline/profiled records, validated decomposition:
+`scratch/megamoe_latency_20260908/results/iket_markers/7017202`.
+Comparison7017340 completed with the original warp-combine branch with identical six
+markers from `source/megamoe_iket_warp_combine_control_20260908`, matching
+artifacts. Prepared entirely on CPU before submission. This compares the
+already accepted top-k8 CTA-combine win; direct-copy dispatch is rejected.
+
+### First-principles latency interpretation
+
+There is no mandatory HBM ->L2 ->L1 ->register chain for communication.
+A global allocation is an address space, not a guaranteed HBM transaction;
+cache hits can avoid HBM, and TMA global/shared transfers bypass intermediate
+register copies. `l1_token_buffer` is Linear-1 global staging, not hardware L1.
+Current dispatch: peer global ->NVLink/TMA ->receiver shared ->TMA local
+Linear-1 global staging ->GEMM TMA shared ->tensor cores. Return: accumulator
+TMEM ->registers ->shared layout conversion ->registers ->remote global slots;
+destination-local TMA loads then feed register reduction and output stores.
+Completion publication/acquire must preserve payload visibility, including
+ordering between ordinary and asynchronous memory accesses.
+
+For one leg, a useful non-overlapped model is startup + bytes/effective BW +
+packing/readiness overhead. Concurrent tokens need not pay startup serially,
+but exact-case fanout still contributes709632 dispatch and1376256 return
+bytes/rank on average (rank0 actual675840/1310720B). At6.5us these alone require109/212GB/s effective bandwidth; that is
+a feasibility calculation, not a measured floor or achieved bandwidth. If
+6.5us describes startup alone, the full phase can exceed it. Across the kernel,
+use the dependency critical path because dispatch, compute and return can
+overlap. Do not sum overlapping envelopes or equate the postcompute tail with
+full communication. Retain TMA after the neutral register-copy repeat; seek
+fewer dependent transfers or earlier consumer readiness, not cache-hint sweeps.
+The Linear-1 global staging also provides reuse across GEMM N tiles. Removing
+it without retaining local reuse can multiply remote activation reads; a
+direct remote-to-consumer design must account for this, not just count hops.
+Primary mechanism references:
+https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/async-copies.html
+https://docs.nvidia.com/cuda/parallel-thread-execution/index.html
+https://nvidia.github.io/cccl/unstable/cccl/tma.html
+
+## A8:F1/EP8 128K batch-6 latency opportunity assessment (2026-09-08 PDT)
+
+The target is the accepted perf-mode Qwen3 decode case: A8:F1, FFN EP8,
+batch 6 per attention lane, MB2, 128K context, FP8-activation/FP4-weight
+MegaMoE, and cost-preserving perfect routing.  The exact perfect-routing sweep
+point is 23.100906 ms/step (230.871173 token/s per active GPU), versus
+23.255805 ms for the normal-routing point, so perfect routing is already only
+0.154899 ms / 0.666% faster end to end at this geometry.
+
+The standalone timing oracle is Nsight Systems source ABBA job `7014107`,
+which reproduces the production prepared-route specialization.  Its unchanged
+control trial medians are 47.808 and 48.064 us (mean 47.936 us).  The top-k-8
+combine candidate medians are 45.152 and 45.056 us (mean 45.104 us), a
+2.832-us / 5.91% kernel-wall improvement.  All four trials completed on all
+ranks with finite output.  Earlier synchronized, unprepared-route, and
+whole-graph cadence experiments are rejected alignment diagnostics; their
+values must not be used as MegaMoE kernel timing.  End-to-end transfer still
+requires a later production graph comparison.
+
+At A8/EP8 each FFN rank owns 16 experts and receives 24 rows per microbatch.
+With top-k 8 and 128 experts, perfect routing produces exactly 12 routes per
+expert, so all 16 local experts are active in one wave.  The current heuristic
+selects block-M 32 above 8.5 routes/expert, padding each 12-row expert tile to
+32.  The former Qwen3 top-k-8 combine used the generic one-warp-per-token path,
+exposing only 24 warps/three CTAs while each warp accumulated eight TMA-loaded
+expert outputs serially.  The accepted change extends the existing H4096
+CTA-per-token bulk-TMA/pairwise-reduction design to top-k 8.
+
+Optimization status and next experiments:
+
+1. The existing one-CTA-per-token bulk-TMA/pairwise combine is now generalized
+   to `topk == 8 && hidden == 4096`.  It reads the actual route IDs and rank
+   masks, so it remains correct for arbitrary routing.  Job `7014107` measures
+   the 5.91% kernel-wall win above.  Comparative IKET jobs `7014576` and
+   `7014768` show that its coarse post-compute combine tail falls from 11.392
+   to 7.680 us while the compute-pipeline proxy is essentially unchanged;
+   this is the accepted first optimization.
+2. M16-versus-M32 Nsight source ABBA job `7015208` completed `0:0` in 8:12.
+   The intended template parameters were present: M32/store-M16/10 stages for
+   control and M16/store-M8/11 stages for candidate.  Control medians were
+   45.440/45.824 us (mean 45.632); candidate medians were 45.760/45.280 us
+   (mean 45.520).  The 0.112-us / 0.25% apparent gain is bracketed by the
+   0.384-us control and 0.480-us candidate spreads, so M16 is neutral and the
+   broad threshold change is rejected.  Retain M32.  Do not lower SM count to
+   manufacture overlap between the two MegaMoE lanes: captured graph
+   dependencies serialized that attempt in job `6542626` and regressed full
+   latency from 28.157 to 31.858 ms.
+3. This exact input groups each token's eight expert routes on one destination
+   rank. Dispatch and BF16 return therefore move about710KB and1.376MB per
+   rank, respectively. A route-agnostic dedup/reduction algorithm could reduce
+   bytes when routes share a destination, but both tested dispatch dedup
+   implementations regressed badly (details below). Do not infer an8x latency
+   gain from an8x byte reduction, or specialize the kernel to this input.
+4. Preserve the actual production route publisher and arbitrary route metadata.
+   Algebraically known perfect-routing counts are an input property, not an
+   authorized optimization. Next mechanisms must reduce dependency depth or
+   useful data movement generally and pass nearby-workload validation.
+
+Avoid reopening already rejected directions without a new mechanism: more or
+fewer pull warps, shallower pipelines, eight-expert waves, per-route completion
+atomics, direct global-store combine, separate route-publisher kernels, and
+SM-sharing between the two captured lanes.  `NCCL_GRAPH_MIXING_SUPPORT` is not
+an optimization lever here: the timed A2A is symmetric-memory peer access plus
+system-atomic barriers, not an NCCL collective.  Parallel-TMA-issue ABBA job
+`7015677` then tested a general top-k-8 combine change: eight warps issued the
+independent slot loads instead of one warp issuing them serially.  Control /
+candidate median means were 46.000 / 45.808 us, but average-duration means
+were 45.979 / 45.989 us.  The contradictory 0.192-us median improvement and
+0.011-us mean regression are noise; the change is rejected and reverted.
+TMA instruction issue is not the exposed combine bottleneck.  Per user
+direction, stop exact-case tile/SM/threshold tuning.  Further work must be a
+route-agnostic algorithmic reduction in communication bytes or synchronization.
+
+### Dispatch dedup rejection and completion-barrier probe (2026-09-08 PDT)
+
+Source ABBA job `7016530` completed `0:0` in 5:39. The warp-token
+candidate medians were 82.816/82.720 us (mean 82.768), versus control
+46.368/46.528 us (mean 46.448): +36.320 us / +78.20%. The earlier
+CTA-token design in job `7016290` was also rejected at 93.984 versus
+46.128 us. Arbitrary-routing check `7016506` passed both prepared and
+unprepared modes (cosine 0.999910831, max-abs 1.006554), but correctness
+does not justify either performance regression. Both dispatch branches and
+their source-count/reverse-slot layout and gate-publisher metadata have been
+removed locally, restoring the accepted control exactly in these three files.
+The accepted top-k-8 CTA combine remains; 27 focused contracts pass.
+
+The user clarified a target of roughly 6–7 us **per communication leg**.
+For concurrent small messages, fixed transfer and synchronization latency may
+dominate byte volume; it is not necessary to pay that latency separately per
+token. Dispatch and combine are distinct dependency-separated legs, however,
+and current IKET warp exits do not prove their full durations. The 7.680-us
+post-compute combine tail is exposed time, not full communication time. Do not
+claim that all communication is already at target or that the existing analyzer
+extracts six exact internal boundaries.
+
+The next isolated candidate is
+`FastAFD/source/megamoe_combine_tx_20260908`, with matching local candidate
+under `scratch/megamoe_latency_20260908/candidate/`. It preserves payload,
+route IDs, concurrency and reduction order, but aggregates all top-k bulk-TMA
+completion bytes onto one existing barrier: one expected-byte arrival and one
+consumer wait instead of eight (or ten). Every token advances the barrier,
+including an empty route mask. This uses the documented CUDA total-transaction
+count mechanism, not a perfect-routing assumption:
+https://nvidia.github.io/cccl/unstable/libcudacxx/extended_api/synchronization_primitives/barrier.html
+Job `7016706` runs on `nvl72098-T[01-02]`. Results go under
+`FastAFD/artifacts/megamoe_combine_tx_20260908/`.
+The allocation runs a focused arbitrary-routing reference check before exact
+prepared-route Nsight ABBA. Run IKET only if the wall-time win is clear. The
+initial source copy was stopped after copying stale cache data; subsequent sync
+excluded cache/scratch/results, and copied cache data was moved to the artifact
+root. No GPU time was used for source preparation.
+
+The completed ABBA samples from `7016706` reject the aggregate barrier:
+control medians 45.408/44.992 us (mean 45.200), candidate
+45.344/45.760 us (mean 45.552), +0.352 us / +0.779%. Mean-duration averages
+also regress, 45.3227 -> 45.5094 us. Arbitrary-routing prepared/unprepared
+reference checks both passed (cosine 0.999965787, max-abs 1.007961). Keep the
+per-slot barriers in production. This result argues against per-slot barrier
+instruction count as a useful wall-time lever at this geometry. No candidate
+IKET run is justified; source-marker profiling instead diagnoses the accepted
+kernel's actual phase boundaries.
+
+### Minimal FastAFD IKET workload (2026-09-08 PDT)
+
+`codex_scripts/profile_megamoe_iket.sbatch` now provides one self-contained
+OCI-HSG entry point for the exact A8:F1/EP8/batch-6 target above.  It requests
+two trays/eight ranks from `short` for 30 minutes, checks that both trays are in
+one NVL72 fabric block, and runs the 24-row/rank, bucket-3840, 150-SM,
+FP8xFP4, E128/top-k-8 target with fixed perfect-balanced expert IDs.  The smoke
+gained `MEGAMOE_SMOKE_PROFILE_ONLY=1` to skip unrelated numerical shapes,
+`MEGAMOE_SMOKE_FIXED_PERFECT_ONLY=1` for deterministic perfect-balanced IDs,
+`MEGAMOE_SMOKE_PRODUCTION_ROUTES=1` to refresh the same prepared-route metadata
+used by the production call site, and
+`MEGAMOE_SMOKE_OUTPUT` for durable JSON; all default off/empty, preserving the
+existing workflow.  Kernel `MEGAMOE_SMOKE_DEBUG_TIMINGS` is explicitly zero.
+
+The script populates the transformed-weight cache, then uses IKET source
+markers on one rank for three measured replays after one warmup, with seven
+normal peers. `DG_JIT_IKET_INCLUDE` enables the external IKET SDK only for
+profiling; normal builds contain no marker instructions. SDK headers are at
+`FastAFD/source/iket/include` (from the official IKET repository). An absent
+header is an error. `--max-ts-cnt-per-warp 512` replaces legacy `--warp-trace`.
+Six explicit markers define dispatch start/end, compute start/end, and combine
+start/end. The analyzer requires every marker in every measured launch and
+reports phase spans, the union of communication envelopes, dispatch exposure
+before compute, and combine exposure after compute.
+
+Definitions: dispatch starts at dispatch-warp entry and ends after local
+payload publication, excluding cleanup. Compute starts when the first MMA
+operands are ready and ends when the final L2 accumulator is ready in the
+consumer epilogue (not at MMA issue-warp exit). Combine begins at the L2 BF16
+epilogue and ends after source-side reduction; it includes packing, remote
+writes, readiness and local reduction. It overlaps later compute tiles. These
+are explicit software phase boundaries, not isolated NVLink packet latency;
+do not sum overlapping spans. Every marker is warp-uniform and payload-free.
+
+**Correction:** the earlier handoff's claim that CUDA C++ cannot use IKET
+source ranges was incorrect. Official device APIs include
+`CREATE_IKET_MARKER` / `IKET_MARK` in `iket/iket_device_apis.cuh`:
+https://nvidia.atlassian.net/wiki/spaces/GCA/pages/2842262134
+https://gitlab-master.nvidia.com/compute/infrastructure/analysis-tools/in-kernel-event-tracing/-/blob/main/docs/iket_device_api.md
+Legacy jobs below used only warp entry/exit proxies. New marker validation job
+`7016822` uses accepted combine code plus profiling-only annotations from
+`FastAFD/source/megamoe_iket_markers_20260908`; output is in the matching
+`FastAFD/artifacts/megamoe_iket_markers_20260908/7016822`. It has not yet
+established valid six-point data. Marker overhead must be kept separate from
+uninstrumented Nsight timing.
+
+No learned routing decision is part of the selected kernel measurement.  A
+zero-weight route producer refreshes production metadata before each replay,
+but the analyzer selects only the MegaMoE kernel.  For rank `r`, its IDs are
+`(arange(24*8) + r*24*8) % 128`: each token's eight routes reside on one EP
+rank, every local expert is active, and every global expert receives exactly
+12 routes.  The kernel uses prepared route publication, route-ready dispatch,
+rank readiness, and rank-gated combine exactly like production.  Perfect
+balance is only the
+controlled workload distribution: the kernel has no perfect-routing flag or
+route-pattern assumption, and optimizations must remain general for arbitrary
+`topk_idx`.  An accidentally submitted
+TensorRT-LLM job `7011409` was canceled before starting and consumed no GPU
+time.  FastAFD jobs `7012437` and `7012638` established that IKET injection
+aborts during synthetic FP4 requantization setup, before MegaMoE; the harness
+now caches only the profiled rank's transformed weights during the unprofiled
+baseline and reloads them in the injected process.  Job `7012794` was stopped
+when the user clarified that the workload must omit the router.  The focused
+source contract and shell syntax checks passed after the fixed-route revision.
+Prepared-route Nsight Systems ABBA job `7014107` established the accepted
+47.936-us control and 45.104-us candidate kernel-wall medians.  Control IKET
+job `7014576` reports median kernel envelope / compute-pipeline tail /
+post-compute combine tail of 47.136 / 35.392 / 11.392 us.  Candidate IKET job
+`7014768` reports 44.384 / 36.128 / 7.680 us.  Thus the combine tail shrinks
+3.712 us and explains the 2.832-us normal-timing wall win; IKET's isolated
+maxima are profiling outliers and are not optimization baselines.  Each raw
+trace is about 659 MB even with only three target launches because this IKET
+version records roughly 4.7 million setup-kernel warp lifetimes and lacks a
+working CTA/kernel capture filter.  Each extracted decomposition is about
+7 KB.  The script output and decomposition intentionally omit graph cadence
+because the optimization oracle is kernel wall time.
+
+### Current physical-path probe and marker launcher correction
+
+The user asked for first-principles memory-path reasoning. `l1_token_buffer`
+is Linear-1 global staging, **not** hardware L1 cache. Existing dispatch uses
+peer global -> TMA receiver shared -> TMA receiver global staging -> GEMM TMA
+shared. Global accesses may hit L2; do not count each as an HBM round trip.
+Return uses TMEM -> registers -> shared swizzle -> registers -> remote global
+slots -> TMA shared -> register reduction. TMA avoids per-thread register
+traffic, but intermediate copies and completion dependencies can dominate
+small payloads. Removing global staging altogether requires matching dispatch
+ownership to GEMM consumer tiles, a larger architectural change.
+
+General direct-dispatch candidate `FastAFD/source/megamoe_direct_dispatch_20260908`
+uses coalesced uint4 peer loads and local staging stores through registers,
+removing the first shared-memory bounce and its two TMA completion steps.
+Expert-major order, per-route warp assignment, scale/weight/metadata layout,
+release publication and all routing/count behavior remain unchanged. There is
+no shape threshold or perfect-routing special case. A warp sync joins all lane
+payload/scale stores before the elected lane publishes arrival. Risk: LSU
+traffic and register pressure may outweigh the shorter dependency chain.
+Local candidate is under `scratch/megamoe_latency_20260908/direct_dispatch`.
+Job `7016924` runs numerical prepared/unprepared checks then exact source ABBA;
+results are under `FastAFD/artifacts/megamoe_direct_dispatch_20260908`.
+A wall win still requires decomposed timing and nearby-workload confirmation.
+
+Marker job `7016822` successfully compiled and IKET discovered all six source
+markers at offsets 0x120/0x26b0/0x6610/0x78d0/0x8de0/0xbc10. The current SDK
+default is NativeDump (confirmed by instrument.config.json), despite older
+API prose saying PMTRIG5. Its first injected run stalled because source mode
+runs **two processes** (tracker then capture), whereas seven peers ran once.
+Process inspection proved peers terminal on both trays while rank 0 waited in
+the second rendezvous. An overlapping srun rejoined the seven peers to the
+still-live capture, rather than restarting the job; exec session `81739`
+monitors that recovery. The local script now runs non-profiled peers twice in
+source mode. Do not run another single-peer-pass version. Full marker result
+and recovery status remain pending.
+
+
+Marker job `7016822` is terminal FAILED (10:59, exit 250). Rejoining peers
+successfully completed the profiled kernel with status ok; postprocessing then
+failed with IKET error 6 (invalid event record). Raw data was preserved locally
+as `scratch/megamoe_latency_20260908/results/iket-native.data.json` (2.9 MB).
+Dispatch records are IDs 1/2 as intended, but leader MMA warps contain many
+unexpected records and exceed the intended count; do not decode this into
+claimed timing data. Corrected retry `7016973` uses the two-pass peer fix,
+explicit PMTRIG5 placeholders, and the existing first-iteration/K-block
+condition rather than a new state flag for the compute-start marker. It reuses
+the extension cache from `7016822` and uses the same marker-source directory;
+source snapshots in each job's patch distinguish them. `7016924` direct-copy
+ABBA was RUNNING at 1:51 on nvl72067-T[03-04], compiling the extension.
+
 ## Active 1K A1:F1/EP4 capacity boundary (2026-09-04 PDT)
 
 Slurm job `6921834` completed `0:0` in 19:48 as the first real maximum-batch
@@ -4020,3 +4511,10 @@ For future GPU work:
 - Treat FEP8 job `6494759` as the latest scaling profile.
 - Do not infer that current ATP1 supports batch 7 or batch 8 at 128K.
 - Do not restart A7, A8, A15, or a broad campaign without explicit user direction.
+
+User reaffirmed non-overfitting on this continuation: use the exact case as a
+latency microscope, not as a kernel assumption. Future accepted changes must
+support arbitrary route IDs and uneven source counts, and a promising normal
+kernel-wall win needs a nearby workload non-regression check before promotion.
+No tile/SM/threshold sweeps or perfect-pattern-only dispatch. Both rejected
+candidates remain isolated; normal accepted code keeps the established paths.

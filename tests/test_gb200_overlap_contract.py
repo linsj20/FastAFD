@@ -1053,6 +1053,23 @@ class GB200OverlapContractTests(unittest.TestCase):
         )
 
     def test_fmha_megamoe_adds_fp8_fp8_without_replacing_fp8_fp4(self) -> None:
+        iket_source = (
+            ROOT / "codex_scripts/profile_megamoe_iket.sbatch"
+        ).read_text()
+        self.assertIn("#SBATCH --qos=short", iket_source)
+        self.assertIn("#SBATCH --time=00:30:00", iket_source)
+        self.assertIn("#SBATCH --nodes=2", iket_source)
+        self.assertIn("#SBATCH --segment=2", iket_source)
+        self.assertIn("#SBATCH --ntasks=8", iket_source)
+        self.assertIn("MEGAMOE_SMOKE_PROFILE_ONLY=1", iket_source)
+        self.assertIn("MEGAMOE_SMOKE_FIXED_PERFECT_ONLY=1", iket_source)
+        self.assertIn("MEGAMOE_SMOKE_PRODUCTION_ROUTES=1", iket_source)
+        self.assertIn("MEGAMOE_SMOKE_DEBUG_TIMINGS=0", iket_source)
+        self.assertNotIn("MEGAMOE_SMOKE_PERFECT_ROUTING=", iket_source)
+        self.assertNotIn("MEGAMOE_SMOKE_SPECIALIZATION_MODES=", iket_source)
+        self.assertIn('"compute_pipeline_tail_us"', iket_source)
+        self.assertNotIn('"comm_bookend_proxy_us"', iket_source)
+
         api_source = (
             ROOT
             / "python/minisgl/kernel/csrc/deepgemm/csrc/apis/mega.hpp"
@@ -1102,7 +1119,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         )
         self.assertIn("st_release_sys", kernel_source)
         self.assertIn(
-            "if constexpr (kNumTopk == 10 and kHidden == 4096)",
+            "if constexpr ((kNumTopk == 8 or kNumTopk == 10) and kHidden == 4096)",
             kernel_source,
         )
         self.assertIn(
@@ -1114,6 +1131,10 @@ class GB200OverlapContractTests(unittest.TestCase):
             "combine_barriers[topk_idx]->wait(combine_phase)", kernel_source
         )
         self.assertIn("uint4 contributions[kNumTopk] = {};", kernel_source)
+        self.assertIn("if constexpr (kNumTopk == 8)", kernel_source)
+        self.assertNotIn("float2 pair_sums[4];", kernel_source)
+        self.assertIn("float2 reduced = {};", kernel_source)
+        self.assertIn("ptx::accumulate(", kernel_source)
         self.assertIn("float2 pair_sums[5];", kernel_source)
         self.assertIn(
             "reinterpret_cast<uint4*>(y)[\n"
@@ -1185,11 +1206,23 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("MEGAMOE_SMOKE_SPECIALIZATION_MODES", smoke_source)
         self.assertIn("MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES", smoke_source)
         self.assertIn("MEGAMOE_SMOKE_NUM_EXPERTS", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_PROFILE_ONLY", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_FIXED_PERFECT_ONLY", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_PRODUCTION_ROUTES", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_OUTPUT", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_WEIGHT_CACHE_INPUT", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT", smoke_source)
+        self.assertIn("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", smoke_source)
         self.assertIn("MEGAMOE_NUMERIC_NUM_EXPERTS", smoke_source)
         self.assertIn("MEGAMOE_NUMERIC_TOP_K", smoke_source)
-        self.assertIn("world_size not in (4, 8)", smoke_source)
+        self.assertIn("world_size not in (2, 4, 8, 16, 32, 64)", smoke_source)
         self.assertIn("MegaMoE specialization is not bitwise equal", smoke_source)
         self.assertIn("hidden_views", smoke_source)
+
+        smoke_job_source = (
+            ROOT / "scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch"
+        ).read_text()
+        self.assertIn("MEGAMOE_SMOKE_JOB_SCRIPT", smoke_job_source)
 
         weight_source = (
             ROOT / "python/minisgl/kernel/megamoe_m2n_mega.py"

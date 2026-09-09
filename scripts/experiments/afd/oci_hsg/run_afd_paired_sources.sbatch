@@ -69,6 +69,7 @@ for index in "${!labels[@]}"; do
     FASTAFD_EXPECTED_HEAD="${expected_heads[$index]}" \
     FASTAFD_IMAGE="$FASTAFD_IMAGE" \
     MINISGL_DEEPGEMM_BUILD_DIR="$cache_root/deepgemm" \
+    DG_JIT_CACHE_DIR="$cache_root/jit" \
     TVM_FFI_CACHE_DIR="$cache_root/tvm_ffi" \
         bash "$control_dir/run_afd_bundle.sh"
     printf 'FASTAFD_PAIRED_SOURCE_COMPLETE label=%s index=%s\n' "$label" "$index"

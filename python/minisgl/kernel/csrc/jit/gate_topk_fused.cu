@@ -13,6 +13,7 @@
 #include <minisgl/tensor.h>
 #include <minisgl/utils.cuh>
 #include <minisgl/utils.h>
+#include <minisgl/valid_tokens.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -213,8 +214,14 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
     dst[0] = *reinterpret_cast<uint4*>(packed);
     dst[1] = *reinterpret_cast<uint4*>(packed + 4);
   };
-  for (int st = 0; st < kStages - 1 && st < num_chunks; ++st)
-    load_stage(st, k_begin + st * kKChunk);
+  // Preserve the wait-group distance even when K cannot fill the pipeline.
+  // Empty groups keep the first consumed copy older than kStages - 1 groups.
+  for (int st = 0; st < kStages - 1; ++st) {
+    if (st < num_chunks)
+      load_stage(st, k_begin + st * kKChunk);
+    else
+      cp_async_commit();
+  }
   for (int c = 0; c < num_chunks; ++c) {
     const int cur = c % kStages;
     if (c + kStages - 1 < num_chunks)
@@ -319,11 +326,12 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
   {
     const int t = warp;
     const int token = m0 + t;
+    const auto validity =
+        minisgl::token_validity(token, num_tokens, valid_token_count, valid_count_size);
     if (token >= num_tokens) {
       if constexpr (!kPrepareMegaMoERoutes)
         return;
-    } else if (valid_count_size != 0 &&
-               token >= min(static_cast<int>(valid_token_count[0]), num_tokens)) {
+    } else if (!validity.valid) {
       if (lane < topk) {
         topk_ids[static_cast<size_t>(token) * topk + lane] =
             static_cast<IndexT>(-1);
@@ -391,18 +399,15 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
       if (lane == j) {
         my_logit = v;
         if constexpr (kPerfectBalance) {
-          const int valid_tokens = valid_count_size == 0
-                                       ? num_tokens
-                                       : min(static_cast<int>(valid_token_count[0]),
-                                             num_tokens);
           // Replace the original expert-id finalization in place. Perfect mode
           // admits only power-of-two expert counts, so the balanced sequence
           // uses 32-bit multiply/add/mask arithmetic rather than a division.
           // The normal GEMM, softmax, and top-k work above remains unchanged,
           // with no extra kernel, graph node, synchronization, copy, or
           // device-side runtime branch.
-          my_expert = ((route_rank * valid_tokens + token) * topk + lane) &
-                      (num_experts - 1);
+          my_expert =
+              ((route_rank * validity.total + validity.compact_index) * topk + lane) &
+              (num_experts - 1);
         } else {
           my_expert = wbi * kWarpSize + static_cast<int>(src);
         }
@@ -511,13 +516,14 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
       }
       __syncthreads();
       if constexpr (kRankReadyRoutePublish) {
-        if (threadIdx.x < route_num_ranks) {
+        for (int dst = static_cast<int>(threadIdx.x);
+             dst < route_num_ranks; dst += static_cast<int>(blockDim.x)) {
           const auto route_ready_offset =
               reinterpret_cast<uintptr_t>(
                   workspace.get_route_ready_count_ptr()) -
               reinterpret_cast<uintptr_t>(route_workspace);
           auto* remote_route_ready = reinterpret_cast<uint64_t*>(
-              static_cast<uintptr_t>(route_buffer_ptrs[threadIdx.x]) +
+              static_cast<uintptr_t>(route_buffer_ptrs[dst]) +
               route_ready_offset);
           // One release per destination orders every per-expert count and
           // source-index store above while avoiding a system atomic per expert.
@@ -565,11 +571,9 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
   __shared__ int warp_experts[kWarps * kWarpSize];
   __shared__ int selected_experts[kTopK];
   __shared__ float selected_logits[kTopK];
-  const int valid_tokens = valid_count_size == 0
-                               ? num_tokens
-                               : min(static_cast<int>(valid_token_count[0]),
-                                     num_tokens);
-  const bool valid = token < valid_tokens;
+  const auto validity =
+      minisgl::token_validity(token, num_tokens, valid_token_count, valid_count_size);
+  const bool valid = validity.valid;
 
   if (valid) {
     const float* token_logits =
@@ -647,8 +651,9 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
       if (tid < kTopK) {
         int expert = selected_experts[tid];
         if constexpr (kPerfectBalance) {
-          expert = ((route_rank * valid_tokens + token) * kTopK + tid) &
-                   (kExperts - 1);
+          expert =
+              ((route_rank * validity.total + validity.compact_index) * kTopK + tid) &
+              (kExperts - 1);
         }
         const auto mapped_expert = expert_map == nullptr
                                        ? static_cast<MapT>(expert)
@@ -742,13 +747,13 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
       }
       __syncthreads();
       if constexpr (kRankReadyRoutePublish) {
-        if (tid < route_num_ranks) {
+        for (int dst = tid; dst < route_num_ranks; dst += kTPB) {
           const auto route_ready_offset =
               reinterpret_cast<uintptr_t>(
                   workspace.get_route_ready_count_ptr()) -
               reinterpret_cast<uintptr_t>(route_workspace);
           auto* remote_route_ready = reinterpret_cast<uint64_t*>(
-              static_cast<uintptr_t>(route_buffer_ptrs[tid]) +
+              static_cast<uintptr_t>(route_buffer_ptrs[dst]) +
               route_ready_offset);
           deep_gemm::ptx::atomic_add_rel_sys(remote_route_ready, 1);
         }
@@ -838,8 +843,9 @@ struct GateTopkFusedKernel {
                  "expert_map must be empty or have num_experts entries, got ",
                  expert_map.size(0), " vs ", experts);
     RuntimeCheck(valid_token_count.size(0) == 0 ||
-                     valid_token_count.size(0) == 1,
-                 "valid_token_count must be empty or shape [1], got ",
+                     valid_token_count.size(0) == 1 ||
+                     valid_token_count.size(0) == rows + 1,
+                 "valid-token metadata must be empty, scalar, or [total, row map], got ",
                  valid_token_count.size(0));
 
     const bool prepare_routes = route_workspace.has_value();

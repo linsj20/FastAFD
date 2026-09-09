@@ -1,5 +1,227 @@
 # Project Memory
 
+## Padding-fix amendment checkpoint (2026-09-09)
+
+User requested cleanup, amendment into the latest MegaMoE commit, then push
+fmha_only to linsj20. Cleanup is limited to formatting and stale smoke-test
+names (prefixes/sources become validity/row_map); validated runtime behavior
+is unchanged. Sync cleaned source, tests and scripts to R/local-mirror before
+checks. Focused CPU padding-replay regression and launcher bash -n pass there;
+local git diff --check passes. Existing GPU/alignment/kernel evidence below
+is retained; no new GPU jobs or e2e timing. Preserve both frozen source variants.
+Include code, reusable validation scripts and project memory in amendment;
+exclude all generated results/reports. Existing remote fmha_only is an ancestor,
+so use a normal push to linsj20, without force. No global skill/rule changes
+needed. CPU check command uses PYTHONPATH=python and the pinned environment
+R/../fastafd_reproduce/envs/minisgl-3c716194-cuda130.artifact-5175891/bin/python
+on the login node (system python lacks torch); tests/test_afd_fmha_runtime.py
+AfdFmhaRuntimeScheduleTest.test_decode_replay_preserves_each_sources_padding -v.
+Local check log: scratch/megamoe_cpu_validity_20260909/amend_checks.log.
+
+## Remove GPU padding arithmetic (2026-09-09, validated and retained)
+
+User requested moving padding overhead off GPU and validating actual AFD
+performance. Candidate CPU-prepares [total, compact_index_per_row] with -1
+for padding, replacing per-source GPU division/prefix arithmetic with a direct
+row load. Normal routing does not consume total; perfect routing uses the same
+compact expert sequence. Scalar/no-mask API paths remain unchanged. CPU fills
+the pinned map with vectorized NumPy operations and an allocation-time iota;
+one H2D copy per MB remains, payload grows16->72B for A2/8 padded rows.
+No new kernel/event or communication change. Old fully aligned source remains
+R/source/megamoe_source_padding_fix_20260909; new candidate is
+R/source/megamoe_cpu_validity_20260909. Candidate included in amendment above.
+Artifacts use R/artifacts/megamoe_cpu_validity_20260909 and matching scratch.
+Focused remote CPU replay regression passed1/1 in0.032s. CUDA router check
+7038505 COMPLETED0:0 in1:48,4 GPUs/1tray. Same8 correctness shapes passed.
+ABBA router graph means:8 rows scalar6.2832/map6.39008us (+0.10688);
+32 rows scalar8.19184/map8.32320us (+0.13136);128 rows scalar8.48704/map8.58720us
+(+0.10016). Source arithmetic removed from GPU; lookup overhead remains,
+so do not claim zero GPU overhead. Old per-source calculation added~0.2552us.
+
+Completed7038673 (0:0,45:05): real A2:F1/EP8/b7/128K/MB2/normal-routing source pair
+using existing run_afd_paired_sources.sbatch, one6-tray allocation,short1hr.
+Control=aligned per-source-prefix fix; candidate=CPU row map. Each source gets
+same112 prompts/17 tokens,memory0.97,NSYS15-step timing; no new vLLM. Compare
+both output bundles with saved vLLM references and extract existing strict
+dual-role CUDA graph span metrics. Config normal_pair.tsv and
+plans/normal_pair_env.json,plan normal_a2.csv,pools normal_{control,candidate}.
+Submitted manually after router check completed; monitored every3min.
+Pair logs are pair-7038673.out/.err. Both frozen source snapshots preserved.
+Both cached alignments pass:1904/1904 top10,1902/1904 top1. All112 prompts
+and1904 generated tokens byte-identical between sources. No new vLLM run.
+Whole-step GPU mean27.59092->27.83018ms (+0.867%) initially raised concern;
+user explicitly directed kernel performance acceptance instead, since e2e
+is noisy. No additional e2e performance run. Both sources used same24 GPUs
+nvl72106-T[01-06], and batch7 capacity gate passed (993024 KV tokens).
+
+Saved actual AFD model:rank17 Nsight traces confirm router improvement.
+Exclude first graph launch as warmup; retain all15 remaining launches,
+2079 kernel nodes/launch,188 calls/family/step (2820 total per source):
+- Gate GEMM mean4.418855->4.419525us; median4.416->4.416us.
+- Route selector mean8.213515->8.034667us (-0.178848us,-2.177%);
+  median8.288->8.064us. Improvement appears in every measured step.
+- Sum of router kernel means12.632370->12.454191us (-0.178179us).
+- MegaMoE mean63.126272->63.369651us (+0.386%); median61.312->61.376us
+  (+0.104%); p9566.143->66.496us. Essentially stable in this pair, not proof
+  of exact performance equality. All outliers retained (max1263.040/1179.008us).
+Retain CPU-map candidate: real router benefit, no material MegaMoE regression
+observed, exact output preservation. Source/test/scripts synchronized to
+local-mirror; included in amendment above. No jobs remain. Kernel summary.json and per_step.csv
+under artifact kernel_analysis/ and matching local scratch; pair summary and
+cached alignment JSONs retained there too. Nsight duration=end-start; router
+sum excludes launch gaps. Kernel results are for profiled rank17, not all ranks.
+CPU-only trace extraction: login host lacked nsys, so unsquashfs extracted only
+the existing image's NsightSystems-cli-2025.5.1 subtree into artifact cpu_tools/;
+target-linux-sbsa-armv8/nsys exported kernel/StringIds tables to SQLite without
+allocating GPUs. Full SQLite and reports remain remote.
+
+## Fan-in padding fix and exact A2 rerun (2026-09-09, PASSED)
+
+User requested fixing failed A2:F1/EP8/b7, checking perf impact, then rerunning
+the SAME A2 case. Explicitly no new vLLM run: reuse saved prompts/references.
+Root cause: merged MB0 rows are [RRRP][RRRP] but scalar valid_count6 masks
+as [RRRRRRPP], routing a dummy and dropping source1's third real request.
+This predicts all eight severe failures at prompt indices33,35,...,47.
+Fix uses cumulative per-source valid counts ([3,6]) in existing pinned/device
+graph buffers and H2D copies. Shared CUDA helper derives source-local validity,
+compact real-token index and total; fused Qwen3/Qwen3.5 and group-local selectors
+use it. Perfect routing uses compact index, preserving balance despite holes.
+No extra kernels/events/synchronization; scalar/no-count behavior retained.
+Runtime and router code are changed locally; candidate snapshot is
+R/source/megamoe_source_padding_fix_20260909 based on de837f5 plus these edits.
+Candidate retained as the validated snapshot. Artifacts/plans/logs under
+R/artifacts/megamoe_source_padding_fix_20260909; matching local scratch dir.
+
+Focused remote CPU replay test passed1/1 in0.032s (batch7,unequal,empty source).
+CUDA router check7037970 COMPLETED0:0 in1:50:8 shapes, E128/top8 and E512/top10,
+fused/group-local valid rows byte-exact vs unmasked routing, invalid rows -1/0.
+ABBA CUDA-graph router timing on identical full8-row work: scalar6.4864/6.4643us,
+per-source6.7456/6.7155us, ~0.2552us added per router call. This is router-only
+overhead, not an end-to-end measurement. No MoE arithmetic or comm change.
+
+Exact failed-case AFD rerun7038012 COMPLETED0:0 in21:10, after check ended:
+attn-only A2:F1,EP8,ATP1,batch7,MB2,normal routing,FP8xFP4,128K,112 prompts,
+17 output tokens,24 GPUs/6 trays,short1hr,memory0.97,capacity-max gate,NSYS0.
+Run basename afd_qwen3_131072_r2_ag16_fg8_atp1_fep8_adp16_b7_n6_20260909_173113_manual_na.
+No scorer job. codex_scripts/compare_cached_alignment.py passed using its
+experiment/sample.json with saved refs:
+- R/artifacts/megamoe_alignment_a2_ep8_b7_20260909/alignment_score/alignment.json
+- R/artifacts/megamoe_final_e2e_20260909/alignment_score_retry/alignment.json
+The earlier passing A1 scorer covers the exact same first48 prompts, including
+all eight corrupted cases, with fully top1 continuations. Newer cached scores
+cover all112 including prompt87's small rank<=3 deviations. Comparator only
+reuses scores at identical prompt and generated prefix; missing coverage must
+fail explicitly, never claim alignment beyond saved context. Monitored every3min.
+Final cached alignment:112 prompts/1904 tokens,1904/1904 covered,1904/1904
+top10 (100%),1902/1904 top1 (99.89496%),no missing reference context.
+Exactly the eight corrupt prompt outputs changed (33,35,37,39,41,43,45,47);
+all112 input prompts identical and all other104 continuations unchanged.
+The two non-top1 tokens remain the original prompt87 positions8 and13,
+both rank3, unchanged by the fix. All eight corrupt cases now match the old
+fully-top1 continuations. This passes the official top10 criterion, not a
+claim of100% top1. Local/remote compact summary.json and cached_alignment.json
+retained with original full remote samples. No jobs remain for this task.
+Fix and test scripts synchronized to local-mirror; no new commit requested.
+Cached comparator reproduced the original failed A2 score exactly:1904/1904
+covered,1810 top1,1820 top10,exit1 expected. No vLLM rerun or GPU involved.
+Clarified to user: this modifies the existing router, not a new kernel/call.
+Any multi-source AFD graph with internal padding is affected by the old scalar
+mask; batch7/MB2 A>=2 is one instance. A1 has only trailing padding; exact3+3
+batch6 has none. Standalone MegaMoE sweep does not use the faulty merged AFD
+layout. Old affected AFD timings are not numerical validation; confirming
+performance claims on corrected routing remains separate from this alignment.
+
+## Current-code A2:F1 alignment (2026-09-09, FAILED)
+
+User requested attn-only A2:F1, EP8, batch7 alignment on current code.
+Generation job7036680 COMPLETED0:0 in20:55 on24 GPUs/6 trays,
+nvl72114-T[04-05,07,09-11], short QoS/1hr. Frozen source commit de837f5
+under R/source/megamoe_alignment_a2_ep8_b7_20260909; R is the consolidated
+remote root below. Outputs/plans/submission.log under
+R/artifacts/megamoe_alignment_a2_ep8_b7_20260909. Local matching scratch dir.
+Settings: normal routing, perf0, FP8xFP4,128K,ATP1,MB2 real3+4/padded4+4,
+16 attention +8 FFN GPUs,112 prompts,17 output tokens per prompt expected.
+Batch7 requires memory_ratio0.97 (nominal KV979200), capacity-max gate enabled;
+0.82 only fits batch6. Dry run passed. No Nsight for this alignment run.
+User then explicitly requested a dependent scorer; submitted7036724 manually
+with afterok:7036680 and kill-on-invalid-dep=yes,4 GPUs,short QoS/1hr.
+This authorizes a queued dependent job while retaining one running allocation.
+Scorer7036724 FAILED1:0 in25:11 on nvl72069-T12 after completing all112
+requests. Alignment gate failed; no jobs remain for this test.
+Scorer uses same frozen source/model profile, sample.json from generation run,
+OUTPUT_ROOT=<artifact-root>/alignment_score. Submission/env saved beside plans.
+Current-code e2e alignment FAILED:1904 tokens, top1=95.06302521008403%,
+top10=95.58823529411765%,top100=96.21848739495799%;94 non-top1 tokens,
+84 outside top10,max rank60564. Nine prompts contain non-top1 tokens:
+zero-based indices33,35,37,39,41,43,45,47,87. The first eight account for all
+top10 failures; prompt87 only has two rank2/3 deviations. Other103 prompts
+have100% top1 agreement. Pattern noted, cause not established. No rerun or
+code fix attempted under the monitoring request. Compact alignment_summary.json
+saved in local matching scratch and remote artifact root; full alignment.json
+remains under remote alignment_score. Earlier A1:F1/b6 pass below predates
+EP64 fixes in de837f5 and covers a different shape; do not equate validations.
+
+## MegaMoE progress checkpoint (2026-09-09)
+
+User requested a git commit after the completed optimization/sweep/report.
+Checkpoint includes runtime fixes, profiling/sweep/validation tooling, tests
+and project memory. User explicitly excludes result files and reports from
+the commit; generated CSV/HTML/audit artifacts remain under scratch and on the
+remote artifact tree. Stale ordered-combine/EP-range test expectations corrected.
+Four focused CPU contract tests and seven shell syntax checks passed remotely
+against synchronized code; no new GPU run. Existing byte-exact, e2e alignment
+and164-case evidence retained. No global skill/rule changes were needed.
+
+## Completed MegaMoE decomposition sweep (2026-09-09)
+
+See `CODEX_PROJECT_megamoe_sweep.md`: EP2–64, MB2, batch1–7 /1–4 tokens
+per attention GPU, all deduplicated NVL72 A:F inputs, integer-balanced routes.
+All164 unique cases /455 AFD aliases complete, each with three IKET samples
+and its own decomposition CSV. Final7028073 COMPLETED0:0 in39:22. Artifact
+audit passed492 samples and all15 successful capture jobs (serial submissions,
+short QoS,one-hour limits). No sweep jobs remain. Results, comparison tables,
+allocation records and audit: scratch/megamoe_input_sweep_20260909/results/.
+EP64 is the explicitly labeled A1:F8 exception within NVL72; its~6us cleanup
+tail and retained IKET dispatch outliers remain future study, not sweep blockers.
+
+## Validated MegaMoE latency result (2026-09-09 UTC)
+
+The requested optimization and final validation are complete; no GPU jobs
+remain active for this task. Main code and local-mirror retain the early
+routing-weight read, CTA bulk-TMA combine with original ascending valid-slot
+PTX accumulation, and the validated short-K producer prefill correction.
+Pairwise top-k8 summation is removed because it can change results. Prefix
+lookup was rejected: its 0.112 us apparent gain was below 0.416 us control drift.
+Included in the MegaMoE progress checkpoint; unrelated Qwen3.5 work is preserved.
+
+- Byte-exact source comparison 7019473 passed on 8 ranks: original control,
+  control repeat, ordered combine/early-weight and prefix each had 56 records.
+  Independent producer quantization also passed. No extra numeric matrix.
+- Final six-point profile 7019787: Nsight kernel median 44.064 us; dispatch
+  span 10.304 us; compute span 26.336 us; exposed combine 7.296 us;
+  post-CombineEnd tail 0.512 us median / 0.800 us max. One dispatch startup
+  outlier of 16.224 us is retained. The 6–7 us dispatch aspiration is still
+  unmet; the interim ~8 us exposed-combine/no-long-tail target is met.
+- Final A1:F1/EP8/batch6, 128K, ATP1, MB2, attn-only, FP8xFP4 generation
+  7019832 passed. Official scorer 7020231 passed all 48 prompts/816 tokens:
+  top-1/top-10/top-100 = 1.0, average/max vLLM rank = 1.0. Individual steps
+  checked. Initial scorer 7019850 failed before scoring on a too-long Unix
+  socket path; fixed only transient IPC location and reused the same sample.
+- Same-allocation perf-mode source pair 7019851: old 24.098079 ms versus
+  retained 23.553900 ms, improving 2.258%; TPS/active GPU 124.491253 to
+  127.367442 (+2.310%). Both use perfect balance and all 16 GPUs; unchanged
+  policy retains 14/15 control steps (1 outlier) and 15/15 candidate steps.
+  This is one paired result, not an extrapolation from standalone timings.
+
+Full concise results: scratch/megamoe_latency_20260908/RESULTS.md.
+Resume details, source/artifact paths and historical evidence:
+scratch/HANDOFF_megamoe_latency_20260908.md. Local compact proof is under
+scratch/megamoe_latency_20260908/results/{final_e2e,final_ordered_iket,exact_results}.
+The earlier fixed-global-work EP4/8/16 test supports roughly inverse-EP compute;
+its 22.128 us fitted fixed term is from earlier code and is not pure wire latency.
+An unrelated E<128 quantization-coverage correction remains isolated and untested
+on GPU; it was deliberately not expanded under the minimum-checking instruction.
+
 ## Required remote workspace layout
 
 The consolidated remote root is
@@ -29,6 +251,75 @@ checkout is authoritative. Its sole accepted execution mirror is
 `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD/local-mirror`;
 preserved Qwen3/Qwen3.5 evidence and archives live under the sibling
 `FastAFD/artifacts/` tree.
+
+## Historical A8:F1/EP8 MegaMoE investigation (2026-09-08 PDT)
+
+Exact standalone input:24 rows/EP rank, H4096/I1536, E128/top-k8,
+FP8 activations/FP4 weights,150 SMs,bucket3840,two trays,prepared production
+route metadata and perfect balance. Perfect balance is never a kernel
+assumption; preserve arbitrary routes and uneven source counts. User explicitly
+requires first-principles memory-path reasoning and no target overfitting.
+Target6–7us per communication leg; no tile/SM/threshold tuning. Nsight kernel
+wall time is the oracle; no harness cadence or new clock64 timing.
+
+Accepted top-k8 CTA-per-token bulk-TMA/pairwise combine: source ABBA7014107
+47.936 ->45.104us(-5.91%). Legacy warp-only IKET7014576/7014768 showed exposed
+post-compute combine tail11.392 ->7.680us; those are not full comm durations.
+M16(7015208),parallel TMA issue(7015677),CTA-token dedup(7016290),warp-token
+dedup(7016530),and aggregate combine barrier(7016706) are rejected. Dedup
+branches/layout/gate metadata were removed locally; accepted combine remains.
+
+Rejected candidate `source/megamoe_direct_dispatch_20260908` replaces dispatch's
+peer-global ->shared ->local-global bounce with coalesced copying through
+registers, preserving scheduling/routing/publication. `l1_token_buffer` denotes
+Linear-1 global staging, not L1 cache. Job7016924 passed numerical checks and
+measured47.632 ->45.984us(-3.46%), but control drift2.464us prevents acceptance.
+Validation7017020 completed0:0 in15:34:24 rows46.336 ->46.336us,
+12 rows44.464 ->44.512us,48 rows49.296 ->49.072us (mean durations regress
+49.147 ->49.440us). Reject direct copy as neutral/noisy; retain TMA dispatch.
+Outputs: `artifacts/megamoe_direct_dispatch_20260908/validation/rows{24,12,48}`;
+local CSVs and summary under `scratch/megamoe_latency_20260908/results/direct_dispatch/validation`.
+
+
+Official IKET CUDA C++ marker APIs correct the earlier unsupported-API claim.
+Profiling-only compiler/kernel support plus `profile_megamoe_iket.sbatch`
+now define six explicit source points and overlapping phase envelopes. Normal
+builds compile markers out. First capture7016822 exposed a two-pass peer-launch
+defect and then invalid NativeDump event records; timestamps are rejected.
+PMTRIG5/two-pass-peer job7016973 failed because installed IKET lacked SModel.
+Official SDK documents predicated-marker ghost slots explaining the earlier
+NativeDump overflow. Isolated SModel dependencies were prepared on the login
+CPU and resource selection passed for all six markers in the captured binary.
+Retry7017202 completed0:0 in3:02 with512 slots/warp and profiler-only
+`source/iket-smodel` dependencies. Three measured launches have all six
+ordered boundaries. Median dispatch11.616us, compute24.448us, combine18.976us;
+combine overlaps compute and exposes8.064us afterward. These are software
+envelopes, not pure NVLink latency. Local validated decomposition/trace:
+`scratch/megamoe_latency_20260908/results/iket_markers/7017202`.
+Control7017340 completed0:0 in4:22: exposed combine10.560us versus8.064us
+accepted; source compute spans24.960/24.448us. Its one long dispatch outlier is
+retained. Accepted post-CombineEnd tails0.960/1.344/1.600us show no long tail in
+three measured launches. User accepts~8us for now with this condition.
+
+User next requested EP scaling and a `T(EP)=A/EP+C` latency-floor estimate.
+Active EP4/8/16 jobs7017478/7017479/7017480 use1/2/4 trays respectively (the
+new scaling request expands the former exact-case two-tray constraint), all
+GPUs active. Fixed192 global tokens,48/24/12 rows per rank,12 routes/expert,
+model/precision/150SM/bucket3840 unchanged. No tile or SM sweep. Source:
+`source/megamoe_ep_scaling_20260908`; outputs:
+`artifacts/megamoe_ep_scaling_20260908/ep{4,8,16}/<job>`.
+The existing profiler now collects uninstrumented Nsight in its normal pass,
+then six-point IKET separately (1024 slots/warp to cover EP4's greater work).
+Compiler flags participate in JIT caching, keeping the two kernels distinct.
+Smoke accepts16 ranks and records EP/global tokens/iterations. Local27 focused
+contracts and shell syntax pass after updating stale topology assertions.
+Fit total Nsight time and compute spans separately; report ratios, residuals,
+and pairwise intercepts. C includes non-scaling setup/synchronization costs,
+not just NVLink latency. Do not assume exact1/EP compute scaling or a literal
+infinite-EP floor. Source frozen while jobs live. Accepted task files synchronized to local-mirror; no commit.
+Details, exact paths, sources and live handles:
+`CODEX_PROJECT_qwen3_ffn_overheads.md` and
+`scratch/HANDOFF_megamoe_latency_20260908.md`.
 
 ## Active 1K perfect-routing maximum-batch search (2026-09-04 PDT)
 

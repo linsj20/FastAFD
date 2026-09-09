@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Same-fabric ABBA comparison for two clean MegaMoE source trees.
+# Same-fabric ABBA comparison for two MegaMoE source trees.
 # Required: FASTAFD_CONTROL_SOURCE FASTAFD_CONTROL_HEAD
 #           FASTAFD_CANDIDATE_SOURCE FASTAFD_CANDIDATE_HEAD
 #           FASTAFD_IMAGE FASTAFD_VENV OUTPUT_ROOT
 # Optional: MEGAMOE_ABBA_CONTROL_CACHE_ROOT MEGAMOE_ABBA_CANDIDATE_CACHE_ROOT
+#           MEGAMOE_ABBA_ALLOW_DIRTY, MEGAMOE_SMOKE_PROFILE_ONLY,
+#           MEGAMOE_SMOKE_FIXED_PERFECT_ONLY,
+#           MEGAMOE_SMOKE_PRODUCTION_ROUTES, MEGAMOE_ABBA_NSYS,
+#           MEGAMOE_ABBA_NSYS_{WARMUPS,ITERATIONS}
 # Smoke-shape and precision variables must be explicit and are forwarded.
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --partition=batch
 #SBATCH --qos=short
 #SBATCH --time=00:30:00
-#SBATCH --nodes=1
-#SBATCH --segment=1
+#SBATCH --nodes=2
+#SBATCH --segment=2
+#SBATCH --ntasks=8
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:4
@@ -83,21 +88,34 @@ verify_source() {
         exit 2
     }
     status=$(git -C "$source_path" status --porcelain)
-    [[ -z "$status" ]] || {
+    [[ -z "$status" || ${MEGAMOE_ABBA_ALLOW_DIRTY:-0} == 1 ]] || {
         echo "source is dirty: $source_path" >&2
         printf '%s\n' "$status" >&2
         exit 2
     }
+    if [[ -n "$status" ]]; then
+        echo "SOURCE_STATUS_BEGIN=$source_path"
+        printf '%s\n' "$status"
+        echo "SOURCE_STATUS_END=$source_path"
+    fi
 }
 
 run_case() {
     local label=$1 source_path=$2 cache_label=$3
     local run_root="$OUTPUT_ROOT/$label"
-    local cache_root
+    local cache_root warmups iterations nsys_output
     if [[ "$cache_label" == control ]]; then
         cache_root=${MEGAMOE_ABBA_CONTROL_CACHE_ROOT:-$MEGAMOE_ABBA_CACHE_ROOT/control}
     else
         cache_root=${MEGAMOE_ABBA_CANDIDATE_CACHE_ROOT:-$MEGAMOE_ABBA_CACHE_ROOT/candidate}
+    fi
+    warmups=$MEGAMOE_SMOKE_WARMUPS
+    iterations=$MEGAMOE_SMOKE_ITERATIONS
+    nsys_output=
+    if [[ ${MEGAMOE_ABBA_NSYS:-0} == 1 ]]; then
+        warmups=${MEGAMOE_ABBA_NSYS_WARMUPS:-1}
+        iterations=${MEGAMOE_ABBA_NSYS_ITERATIONS:-3}
+        nsys_output=$run_root/nsys/megamoe
     fi
     echo "CASE=$label SOURCE=$source_path HEAD=$(git -C "$source_path" rev-parse --short HEAD)"
     FASTAFD_SOURCE_REPO="$source_path" \
@@ -105,14 +123,19 @@ run_case() {
     FASTAFD_VENV="$FASTAFD_VENV" \
     OUTPUT_ROOT="$run_root" \
     MINISGL_DEEPGEMM_BUILD_DIR="$cache_root/deepgemm" \
+    DG_JIT_CACHE_DIR="$cache_root/jit" \
     TVM_FFI_CACHE_DIR="$cache_root/tvm_ffi" \
     MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE="$MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE" \
     MEGAMOE_SMOKE_ROWS="$MEGAMOE_ABBA_ROWS" \
     MEGAMOE_SMOKE_SMS="$MEGAMOE_SMOKE_SMS" \
     MEGAMOE_SMOKE_BUCKET="$MEGAMOE_SMOKE_BUCKET" \
-    MEGAMOE_SMOKE_WARMUPS="$MEGAMOE_SMOKE_WARMUPS" \
-    MEGAMOE_SMOKE_ITERATIONS="$MEGAMOE_SMOKE_ITERATIONS" \
+    MEGAMOE_SMOKE_WARMUPS="$warmups" \
+    MEGAMOE_SMOKE_ITERATIONS="$iterations" \
     MEGAMOE_SMOKE_SPECIALIZATION_MODES_SBATCH="$MEGAMOE_SMOKE_SPECIALIZATION_MODES_SBATCH" \
+    MEGAMOE_SMOKE_PROFILE_ONLY="${MEGAMOE_SMOKE_PROFILE_ONLY:-0}" \
+    MEGAMOE_SMOKE_FIXED_PERFECT_ONLY="${MEGAMOE_SMOKE_FIXED_PERFECT_ONLY:-0}" \
+    MEGAMOE_SMOKE_PRODUCTION_ROUTES="${MEGAMOE_SMOKE_PRODUCTION_ROUTES:-0}" \
+    MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX="$nsys_output" \
     bash "$source_path/scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch"
 }
 
