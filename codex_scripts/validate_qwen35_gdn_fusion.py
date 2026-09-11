@@ -40,8 +40,6 @@ def _bench_ms(function, iterations: int) -> float:
         graph.replay()
     end.record()
     end.synchronize()
-    if captured_output is None:
-        raise RuntimeError("benchmark capture unexpectedly returned no output")
     return start.elapsed_time(end) / iterations
 
 

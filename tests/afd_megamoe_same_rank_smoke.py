@@ -207,9 +207,11 @@ def _make_weights(
     local_experts: int,
     hidden: int,
     intermediate: int,
+    *,
+    build_reference: bool = True,
 ) -> tuple[
-    tuple[torch.Tensor, torch.Tensor],
-    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor] | None,
+    tuple[torch.Tensor, torch.Tensor] | None,
     tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
 ]:
     l1 = (torch.randn(
@@ -234,9 +236,12 @@ def _make_weights(
             device="cuda",
         )
 
-    l1_reference = (l1, scales(2 * intermediate, hidden))
-    l2_reference = (l2, scales(hidden, intermediate))
-    if os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp8") == "fp4":
+    is_fp4 = os.environ.get("MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp8") == "fp4"
+    l1_reference = l2_reference = None
+    if build_reference or not is_fp4:
+        l1_reference = (l1, scales(2 * intermediate, hidden))
+        l2_reference = (l2, scales(hidden, intermediate))
+    if is_fp4:
         l1_kernel = weight_utils.requant_qwen_fp8_weights_to_fp4(
             l1, block_scales(2 * intermediate, hidden)
         )
@@ -253,9 +258,10 @@ def _make_weights(
                 experts.append(weight_utils.dequant_fp4(packed, sf, gran_k=32))
             return torch.stack(experts)
 
-        # Reference the exact requantized FP4 values consumed by the kernel.
-        l1_reference = (dequantized_fp4_reference(l1), l1_reference[1])
-        l2_reference = (dequantized_fp4_reference(l2), l2_reference[1])
+        if build_reference:
+            # Numeric tests need these; fixed-perfect profiling discards them.
+            l1_reference = (dequantized_fp4_reference(l1), l1_reference[1])
+            l2_reference = (dequantized_fp4_reference(l2), l2_reference[1])
     else:
         l1_kernel, l2_kernel = l1_reference, l2_reference
     transformed = weight_utils.transform_weights_for_mega_moe(
@@ -286,8 +292,9 @@ def _make_or_load_transformed_weights(
             raise RuntimeError("invalid MegaMoE smoke transformed-weight cache")
         return transformed
 
-    _l1, _l2, transformed = _make_weights(local_experts, hidden, intermediate)
-    del _l1, _l2
+    _, _, transformed = _make_weights(
+        local_experts, hidden, intermediate, build_reference=False
+    )
     if weight_cache_output:
         torch.save(transformed, weight_cache_output)
     return transformed
@@ -777,6 +784,8 @@ def _exact_qwen_fixed_perfect_case(
     return {
         f"bucket{bucket}_rows{rows}_sms{num_sms}": {
             "ep_size": world_size,
+            "model_dimensions": {"hidden": hidden, "intermediate": intermediate,
+                                 "experts": num_experts, "top_k": top_k},
             "rows_per_rank": rows,
             "global_tokens": global_tokens,
             "valid_rows_per_rank": [base_rows + int(r < extra_rows) for r in range(world_size)],

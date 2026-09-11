@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3 fixed-global-work MegaMoE Nsight timing and six-point IKET trace.
+# Model-configurable fixed-global-work MegaMoE Nsight timing and six-point IKET trace.
 # Run from an OCI-HSG login node; with no allocation this script submits itself.
 # Optional overrides: FASTAFD_SOURCE_REPO FASTAFD_IMAGE FASTAFD_VENV
 #                     FASTAFD_IKET_INCLUDE FASTAFD_IKET_PYTHON_DEPS
@@ -40,6 +40,13 @@ MEGAMOE_IKET_DISPATCH_DETAIL=${MEGAMOE_IKET_DISPATCH_DETAIL:-0}
 }
 MEGAMOE_IKET_EP=${MEGAMOE_IKET_EP:-8}
 MEGAMOE_IKET_GLOBAL_TOKENS=${MEGAMOE_IKET_GLOBAL_TOKENS:-192}
+export MEGAMOE_IKET_MODEL=${MEGAMOE_IKET_MODEL:-Qwen3-235B-A22B}
+export MEGAMOE_IKET_HIDDEN=${MEGAMOE_IKET_HIDDEN:-4096}
+export MEGAMOE_IKET_INTERMEDIATE=${MEGAMOE_IKET_INTERMEDIATE:-1536}
+export MEGAMOE_IKET_EXPERTS=${MEGAMOE_IKET_EXPERTS:-128}
+export MEGAMOE_IKET_TOP_K=${MEGAMOE_IKET_TOP_K:-8}
+export MEGAMOE_IKET_SMS=${MEGAMOE_IKET_SMS:-150}
+export MEGAMOE_IKET_BUCKET=${MEGAMOE_IKET_BUCKET:-3840}
 case "$MEGAMOE_IKET_EP" in
     2|4|8|16|32|64) ;;
     *) echo "MEGAMOE_IKET_EP must be 2, 4, 8, 16, 32, or 64" >&2; exit 2 ;;
@@ -159,42 +166,60 @@ if (( ! analyze_only )); then
     exit 2
 }
 
-mapfile -t fabric_blocks < <(
-    scontrol show hostnames "$SLURM_JOB_NODELIST" |
-        sed -E 's/-T[0-9]+$//' | sort -u
-)
-(( ${#fabric_blocks[@]} == 1 )) || {
-    printf 'allocation crosses NVL72 fabric blocks: %s\n' \
-        "${fabric_blocks[*]}" >&2
-    exit 2
-}
+if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} == 1 ]]; then
+    [[ ${FASTAFD_IKET_SINGLE_FABRIC:-0} == 1 ]] || {
+        echo 'container worker requires parent fabric validation' >&2; exit 2;
+    }
+else
+    mapfile -t fabric_blocks < <(
+        scontrol show hostnames "$SLURM_JOB_NODELIST" |
+            sed -E 's/-T[0-9]+$//' | sort -u
+    )
+    (( ${#fabric_blocks[@]} == 1 )) || {
+        printf 'allocation crosses NVL72 fabric blocks: %s\n' \
+            "${fabric_blocks[*]}" >&2
+        exit 2
+    }
+fi
 
 run_root=$FASTAFD_IKET_ARTIFACT_ROOT/$SLURM_JOB_ID
 deepgemm_cache=${FASTAFD_IKET_DEEPGEMM_CACHE_ROOT:-$run_root/cache/deepgemm}
-mkdir -p "$run_root/ranks" "$deepgemm_cache" "$run_root/cache/tvm_ffi"
+tvm_cache=${FASTAFD_IKET_TVM_CACHE_ROOT:-$deepgemm_cache/tvm_ffi}
+mkdir -p "$run_root/ranks" "$deepgemm_cache" "$tvm_cache"
 export FASTAFD_IKET_RUN_ROOT=$run_root
-cp "$script_path" "$run_root/profile_megamoe_iket.sbatch"
-git -C "$FASTAFD_SOURCE_REPO" rev-parse HEAD > "$run_root/source-head.txt"
-git -C "$FASTAFD_SOURCE_REPO" status --short > "$run_root/source-status.txt"
-git -C "$FASTAFD_SOURCE_REPO" diff -- \
-    tests/afd_megamoe_same_rank_smoke.py \
-    python/minisgl/kernel/csrc/deepgemm/csrc/jit/compiler.hpp \
-    python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh \
-    python/minisgl/kernel/csrc/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp \
-    > "$run_root/source.patch"
+if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} != 1 || $SLURM_PROCID == "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
+    cp "$script_path" "$run_root/profile_megamoe_iket.sbatch"
+    git -C "$FASTAFD_SOURCE_REPO" rev-parse HEAD > "$run_root/source-head.txt"
+    git -C "$FASTAFD_SOURCE_REPO" status --short > "$run_root/source-status.txt"
+    git -C "$FASTAFD_SOURCE_REPO" diff -- \
+        tests/afd_megamoe_same_rank_smoke.py \
+        python/minisgl/kernel/csrc/deepgemm/csrc/jit/compiler.hpp \
+        python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh \
+        python/minisgl/kernel/csrc/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp \
+        > "$run_root/source.patch"
+fi
 
-master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')
+if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} == 1 ]]; then
+    master_addr=${MASTER_ADDR:?}
+else
+    master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | sed -n '1p')
+fi
 master_port=${MASTER_PORT:-29631}
 
 run_world() {
     local mode=$1 warmups=$2 iterations=$3 output=$4
     local iket_include=""
     local compare_combine=0
+    local launch=()
+    if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} != 1 ]]; then
+        launch=(srun --nodes="$MEGAMOE_IKET_NODES" --ntasks="$MEGAMOE_IKET_EP"
+            --ntasks-per-node="$MEGAMOE_IKET_TASKS_PER_NODE" --kill-on-bad-exit=1
+            --container-image="$FASTAFD_IMAGE" --container-mount-home
+            --container-mounts=/lustre:/lustre --no-container-remap-root)
+    fi
     [[ $mode != profile ]] || iket_include=$FASTAFD_IKET_INCLUDE
     [[ $mode != normal ]] || compare_combine=${MEGAMOE_SMOKE_COMPARE_COMBINE:-0}
-    srun --nodes="$MEGAMOE_IKET_NODES" --ntasks="$MEGAMOE_IKET_EP" --ntasks-per-node="$MEGAMOE_IKET_TASKS_PER_NODE" --kill-on-bad-exit=1 \
-        --container-image="$FASTAFD_IMAGE" --container-mount-home \
-        --container-mounts=/lustre:/lustre --no-container-remap-root \
+    "${launch[@]}" \
         env -u CUDA_VISIBLE_DEVICES \
         FASTAFD_IKET_RANK_MODE="$mode" \
         FASTAFD_IKET_RUN_ROOT="$run_root" \
@@ -203,7 +228,7 @@ run_world() {
         MINISGL_DEEPGEMM_BUILD_DIR="$deepgemm_cache" \
         DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-$deepgemm_cache/jit}" \
         DG_JIT_IKET_INCLUDE="$iket_include" \
-        TVM_FFI_CACHE_DIR="$run_root/cache/tvm_ffi" \
+        TVM_FFI_CACHE_DIR="$tvm_cache" \
         MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE=fp4 \
         MEGAMOE_SMOKE_PROFILE_ONLY=1 \
         MEGAMOE_SMOKE_FIXED_PERFECT_ONLY=1 \
@@ -212,19 +237,19 @@ run_world() {
         MEGAMOE_SMOKE_COMPARE_COMBINE="$compare_combine" \
         MEGAMOE_SMOKE_ROWS="$MEGAMOE_IKET_ROWS" \
         MEGAMOE_SMOKE_GLOBAL_TOKENS="$MEGAMOE_IKET_GLOBAL_TOKENS" \
-        MEGAMOE_SMOKE_SMS=150 \
-        MEGAMOE_SMOKE_BUCKET=3840 \
+        MEGAMOE_SMOKE_SMS="$MEGAMOE_IKET_SMS" \
+        MEGAMOE_SMOKE_BUCKET="$MEGAMOE_IKET_BUCKET" \
         MEGAMOE_SMOKE_WARMUPS="$warmups" \
         MEGAMOE_SMOKE_ITERATIONS="$iterations" \
         MEGAMOE_SMOKE_DEBUG_TIMINGS=0 \
         MEGAMOE_SMOKE_CONTEND_CYCLES=0 \
-        MEGAMOE_SMOKE_NUM_EXPERTS=128 \
-        MEGAMOE_SMOKE_HIDDEN=4096 \
-        MEGAMOE_SMOKE_INTERMEDIATE=1536 \
-        MEGAMOE_SMOKE_TOP_K=8 \
+        MEGAMOE_SMOKE_NUM_EXPERTS="$MEGAMOE_IKET_EXPERTS" \
+        MEGAMOE_SMOKE_HIDDEN="$MEGAMOE_IKET_HIDDEN" \
+        MEGAMOE_SMOKE_INTERMEDIATE="$MEGAMOE_IKET_INTERMEDIATE" \
+        MEGAMOE_SMOKE_TOP_K="$MEGAMOE_IKET_TOP_K" \
         MEGAMOE_SMOKE_OUTPUT="$output" \
         MASTER_ADDR="$master_addr" MASTER_PORT="$master_port" \
-        bash "$run_root/profile_megamoe_iket.sbatch"
+        bash "$script_path"
 }
 
 printf 'FASTAFD_MEGAMOE_IKET_CONFIG=job=%s nodes=%s source=%s\n' \
@@ -233,6 +258,9 @@ run_world normal "$MEGAMOE_BASELINE_WARMUPS" \
     "$MEGAMOE_BASELINE_ITERATIONS" "$run_root/baseline.json"
 run_world profile "$MEGAMOE_IKET_WARMUPS" \
     "$MEGAMOE_IKET_ITERATIONS" "$run_root/profiled.json"
+if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} == 1 && $SLURM_PROCID != "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
+    exit 0
+fi
 fi
 
 python3 - "$run_root" "$MEGAMOE_IKET_ITERATIONS" \
@@ -258,7 +286,11 @@ global_tokens = int(sys.argv[5])
 dispatch_detail = bool(int(sys.argv[6]))
 rows_per_rank = (global_tokens + ep_size - 1) // ep_size
 balance_ranks = bool(int(os.environ.get("MEGAMOE_SMOKE_BALANCE_RANKS", "0")))
-case_key = f"bucket3840_rows{rows_per_rank}_sms150"
+hidden, intermediate, experts, top_k, num_sms, bucket = (
+    int(os.environ[f"MEGAMOE_IKET_{key}"])
+    for key in ("HIDDEN", "INTERMEDIATE", "EXPERTS", "TOP_K", "SMS", "BUCKET")
+)
+case_key = f"bucket{bucket}_rows{rows_per_rank}_sms{num_sms}"
 
 
 def load_benchmark(name: str) -> tuple[dict, dict]:
@@ -272,8 +304,12 @@ def load_benchmark(name: str) -> tuple[dict, dict]:
         ep_size, global_tokens, rows_per_rank
     ):
         raise SystemExit(f"invalid {name}: EP/global-work contract mismatch")
-    expected_active = min(128 // ep_size, (global_tokens * 8 + ep_size - 1) // ep_size
-                          if balance_ranks else global_tokens * 8)
+    dimensions = {"hidden": hidden, "intermediate": intermediate,
+                  "experts": experts, "top_k": top_k}
+    if record.get("model_dimensions") != dimensions:
+        raise SystemExit(f"invalid {name}: model dimensions mismatch")
+    expected_active = min(experts // ep_size, (global_tokens * top_k + ep_size - 1) // ep_size
+                          if balance_ranks else global_tokens * top_k)
     if record.get("max_active_experts") != expected_active:
         raise SystemExit(f"invalid {name}: unexpected active local expert count")
     if record.get("timed_scope") != "route_producer_and_megamoe":
@@ -547,7 +583,7 @@ metric_names = [name for name in samples[0] if name.endswith("_us")]
 summary = {name: stats([sample[name] for sample in samples]) for name in metric_names}
 result = {
     "contract": {
-        "model_shape": "Qwen3-235B-A22B",
+        "model_shape": os.environ["MEGAMOE_IKET_MODEL"],
         "topology": f"EP{ep_size}, {(ep_size + 3) // 4} trays",
         "ep_size": ep_size,
         "reference_input": "see sweep manifest for equivalent AFD inputs",
@@ -556,16 +592,17 @@ result = {
         "valid_rows_per_rank": [global_tokens // ep_size + int(r < global_tokens % ep_size)
                                 for r in range(ep_size)],
         "global_tokens_per_launch": global_tokens,
-        "routed_slots_per_launch": global_tokens * 8,
-        "routes_per_expert_min": global_tokens * 8 // 128,
-        "routes_per_expert_max": (global_tokens * 8 + 127) // 128,
-        "hidden": 4096,
-        "intermediate": 1536,
-        "experts": 128,
-        "top_k": 8,
+        "routed_slots_per_launch": global_tokens * top_k,
+        "routes_per_expert_min": global_tokens * top_k // experts,
+        "routes_per_expert_max": (global_tokens * top_k + experts - 1) // experts,
+        "hidden": hidden,
+        "intermediate": intermediate,
+        "experts": experts,
+        "top_k": top_k,
         "activation_dtype": "fp8",
         "weight_dtype": "fp4",
-        "num_sms": 150,
+        "num_sms": num_sms,
+        "bucket": bucket,
         "routes_prepared": True,
         "rank_gated_combine": True,
         "route_ready_dispatch": True,

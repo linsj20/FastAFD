@@ -112,6 +112,21 @@ class AfdOnlineCasePoolMetricTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "strict corrected metric"):
             pool.validate_metric(self.metric_path, self.result_path, self.case)
 
+    def test_fmha_metric_accepts_nondivisible_fanin(self) -> None:
+        self.write_result("attn-only", attention_dp_size=56)
+        result = json.loads(self.result_path.read_text())
+        result["placement"]["mlp_dp_rank_nodes"] = [[f"node{i}"] for i in range(16)]
+        self.result_path.write_text(json.dumps(result))
+        self.write_metric()
+        pool.validate_metric(self.metric_path, self.result_path, self.case)
+
+    def test_metric_rejects_missing_requested_overlap(self) -> None:
+        self.write_result("attn-only")
+        self.write_metric()
+        self.case["afd_force_multi_mb_graph_overlap"] = "1"
+        with self.assertRaisesRegex(RuntimeError, "execution setting mismatch"):
+            pool.validate_metric(self.metric_path, self.result_path, self.case)
+
     def test_fmha_metric_requires_exact_roles_and_preceding_warmup(self) -> None:
         self.write_result("fmha-only")
         self.write_metric(

@@ -9,70 +9,79 @@ import math
 from pathlib import Path
 
 
-def plan(output: Path) -> None:
-    cases = []
-    limits = {}
-    for ep in (2, 4, 8, 16, 32, 64):
+def plan(output: Path, model: str = "qwen3", batch_max: int = 7,
+         capacity: Path | None = None) -> None:
+    qwen35 = model == "qwen35"
+    experts, intermediate, top_k = (512, 1024, 10) if qwen35 else (128, 1536, 8)
+    eps = (4, 8, 16, 32, 64) if qwen35 else (2, 4, 8, 16, 32, 64)
+    capacity_basis = None
+    if capacity:
+        capacity_basis = json.loads(capacity.read_text())
+        context = capacity_basis["context_tokens"]
+        page = capacity_basis["page_size"]
+        output_tokens = capacity_basis["output_tokens"]
+        tokens = capacity_basis["capacity_tokens"]
+        resident = (context + page - 1) // page * page
+        fresh = context + output_tokens
+        reservation = output_tokens - 1 + page - 1
+        batch_max = max(0, (tokens - fresh) // (resident + reservation) + 1)
+        capacity_basis["calculated_scheduler_max_batch"] = batch_max
+    if batch_max < 1:
+        raise ValueError("batch maximum must be positive")
+    cases, limits = [], {}
+    for ep in eps:
         max_ratio = 72 // ep - 1
         limits[str(ep)] = max_ratio
         equivalent = {}
-        for ratio in range(1, max_ratio + 1):
-            for batch in range(1, 8):
-                # AFD captures both MB2 lanes at ceil(batch/2) rows per
-                # attention GPU. Real counts and padding are recorded below.
-                tokens_per_attention_gpu = (batch + 1) // 2
-                rows = ratio * tokens_per_attention_gpu
-                equivalent.setdefault(rows, []).append({
-                    "attention_to_ffn_ratio": f"{ratio}:1",
-                    "attention_gpus": ep * ratio,
+        ratios = [(ep * ratio, f"{ratio}:1")
+                  for ratio in range(1, max_ratio + 1)]
+        if ep == 64:
+            ratios = [(8, "1:8")]
+        for attention_gpus, ratio_label in ratios:
+            for batch in range(1, batch_max + 1):
+                per_attention = (batch + 1) // 2
+                tokens = attention_gpus * per_attention
+                equivalent.setdefault(tokens, []).append({
+                    "attention_to_ffn_ratio": ratio_label,
+                    "attention_gpus": attention_gpus,
                     "batch_per_attention_gpu": batch,
-                    "real_microbatch_sizes": [batch // 2, (batch + 1) // 2],
-                    "tokens_per_attention_gpu_per_microbatch": tokens_per_attention_gpu,
-                    "active_gpus": ep * (ratio + 1),
+                    "real_microbatch_sizes": [batch // 2, per_attention],
+                    "tokens_per_attention_gpu_per_microbatch": per_attention,
+                    "active_gpus": attention_gpus + ep,
                 })
-        for rows, inputs in sorted(equivalent.items()):
-            cases.append({
-                "case_id": f"ep{ep}_rows{rows}", "ep": ep,
-                "rows_per_rank": rows, "global_tokens": ep * rows,
-                "routes_per_expert_min": ep * rows * 8 // 128,
-                "routes_per_expert_max": (ep * rows * 8 + 127) // 128,
+        for tokens, inputs in sorted(equivalent.items()):
+            rows = (tokens + ep - 1) // ep
+            case = {
+                "case_id": f"ep64_tokens{tokens}" if ep == 64 else f"ep{ep}_rows{rows}",
+                "ep": ep, "rows_per_rank": rows, "global_tokens": tokens,
+                "routes_per_expert_min": tokens * top_k // experts,
+                "routes_per_expert_max": (tokens * top_k + experts - 1) // experts,
                 "equivalent_inputs": inputs,
-            })
-    # EP64 has no A>=1 integer ratio inside NVL72. Record that boundary and
-    # study the largest physically fitting attention side explicitly as1:8.
-    for tokens_per_gpu in range(1, 5):
-        global_tokens = 8 * tokens_per_gpu
-        cases.append({
-            "case_id": f"ep64_tokens{global_tokens}", "ep": 64,
-            "rows_per_rank": 1, "global_tokens": global_tokens,
-            "valid_rows_per_rank": [int(rank < global_tokens) for rank in range(64)],
-            "routes_per_expert_min": global_tokens * 8 // 128,
-            "routes_per_expert_max": (global_tokens * 8 + 127) // 128,
-            "equivalent_inputs": [{
-                "attention_to_ffn_ratio": "1:8", "attention_gpus": 8,
-                "batch_per_attention_gpu": batch,
-                "real_microbatch_sizes": [batch // 2, (batch + 1) // 2],
-                "tokens_per_attention_gpu_per_microbatch": tokens_per_gpu,
-                "active_gpus": 72,
-            } for batch in range(1, 8) if (batch + 1) // 2 == tokens_per_gpu],
-        })
+            }
+            if ep == 64:
+                case["valid_rows_per_rank"] = [tokens // ep + int(r < tokens % ep)
+                                               for r in range(ep)]
+            cases.append(case)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({
-        "contract": {"model": "Qwen3-235B-A22B", "experts": 128,
-                     "hidden": 4096, "intermediate": 1536, "top_k": 8,
+        "contract": {"model": "Qwen3.5-397B-A17B" if qwen35 else "Qwen3-235B-A22B",
+                     "experts": experts, "hidden": 4096,
+                     "intermediate": intermediate, "top_k": top_k,
                      "activation_dtype": "fp8", "weight_dtype": "fp4",
-                     "microbatches": 2, "batch_min": 1, "batch_max": 7,
-                     "tokens_per_attention_gpu": [1, 2, 3, 4],
+                     "microbatches": 2, "batch_min": 1, "batch_max": batch_max,
+                     "tokens_per_attention_gpu": list(range(1, (batch_max + 1) // 2 + 1)),
                      "attention_tp": 1, "gpu_budget": 72,
-                     "num_sms": 150, "bucket": 3840,
+                     "num_sms": 150, "bucket": 3840, "eps": list(eps),
                      "routing": "integer-balanced rank-interleaved expert sequence"},
+        "capacity_basis": capacity_basis,
         "max_attention_to_ffn_ratio": limits,
         "ep64_policy": "A1:F1 infeasible (128 GPUs); measure A1:F8 with 8 attention GPUs",
         "cases": cases,
     }, indent=2) + "\n")
     print(json.dumps({"manifest": str(output), "unique_cases": len(cases),
-                      "per_ep": {str(ep): sum(c["ep"] == ep for c in cases)
-                                 for ep in (2, 4, 8, 16, 32, 64)}}))
+                      "batch_max": batch_max,
+                      "equivalent_inputs": sum(len(c["equivalent_inputs"]) for c in cases),
+                      "per_ep": {str(ep): sum(c["ep"] == ep for c in cases) for ep in eps}}))
 
 
 def collect(manifest_path: Path, root: Path) -> None:
@@ -166,11 +175,14 @@ def collect(manifest_path: Path, root: Path) -> None:
 def audit(manifest_path: Path, root: Path) -> None:
     """Check capture completeness and contracts without another GPU run."""
     manifest = json.loads(manifest_path.read_text())
-    expected = {(ep, f"{ratio}:1", batch)
-                for ep in (2, 4, 8, 16, 32)
-                for ratio in range(1, 72 // ep)
-                for batch in range(1, 8)}
-    expected.update((64, "1:8", batch) for batch in range(1, 8))
+    planned = manifest["contract"]
+    eps = planned.get("eps", [2, 4, 8, 16, 32, 64])
+    batches = range(planned["batch_min"], planned["batch_max"] + 1)
+    expected = {(ep, f"{ratio}:1", batch) for ep in eps if ep != 64
+                for ratio in range(1, 72 // ep) for batch in batches}
+    if 64 in eps:
+        expected.update((64, "1:8", batch) for batch in batches)
+    experts, top_k = planned["experts"], planned["top_k"]
     aliases = []
     unique_inputs = set()
     missing = []
@@ -197,7 +209,7 @@ def audit(manifest_path: Path, root: Path) -> None:
         result = json.loads(path.read_text())
         contract = result["contract"]
         assert (contract["ep_size"], contract["global_tokens_per_launch"]) == key
-        assert tuple(contract[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms")) == (4096, 1536, 128, 8, 150)
+        assert tuple(contract[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms")) == tuple(planned[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms"))
         assert (contract["activation_dtype"], contract["weight_dtype"], contract["microbatches"]) == ("fp8", "fp4", 2)
         assert contract["iket_mode"] == "source-markers"
         assert contract["rank_interleaved_expert_mapping"] and contract["routes_prepared"]
@@ -210,8 +222,8 @@ def audit(manifest_path: Path, root: Path) -> None:
             counts = contract["valid_rows_per_rank"]
             assert len(counts) == ep and sum(counts) == tokens
             assert max(counts) - min(counts) <= 1
-        assert contract["routes_per_expert_min"] == tokens * 8 // 128
-        assert contract["routes_per_expert_max"] == (tokens * 8 + 127) // 128
+        assert contract["routes_per_expert_min"] == tokens * top_k // experts
+        assert contract["routes_per_expert_max"] == (tokens * top_k + experts - 1) // experts
         with path.with_suffix(".csv").open() as stream:
             rows = list(csv.DictReader(stream))
         assert len(rows) == len(result["samples"]) == 3
@@ -253,6 +265,9 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("plan")
     p.add_argument("output", type=Path)
+    p.add_argument("--model", choices=("qwen3", "qwen35"), default="qwen3")
+    p.add_argument("--batch-max", type=int, default=7)
+    p.add_argument("--capacity", type=Path, help="Capacity basis JSON; calculates batch maximum")
     p = sub.add_parser("collect")
     p.add_argument("manifest", type=Path)
     p.add_argument("root", type=Path)
@@ -261,7 +276,7 @@ if __name__ == "__main__":
     p.add_argument("root", type=Path)
     args = parser.parse_args()
     if args.command == "plan":
-        plan(args.output)
+        plan(args.output, args.model, args.batch_max, args.capacity)
     elif args.command == "collect":
         collect(args.manifest, args.root)
     else:

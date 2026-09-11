@@ -1,5 +1,78 @@
 # Project Memory
 
+## Completed cleanup — September 10, 2026
+
+Comprehensive runtime/script/test cleanup removed905 net code lines;consolidated
+scheduling and test setup,removed one-shot scripts and obsolete scratch artifacts.
+Final source/docs synchronized to R/local-mirror. User requested committing this cleanup together with the already staged code; no push requested.
+
+Both Qwen3 and Qwen3.5 pass attn-only A2:F1/EP8/b7/128K/MB2 alignment:
+1904/1904 tokens top10 for each (Q3 top1=1902,Q35 top1=1904). Both same-allocation
+performance comparisons pass unchanged graph-span/stability policy,15samples,
+0outliers:Q3 25.259388->25.258882ms;Q35 15.943200->15.943236ms. No material
+regression observed. Focused CPU suite63/63 passed;no task GPU jobs remain.
+Details,evidence,failed preparation attempts:CODEX_PROJECT_cleanup.md.
+Control=R/source/code_reduction_control_20260910. Source patches/checks/plans:
+scratch/afd/validation/cleanup_20260910 (full original source retained remotely).
+
+**Nsight copy-back policy (user instruction):** when retrieving traces, copy
+exactly one representative attention trace and one representative FFN trace
+(two `.nsys-rep` files total). Do not copy other ranks' traces or unrelated
+result files. Keep the full trace set remote; retrieve only the compact results
+needed for the requested analysis. Store traces by case, then optimization version
+under scratch/afd/cases/; follow CODEX_PROJECT_nsys_traces.md. No trace-management
+script: this agreement is the workflow for future sessions. Every retained
+performance version must have its two metric-selected reports; JSON-only
+performance versions are now filled (207 versions,414 reports). Unprofiled alignment has no traces.
+
+Local scratch now has only `afd/` and `megamoe/` (562MB total, including all retained performance trace pairs). AFD case data
+and traces live in `scratch/afd/cases/<model>/isl_<tokens>/ep_<EP>/a<A>-f<F>/batch_<batch>/<optimization>/`; shared
+reports in `scratch/afd/reports/`; active cleanup checks/plans in
+`scratch/afd/validation/cleanup_20260910/`. Completed standalone MegaMoE sweeps
+are in `scratch/megamoe/{qwen3,qwen35}/`. Superseded experimental directories,
+numbered v1/v2/etc snapshots, incomplete captures and outdated plots were removed.
+Historical local scratch paths below are superseded by this layout; remote
+artifact paths are unchanged.
+
+## Previous checkpoint — September 10, 2026
+
+All requested sweeps and trace deliveries are complete; no monitoring or new
+GPU jobs remain. Keep the existing AFD maximum representative GPU graph-span
+timing, including sampling/writeback (user confirmed after TRT comparison).
+
+- Original, early-attention, and final graph-edge AFD sweeps: 66/66 each.
+  Final vs early: TPS/GPU geometric mean +1.03183%; batch7 +2.43169%,
+  batch6 +2.80366%; 50/66 faster. All final jobs7061091–7061097 completed0:0.
+- Qwen3.5 decomposition: 299/299 inputs,897 samples,1110 aliases audited.
+  One persistent container per node/job; one EP per job,2hr,max8 outstanding.
+- Qwen3.5 A3:F1/EP16/max batch38: job7063495 passed;31.02785ms,
+  918.52966TPS/GPU; all64 Nsight traces local. No matching old B38 baseline.
+- Both requested Pareto HTMLs contain the final curve; `afd_optimized` retains
+  its label. Max-TPS Qwen3 A8:F1/EP8/b7 all72 traces copied locally.
+- User authorized promotion: final Qwen3/Qwen3.5 scheduling and K10 barrier
+  fix are in main code. Six superseded remote snapshot repos and five local
+  overlays removed; compact patches and results retained. Changes are for
+  git-index staging only, without commit or push.
+
+Task memory and reusable workflows:
+
+- `CODEX_PROJECT_pareto_perf.md`: original sweep, machine cross-check,
+  64-bit combine-address fix, correctness and same-GPU performance evidence.
+- `CODEX_PROJECT_attn_release_perf.md`: earlier scheduling comparison.
+- `CODEX_PROJECT_publish_entry_perf.md`: cancelled intermediate experiment.
+- `CODEX_PROJECT_attn_graph_edge.md`: final scheduling, alignment/sweep,
+  trace analysis, timing scope and current cleanup checkpoint.
+- `CODEX_PROJECT_qwen35_graph_edge.md`: hybrid attention/direct GDN transport.
+- `CODEX_PROJECT_qwen35_megamoe_sweep.md`: decomposition/capacity/idle fix.
+- `codex_scripts/megamoe_input_sweep.py` and `.sbatch`: plan, run, collect,
+  audit either model; `profile_megamoe_iket.sbatch` profiles each input.
+- `codex_scripts/summarize_afd_sweep.py`, `compare_afd_sweep_metrics.py`,
+  `plot_afd_sweep.py`: validate, compare and plot AFD results.
+- `codex_scripts/analyze_afd_attention_gap.py`: CPU-only paired Nsight analysis.
+
+The sections below retain earlier project history. Task documents' completed
+results supersede their historical pending/running entries.
+
 ## Padding-fix amendment checkpoint (2026-09-09)
 
 User requested cleanup, amendment into the latest MegaMoE commit, then push

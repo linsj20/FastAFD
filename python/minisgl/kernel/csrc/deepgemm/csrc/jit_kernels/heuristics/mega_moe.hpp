@@ -126,7 +126,7 @@ static int get_num_experts_per_wave_for_mega_moe(
 
 static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int& smem_capacity,
-    const int& num_experts, const int& hidden,
+    const int& num_experts, const int& hidden, const int& num_topk,
     const int& block_m, const int& block_n, const int& block_k, const int& store_block_m,
     const int& sf_block_m, const int& sf_block_n,
     const int& num_dispatch_warps, const int& num_epilogue_warps,
@@ -153,10 +153,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
     const int smem_cd_l2 = num_epilogue_warpgroups * store_block_m * block_n * static_cast<int>(sizeof(nv_bfloat16));
     const int smem_cd = std::max(smem_cd_l1, smem_cd_l2);
 
-    // Barriers (stage-independent): dispatch + tensor memory full/empty + combine (2 per epilogue warp)
+    // Match the device CTA-combine barrier count, preserving other shapes.
+    const int num_combine_barriers = std::max(
+        num_epilogue_warps * 2,
+        (hidden == 4096 and (num_topk == 8 or num_topk == 10)) ? num_topk : 0);
+    // Barriers (stage-independent): dispatch + tensor memory full/empty + combine
     const int smem_barriers = (
         num_dispatch_warps * num_dispatch_pull_stages +
-        kNumEpilogueStages * 2 + num_epilogue_warps * 2) * 8;
+        kNumEpilogueStages * 2 + num_combine_barriers) * 8;
 
     // Amax reduction
     const int smem_amax_reduction = store_block_m * num_epilogue_warps * static_cast<int>(sizeof(float));
@@ -214,7 +218,7 @@ static MegaMoEConfig get_mega_moe_config(
     // Pipeline
     const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe(
         SM100ArchSpec::smem_capacity,
-        num_experts, hidden,
+        num_experts, hidden, num_topk,
         block_m, block_n, block_k, store_block_m,
         sf_block_m, sf_block_n,
         num_dispatch_threads / 32, num_epilogue_threads / 32,

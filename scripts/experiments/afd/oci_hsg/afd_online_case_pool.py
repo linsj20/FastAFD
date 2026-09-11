@@ -53,6 +53,12 @@ CASE_EXECUTION_FIELDS = (
     "afd_kv_capacity_tokens",
     "require_capacity_max",
     "megamoe_expert_weight_dtype",
+    "afd_perf_mode",
+    "afd_perf_context_len",
+    "perfect_routing",
+    "perf_state_source",
+    "attention_gpus_override",
+    "afd_force_multi_mb_graph_overlap",
 )
 LEGACY_SELECTION_POLICY = (
     "atomically claim the lowest rerun_index matching allocated_trays; "
@@ -400,7 +406,7 @@ def fmha_profile_topology_valid(
         return False
     attention_dp_size = int(result.get("attention_dp_size", 0))
     model_dp_size = len(model_dp_nodes)
-    if attention_dp_size < 1 or attention_dp_size % model_dp_size:
+    if attention_dp_size < model_dp_size:
         return False
     # Fan-in changes the rows serviced by the grouped model graph, never the
     # number of graph replays. Every attention and model DP launches exactly
@@ -442,6 +448,13 @@ def validate_metric(
         raise RuntimeError(f"missing metric/result proof for {case_id}")
     metric = json.loads(metric_path.read_text(encoding="utf-8"))
     result = json.loads(result_path.read_text(encoding="utf-8"))
+    for field in ("afd_perf_mode", "perfect_routing", "afd_force_multi_mb_graph_overlap"):
+        if field in case and result.get(field) is not bool(int(case[field])):
+            raise RuntimeError(f"result execution setting mismatch for {case_id}: {field}")
+    if int(case.get("attention_gpus_override", "0")) and int(
+        result.get("attention_gpus", 0)
+    ) != int(case["attention_gpus_override"]):
+        raise RuntimeError(f"result attention GPU count mismatch for {case_id}")
     min_retained = int(case["required_retained_steps_min"])
     max_outliers = int(case["required_max_outliers"])
     range_limit = float(case["required_dominant_range_percent_limit"])

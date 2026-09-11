@@ -330,6 +330,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Epilogue amax reduction shared memory
     auto smem_amax_reduction = reinterpret_cast<float2*>(smem_sfb[kNumStages]);
 
+    // CTA combine uses one barrier per selected expert. Some Qwen3.5
+    // geometries have four epilogue warps but ten selected experts.
+    constexpr uint32_t kNumCombineBarriers =
+        ((kNumTopk == 8 or kNumTopk == 10) and kHidden == 4096 and
+         kNumTopk > kNumEpilogueWarps * 2) ? kNumTopk : kNumEpilogueWarps * 2;
+
     // Barriers and tensor memory pointer
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(smem_amax_reduction + STORE_BLOCK_M * kNumEpilogueWarps / 2);
     auto dispatch_barriers      = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (i); });
@@ -338,7 +344,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     auto tmem_full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + i); });
     auto tmem_empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages + i); });
     auto combine_barriers       = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + i); });
-    auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumEpilogueWarps * 2);
+    auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumCombineBarriers);
 
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();
@@ -371,7 +377,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 tmem_empty_barriers[i]->init(2 * kNumEpilogueThreads);
             }
             #pragma unroll
-            for (uint32_t i = 0; i < kNumEpilogueWarps * 2; ++ i)
+            for (uint32_t i = 0; i < kNumCombineBarriers; ++ i)
                 combine_barriers[i]->init(1);
         }
         cutlass::arch::fence_barrier_init();
@@ -1661,7 +1667,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // while increasing token-level parallelism.
             constexpr uint32_t kNumUint4 = kNumHiddenBytes / sizeof(uint4);
             DG_STATIC_ASSERT(
-                kNumTopk <= kNumEpilogueWarps * 2,
+                kNumTopk <= kNumCombineBarriers,
                 "CTA combine requires one transaction barrier per top-k slot");
             DG_STATIC_ASSERT(
                 kNumTopk * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE,
@@ -1748,10 +1754,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                          topk_idx < kNumTopk;
                          ++topk_idx) {
                         if ((total_mask & (1u << topk_idx)) != 0) {
-                            const auto src_ptr = combine_token_buffer
-                                .get_rank_buffer(topk_idx)
-                                .get_data_buffer(token_idx)
-                                .get_base_ptr();
+                            // Keep large combine offsets in 64-bit integer
+                            // arithmetic across the final address addition.
+                            const auto sym_base = reinterpret_cast<uint64_t>(
+                                sym_buffer.get_base_ptr());
+                            const uint64_t combine_offset =
+                                reinterpret_cast<uint64_t>(
+                                    combine_token_buffer.get_base_ptr()) - sym_base;
+                            const uint64_t combine_end_offset = combine_offset +
+                                static_cast<uint64_t>(kNumTopk) *
+                                    kNumMaxTokensPerRank * kNumHiddenBytes;
+                            const void* src_ptr;
+                            if (combine_end_offset > 0x7fffffffULL) {
+                                const uint64_t source_offset = combine_offset +
+                                    (static_cast<uint64_t>(topk_idx) *
+                                         kNumMaxTokensPerRank + token_idx) *
+                                        kNumHiddenBytes;
+                                uint64_t source_address;
+                                asm volatile("add.u64 %0, %1, %2;"
+                                    : "=l"(source_address)
+                                    : "l"(sym_base), "l"(source_offset));
+                                src_ptr = reinterpret_cast<const void*>(source_address);
+                            } else {
+                                // Preserve the established small-buffer path.
+                                src_ptr = combine_token_buffer
+                                    .get_rank_buffer(topk_idx)
+                                    .get_data_buffer(token_idx)
+                                    .get_base_ptr();
+                            }
                             auto* dst_ptr = combine_tma_buffer +
                                 topk_idx * kNumUint4;
                             ptx::tma_load_1d(

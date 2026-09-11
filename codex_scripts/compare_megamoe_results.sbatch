@@ -27,13 +27,14 @@ mapfile -t blocks < <(scontrol show hostnames "$SLURM_JOB_NODELIST" |
 (( ${#blocks[@]} == 1 )) || { echo 'allocation crosses NVL72 blocks' >&2; exit 2; }
 comparison_root=$OUTPUT_ROOT
 export MEGAMOE_RESULT_REFERENCE_DIR="$comparison_root/reference"
-export MEGAMOE_SMOKE_PROFILE_ONLY=0
+export MEGAMOE_SMOKE_PROFILE_ONLY=${MEGAMOE_SMOKE_PROFILE_ONLY:-0}
 
 run_source() {
     local index=$1 mode=$2 label=$3
     echo "RESULT_SOURCE=$label path=${sources[index]} mode=$mode"
     FASTAFD_SOURCE_REPO="${sources[index]}" \
     OUTPUT_ROOT="$comparison_root/$label" \
+    MEGAMOE_SMOKE_OUTPUT="$comparison_root/$label/result.json" \
     MINISGL_DEEPGEMM_BUILD_DIR="$comparison_root/cache/source$index/deepgemm" \
     DG_JIT_CACHE_DIR="$comparison_root/cache/source$index/jit" \
     TVM_FFI_CACHE_DIR="$comparison_root/cache/source$index/tvm_ffi" \

@@ -15,33 +15,14 @@ def _jit_module(head_dim: int):
         *args,
         cuda_files=["afd_fmha_transport.cu"],
         cuda_wrappers=[
-            ("publish_qkv", f"AfdFmhaTransportKernel<{args}>::publish_qkv"),
-            ("publish_o", f"AfdFmhaTransportKernel<{args}>::publish_o"),
-            (
-                "publish_o_release_turn",
-                f"AfdFmhaTransportKernel<{args}>::publish_o_release_turn",
-            ),
-            ("publish_o_fp8", f"AfdFmhaTransportKernel<{args}>::publish_o_fp8"),
-            (
-                "publish_o_fp8_release_turn",
-                f"AfdFmhaTransportKernel<{args}>::publish_o_fp8_release_turn",
-            ),
-            (
-                "quantize_publish_o_fp8",
-                f"AfdFmhaTransportKernel<{args}>::quantize_publish_o_fp8",
-            ),
-            (
-                "quantize_publish_o_fp8_release_turn",
-                f"AfdFmhaTransportKernel<{args}>::quantize_publish_o_fp8_release_turn",
-            ),
-            ("wait_turn", f"AfdFmhaTransportKernel<{args}>::wait_turn"),
-            ("release_turn", f"AfdFmhaTransportKernel<{args}>::release_turn"),
-            (
-                "signal_direct_o_release_turn",
-                f"AfdFmhaTransportKernel<{args}>::signal_direct_o_release_turn",
-            ),
-            ("wait_ready", f"AfdFmhaTransportKernel<{args}>::wait_ready"),
-            ("wait_ready_turn", f"AfdFmhaTransportKernel<{args}>::wait_ready_turn"),
+            (name, f"AfdFmhaTransportKernel<{args}>::{name}")
+            for name in (
+                "publish_qkv", "publish_o", "publish_o_release_turn",
+                "publish_o_fp8", "publish_o_fp8_release_turn",
+                "quantize_publish_o_fp8", "quantize_publish_o_fp8_release_turn",
+                "wait_turn", "release_turn", "signal_direct_o",
+                "signal_direct_o_release_turn", "wait_ready", "wait_ready_turn",
+            )
         ],
     )
 
@@ -361,6 +342,21 @@ def release_turn(
     _jit_module(int(head_dim)).release_turn(turn, int(next_turn))
 
 
+def signal_direct_o(
+    ready_descriptors: torch.Tensor,
+    *,
+    slot: int,
+    head_dim: int,
+    ready_value: int,
+) -> None:
+    """Publish readiness for symmetric O already written by its producer."""
+    _validate_ready_descriptors(ready_descriptors)
+    _validate_ready_value(ready_value)
+    _jit_module(int(head_dim)).signal_direct_o(
+        ready_descriptors, int(slot), int(ready_value)
+    )
+
+
 def signal_direct_o_release_turn(
     ready_descriptors: torch.Tensor,
     turn: torch.Tensor,
@@ -554,6 +550,7 @@ __all__ = [
     "quantize_publish_o_fp8_release_turn",
     "publish_qkv",
     "release_turn",
+    "signal_direct_o",
     "signal_direct_o_release_turn",
     "wait_ready",
     "wait_turn",

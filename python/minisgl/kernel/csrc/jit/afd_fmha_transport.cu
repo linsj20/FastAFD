@@ -239,15 +239,18 @@ __global__ void release_turn_kernel(int64_t* turn, int64_t next_turn) {
     store_release_device(turn, next_turn);
 }
 
-__global__ void signal_direct_o_release_turn_kernel(
+template <bool kReleaseTurn>
+__global__ void signal_direct_o_kernel(
     const int64_t* ready_desc,
     int ready_edges,
     int slot,
     int64_t ready_value,
     int64_t* turn,
     int64_t next_turn) {
-  if (threadIdx.x == 0)
-    store_release_device(turn, next_turn);
+  if constexpr (kReleaseTurn) {
+    if (threadIdx.x == 0)
+      store_release_device(turn, next_turn);
+  }
   __syncwarp();
   // The producer GEMM is stream-ordered before this kernel and writes the
   // imported symmetric slot directly. Publish only after its remote stores
@@ -1523,6 +1526,30 @@ struct AfdFmhaTransportKernel {
         next_turn);
   }
 
+  static void signal_direct_o(
+      const tvm::ffi::TensorView ready_desc,
+      int64_t slot,
+      int64_t ready_value) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto ready_edges = SymbolicSize{"ready_edges"};
+    TensorMatcher({ready_edges, 3})
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device)
+        .verify(ready_desc);
+    RuntimeCheck(
+        ready_edges.unwrap() > 0 and slot >= 0 and slot < kTransportSlots and
+        ready_value > 0);
+    LaunchKernel(1, kSignalThreads, device.unwrap())(
+        signal_direct_o_kernel<false>,
+        static_cast<const int64_t*>(ready_desc.data_ptr()),
+        static_cast<int>(ready_edges.unwrap()),
+        static_cast<int>(slot),
+        ready_value,
+        static_cast<int64_t*>(nullptr),
+        static_cast<int64_t>(0));
+  }
+
   static void signal_direct_o_release_turn(
       const tvm::ffi::TensorView ready_desc,
       const tvm::ffi::TensorView turn,
@@ -1544,7 +1571,7 @@ struct AfdFmhaTransportKernel {
         ready_edges.unwrap() > 0 and slot >= 0 and slot < kTransportSlots and
         next_turn >= 0 and ready_value > 0);
     LaunchKernel(1, kSignalThreads, device.unwrap())(
-        signal_direct_o_release_turn_kernel,
+        signal_direct_o_kernel<true>,
         static_cast<const int64_t*>(ready_desc.data_ptr()),
         static_cast<int>(ready_edges.unwrap()),
         static_cast<int>(slot),

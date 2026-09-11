@@ -21,8 +21,8 @@ from minisgl.kernel.afd_fmha_transport import (
     publish_o,
     publish_qkv,
     quantize_publish_o_fp8,
-    quantize_publish_o_fp8_release_turn,
     release_turn,
+    signal_direct_o,
     signal_direct_o_release_turn,
     wait_ready,
     wait_turn,
@@ -114,6 +114,7 @@ class _FmhaDecodeGraph:
     valid_token_counts: tuple[torch.Tensor, ...]
     valid_token_counts_host: tuple[torch.Tensor, ...]
     valid_token_iota_host: np.ndarray
+    attention_done_events: tuple[torch.cuda.Event, ...] = ()
     bootstrap_compute_events: tuple[torch.cuda.Event, ...] = ()
     compute_done_events: tuple[tuple[torch.cuda.Event, ...], ...] = ()
 
@@ -424,9 +425,6 @@ class AfdFmhaRuntime:
                 )
             self.q_ready.zero_()
             self.o_publish_counters = torch.zeros(
-                (self.transport_slots,), dtype=torch.int32, device=self.device
-            )
-            self.o_quantization_counters = torch.zeros(
                 (self.transport_slots,), dtype=torch.int32, device=self.device
             )
             self.o_fp8_staging = torch.empty(
@@ -1416,6 +1414,7 @@ class AfdFmhaRuntime:
             ctx.mlp_deepep_buffer = self._moe_buffers[0]
         ctx.moe_num_token_non_padded = merged_per_mb_bs
         ctx.moe_deepep_dispatch_max_tokens_per_rank = merged_per_mb_bs
+
         try:
             with torch.no_grad(), torch.cuda.stream(stream):
                 if getattr(self, "_mega_moe", None) is None:
@@ -1940,6 +1939,14 @@ class AfdFmhaRuntime:
             and not self.is_hybrid_attention
             else ()
         )
+        attention_done_events = (
+            tuple(
+                torch.cuda.Event(enable_timing=False, external=False)
+                for _ in range(int(self.model_config.num_layers) * self.num_mb)
+            )
+            if self.role == "attention" and self._decode_lane_streams
+            else ()
+        )
         output: list[torch.Tensor | None] = [None]
 
         def body() -> None:
@@ -1948,6 +1955,7 @@ class AfdFmhaRuntime:
                     batch,
                     slot_base,
                     lane_streams=self._decode_lane_streams,
+                    attention_done_events=attention_done_events,
                 )
             else:
                 assert sampling_batch is not None
@@ -1998,6 +2006,7 @@ class AfdFmhaRuntime:
             valid_token_iota_host=np.arange(merged_rows, dtype=np.int64),
             bootstrap_compute_events=bootstrap_compute_events,
             compute_done_events=compute_done_events,
+            attention_done_events=attention_done_events,
         )
         schedule = (
             "mb_exclusive_compute_ping_pong"
@@ -2010,6 +2019,7 @@ class AfdFmhaRuntime:
             f"captured total_bs={bs} per_mb_bs={int(per_mb_bs)} "
             f"num_mb={self.num_mb} slot_base={slot_base} "
             f"main_streams={len(self._decode_lane_streams)} "
+            f"attention_sync={'graph_edges' if attention_done_events else 'device_turn'} "
             f"model_sync={'device_turn' if self._model_compute_turn is not None else 'events'} "
             f"graph_root={'mb0' if self._decode_lane_streams else 'engine'} "
             f"schedule={schedule}",
@@ -2022,72 +2032,66 @@ class AfdFmhaRuntime:
         slot_base: int,
         *,
         lane_streams: tuple[torch.cuda.Stream, ...] = (),
+        attention_done_events: tuple[torch.cuda.Event, ...] = (),
     ) -> None:
         ctx = self.state.ctx
         subs = self._microbatches(batch)
         self._validate_lane_streams(lane_streams)
         num_layers = int(self.model_config.num_layers)
-        attention_turn = self._attention_turn if lane_streams else None
-        if lane_streams and attention_turn is None:
-            raise RuntimeError(
-                "FMHA-only pipelined attention is missing its device turn"
-            )
+        total_rounds = num_layers * self.num_mb
+        if attention_done_events and (
+            not lane_streams or len(attention_done_events) != total_rounds
+        ):
+            raise RuntimeError("attention event grid requires lanes and one event per attention round")
+        attention_turn = (
+            self._attention_turn if lane_streams and not attention_done_events else None
+        )
+        if lane_streams and not attention_done_events and attention_turn is None:
+            raise RuntimeError("FMHA-only pipelined attention is missing its device turn")
 
-        # Keep the accepted MB2 schedule: both one-CTA Q waits are resident
-        # before either FMHA starts, and each lane arms its next-layer wait as
-        # soon as it publishes O.  This lets the peer Q publication wake a
-        # resident waiter while the other lane is still pushing O.  More than
-        # two logical microbatches share two physical streams, so they use the
-        # inline wait below rather than queueing a future turn ahead of work on
-        # the same stream.
-        prearm_q_waits = bool(lane_streams and self.num_mb == 2)
-        if prearm_q_waits:
+        # MB2 prearms both Q waits. More logical microbatches share the two
+        # lanes and must wait inline to avoid blocking earlier work on a lane.
+        prearm = bool(lane_streams and self.num_mb == 2)
+        if prearm:
             for mb, sub in enumerate(subs):
                 with torch.cuda.stream(lane_streams[mb]):
                     self._wait_attention_q(
                         sub,
                         epoch=int(slot_base) + mb,
                         turn=attention_turn,
-                        expected_turn=mb,
+                        expected_turn=mb if attention_turn is not None else None,
                     )
-
-        total_rounds = num_layers * self.num_mb
         for layer in range(num_layers):
             for mb, sub in enumerate(subs):
-                lane_stream = (
-                    lane_streams[mb % len(lane_streams)] if lane_streams else None
-                )
-                stream_context = (
-                    torch.cuda.stream(lane_stream)
-                    if lane_streams
-                    else nullcontext()
-                )
-                with stream_context:
+                index = layer * self.num_mb + mb
+                epoch = int(slot_base) + index
+                lane = lane_streams[mb % len(lane_streams)] if lane_streams else None
+                with torch.cuda.stream(lane) if lane is not None else nullcontext():
+                    if attention_done_events:
+                        # Remote Q readiness precedes the local FMHA dependency.
+                        if not prearm:
+                            self._wait_attention_q(sub, epoch=epoch)
+                        if index:
+                            lane.wait_event(attention_done_events[index - 1])
                     previous = ctx.attn_backend
                     ctx.attn_backend = self.state.attn_backends[mb]
                     try:
                         with ctx.forward_batch(sub):
-                            epoch = int(slot_base) + layer * self.num_mb + mb
-                            turn_index = layer * self.num_mb + mb
                             self.run_attention_fmha(
                                 sub,
                                 layer=layer,
                                 epoch=epoch,
-                                lane_stream=lane_stream,
-                                q_wait_already_enqueued=prearm_q_waits,
-                                enqueue_next_q_wait=bool(
-                                    prearm_q_waits and layer + 1 < num_layers
-                                ),
+                                lane_stream=lane,
+                                q_wait_already_enqueued=prearm or bool(attention_done_events),
+                                enqueue_next_q_wait=prearm and layer + 1 < num_layers,
                                 attention_turn=attention_turn,
-                                expected_turn=(turn_index if lane_streams else None),
+                                expected_turn=index if attention_turn is not None else None,
                                 next_turn=(
-                                    (
-                                        0
-                                        if turn_index + 1 == total_rounds
-                                        else turn_index + 1
-                                    )
-                                    if lane_streams
-                                    else None
+                                    (index + 1) % total_rounds
+                                    if attention_turn is not None else None
+                                ),
+                                attention_done_event=(
+                                    attention_done_events[index] if attention_done_events else None
                                 ),
                             )
                     finally:
@@ -3127,12 +3131,16 @@ class AfdFmhaRuntime:
         attention_turn: torch.Tensor | None = None,
         expected_turn: int | None = None,
         next_turn: int | None = None,
+        attention_done_event: torch.cuda.Event | None = None,
     ) -> None:
         ticketed = any(
             value is not None
             for value in (attention_turn, expected_turn, next_turn)
         )
-        if (q_wait_already_enqueued or enqueue_next_q_wait or ticketed) and (
+        event_handoff = attention_done_event is not None
+        if event_handoff and (lane_stream is None or ticketed):
+            raise RuntimeError("attention event handoff requires an owning lane without device turns")
+        if not event_handoff and (q_wait_already_enqueued or enqueue_next_q_wait or ticketed) and (
             lane_stream is None
             or attention_turn is None
             or expected_turn is None
@@ -3165,7 +3173,7 @@ class AfdFmhaRuntime:
             ]
             direct_output = (
                 self._direct_linear_o_output(batch, epoch=epoch)
-                if attention_turn is not None and batch.phase == "decode"
+                if (attention_turn is not None or event_handoff) and batch.phase == "decode"
                 else None
             )
             o = self.attention_model.forward_linear(
@@ -3173,41 +3181,41 @@ class AfdFmhaRuntime:
                 linear_input,
                 output=direct_output,
             )
+            if attention_done_event is not None:
+                attention_done_event.record(lane_stream)
             if direct_output is not None:
                 if int(o.data_ptr()) != int(direct_output.data_ptr()):
                     raise RuntimeError(
                         "Qwen3.5 linear attention did not preserve its direct "
                         "symmetric output"
                     )
-                assert next_turn is not None
-                signal_direct_o_release_turn(
-                    self.o_ready_descriptors,
-                    attention_turn,
-                    slot=slot,
-                    next_turn=next_turn,
-                    head_dim=self.head_dim,
-                    ready_value=epoch + 1,
-                )
-            if attention_turn is None:
-                publish_o(
-                    o,
-                    self.linear_o_descriptors,
-                    self.o_ready_descriptors,
-                    self.o_publish_counters[slot : slot + 1],
-                    slot=slot,
-                    destination_source_stride=destination_source_stride,
-                    head_dim=self.head_dim,
-                    ready_value=epoch + 1,
-                )
-            elif direct_output is None:
-                assert next_turn is not None
-                # Make the next microbatch runnable before this communication
-                # launch so the entire O push can overlap its attention work.
-                release_turn(
-                    attention_turn,
-                    next_turn=next_turn,
-                    head_dim=self.head_dim,
-                )
+                if event_handoff:
+                    # GDN writes the peer's symmetric O slot directly. The
+                    # graph event releases local compute; this signal still
+                    # orders remote visibility before the FFN consumes O.
+                    signal_direct_o(
+                        self.o_ready_descriptors,
+                        slot=slot,
+                        head_dim=self.head_dim,
+                        ready_value=epoch + 1,
+                    )
+                else:
+                    assert next_turn is not None
+                    signal_direct_o_release_turn(
+                        self.o_ready_descriptors,
+                        attention_turn,
+                        slot=slot,
+                        next_turn=next_turn,
+                        head_dim=self.head_dim,
+                        ready_value=epoch + 1,
+                    )
+            else:
+                if attention_turn is not None:
+                    release_turn(
+                        attention_turn,
+                        next_turn=next_turn,
+                        head_dim=self.head_dim,
+                    )
                 publish_o(
                     o,
                     self.linear_o_descriptors,
@@ -3219,12 +3227,12 @@ class AfdFmhaRuntime:
                     ready_value=epoch + 1,
                 )
             if enqueue_next_q_wait:
-                assert expected_turn is not None
+                assert event_handoff or expected_turn is not None
                 self._wait_attention_q(
                     batch,
                     epoch=epoch + self.num_mb,
                     turn=attention_turn,
-                    expected_turn=expected_turn + self.num_mb,
+                    expected_turn=(None if event_handoff else expected_turn + self.num_mb),
                 )
             return
         if self.q_transport_multiplier == 2:
@@ -3232,42 +3240,27 @@ class AfdFmhaRuntime:
         else:
             gate = None
         o = self.state.ctx.attn_backend.forward_prepared(q_slot, layer, batch)
+        if attention_done_event is not None:
+            attention_done_event.record(lane_stream)
         o = o.view(rows, -1).contiguous()
         gate = gate.view(rows, -1) if gate is not None else None
+        if attention_turn is not None:
+            # Release compute before publishing O; remote readiness still orders
+            # the model's consumption of the complete output.
+            release_turn(attention_turn, next_turn=next_turn, head_dim=self.head_dim)
         if self.is_hybrid_attention:
-            if attention_turn is None:
-                publish_o(
-                    o,
-                    self.hybrid_o_descriptors,
-                    self.o_ready_descriptors,
-                    self.o_publish_counters[slot : slot + 1],
-                    gate=gate,
-                    slot=slot,
-                    destination_source_stride=destination_source_stride,
-                    head_dim=self.head_dim,
-                    ready_value=epoch + 1,
-                )
-            else:
-                assert next_turn is not None
-                # Qwen3.5 has no O quantization dependency. Release the next
-                # attention microbatch first, then overlap all publication.
-                release_turn(
-                    attention_turn,
-                    next_turn=next_turn,
-                    head_dim=self.head_dim,
-                )
-                publish_o(
-                    o,
-                    self.hybrid_o_descriptors,
-                    self.o_ready_descriptors,
-                    self.o_publish_counters[slot : slot + 1],
-                    gate=gate,
-                    slot=slot,
-                    destination_source_stride=destination_source_stride,
-                    head_dim=self.head_dim,
-                    ready_value=epoch + 1,
-                )
-        elif attention_turn is None:
+            publish_o(
+                o,
+                self.hybrid_o_descriptors,
+                self.o_ready_descriptors,
+                self.o_publish_counters[slot : slot + 1],
+                gate=gate,
+                slot=slot,
+                destination_source_stride=destination_source_stride,
+                head_dim=self.head_dim,
+                ready_value=epoch + 1,
+            )
+        else:
             staged_o = self.o_fp8_staging[slot, :rows]
             staged_scales = self.o_scale_staging[slot, :rows]
             quantize_publish_o_fp8(
@@ -3282,35 +3275,13 @@ class AfdFmhaRuntime:
                 head_dim=self.head_dim,
                 ready_value=epoch + 1,
             )
-        else:
-            assert next_turn is not None
-            staged_o = self.o_fp8_staging[slot, :rows]
-            staged_scales = self.o_scale_staging[slot, :rows]
-            # The fused publisher releases the next lane only after every CTA
-            # completes quantization. Remote visibility remains independently
-            # ordered by the publication counter and readiness release.
-            quantize_publish_o_fp8_release_turn(
-                o,
-                staged_o,
-                staged_scales,
-                self.o_descriptors,
-                self.o_ready_descriptors,
-                self.o_publish_counters[slot : slot + 1],
-                self.o_quantization_counters[slot : slot + 1],
-                attention_turn,
-                slot=slot,
-                destination_source_stride=destination_source_stride,
-                next_turn=next_turn,
-                head_dim=self.head_dim,
-                ready_value=epoch + 1,
-            )
         if enqueue_next_q_wait:
-            assert expected_turn is not None
+            assert event_handoff or expected_turn is not None
             self._wait_attention_q(
                 batch,
                 epoch=epoch + self.num_mb,
                 turn=attention_turn,
-                expected_turn=expected_turn + self.num_mb,
+                expected_turn=(None if event_handoff else expected_turn + self.num_mb),
             )
 
     def receive_attention_o(

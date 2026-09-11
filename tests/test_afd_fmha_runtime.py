@@ -1374,6 +1374,15 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
 
     def test_mb2_attention_runs_wait_fmha_and_publish_on_matching_main_stream(self) -> None:
+        self._check_attention_schedule(hybrid=False, graph_edges=False)
+
+    def test_mb2_attention_graph_edges_release_before_publication(self) -> None:
+        self._check_attention_schedule(hybrid=False)
+
+    def test_hybrid_attention_graph_edges_preserve_direct_gdn_output(self) -> None:
+        self._check_attention_schedule(hybrid=True)
+
+    def _check_attention_schedule(self, *, hybrid: bool, graph_edges: bool = True) -> None:
         observations: list[tuple] = []
         waits: list[tuple[str, str]] = []
         event_records: list[tuple[str, str]] = []
@@ -1399,25 +1408,40 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.num_mb = 2
         runtime.transport_slots = 2
         runtime.model_config = SimpleNamespace(
-            num_layers=2, layer_types=("full_attention", "full_attention")
+            num_layers=2,
+            layer_types=("linear_attention" if hybrid else "full_attention", "full_attention"),
+            hidden_size=1,
         )
-        runtime.is_hybrid_attention = False
-        runtime.q_transport_multiplier = 1
+        runtime.is_hybrid_attention = hybrid
+        runtime.q_transport_multiplier = 2 if hybrid else 1
         runtime.state = SimpleNamespace(ctx=ctx, stream=root, attn_backends=backends)
         runtime.max_rows = 4
         runtime.source_max_rows = 4
-        runtime.q_slots = torch.zeros((2, 4, 1))
+        runtime.q_slots = torch.zeros((2, 4, 2, 1) if hybrid else (2, 4, 1))
         runtime.q_ready = torch.zeros((2, 1), dtype=torch.int64)
         runtime.timeout_record = object()
         runtime.timeout_ms = 1
         runtime.head_dim = 1
         runtime.o_descriptors = object()
+        runtime.hybrid_o_descriptors = object()
+        runtime.linear_o_descriptors = object()
         runtime.o_ready_descriptors = object()
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
-        runtime.o_quantization_counters = torch.zeros((2,), dtype=torch.int32)
         runtime.o_fp8_staging = torch.empty((2, 4, 1))
         runtime.o_scale_staging = torch.empty((2, 4, 1), dtype=torch.uint8)
         runtime._attention_turn = object()
+        if hybrid:
+            direct_outputs = [torch.empty((4, 1)), torch.empty((4, 1))]
+            runtime._direct_linear_o_output = lambda batch, *, epoch: direct_outputs[epoch % 2]
+
+            def forward_linear(layer, hidden, *, output):
+                mb = int(active_stream[0][-1])
+                self.assertIs(output, direct_outputs[mb])
+                observations.append(("linear", layer, mb, active_stream[0], ctx.attn_backend))
+                output.fill_(mb)
+                return output
+
+            runtime.attention_model = SimpleNamespace(forward_linear=forward_linear)
         sub0 = SimpleNamespace(positions=torch.arange(4), phase="decode")
         sub1 = SimpleNamespace(positions=torch.arange(4), phase="decode")
         batch = SimpleNamespace(
@@ -1443,84 +1467,92 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         def fake_publish(*args, **kwargs):
             observations.append(("publish", active_stream[0], kwargs["slot"]))
 
-        def fake_publish_release(*args, **kwargs):
+        def fake_release(*args, **kwargs):
             observations.append(
-                ("release", active_stream[0], kwargs.get("next_turn"))
+                ("release", active_stream[0], kwargs["next_turn"])
             )
-            observations.append(("publish", active_stream[0], kwargs["slot"]))
 
+        done_events = tuple(
+            _FakeEvent(f"attn{index}", event_records, observations) for index in range(4)
+        ) if graph_edges else ()
         with (
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
             patch(
-                "minisgl.afd_fmha_runtime.quantize_publish_o_fp8_release_turn",
-                side_effect=fake_publish_release,
+                "minisgl.afd_fmha_runtime.release_turn",
+                side_effect=fake_release,
             ),
             patch(
                 "minisgl.afd_fmha_runtime.quantize_publish_o_fp8",
                 side_effect=fake_publish,
-            ),
+            ) as quantize,
+            patch("minisgl.afd_fmha_runtime.publish_o", side_effect=fake_publish) as publish,
+            patch("minisgl.afd_fmha_runtime.signal_direct_o", side_effect=fake_publish) as signal,
+            patch("minisgl.afd_fmha_runtime.signal_direct_o_release_turn") as signal_turn,
         ):
             runtime._run_attention_body(
                 batch,
                 0,
                 lane_streams=lanes,
+                attention_done_events=done_events,
             )
 
-        self.assertEqual(
-            [item for item in observations if item[0] == "fmha"],
-            [
-                ("fmha", 0, 0, "mb0", backends[0]),
-                ("fmha", 0, 1, "mb1", backends[1]),
-                ("fmha", 1, 0, "mb0", backends[0]),
-                ("fmha", 1, 1, "mb1", backends[1]),
-            ],
-        )
-        self.assertEqual(
-            [item[1:] for item in observations if item[0] == "wait"],
-            [("mb0", 0), ("mb1", 1), ("mb0", 2), ("mb1", 3)],
-        )
-        self.assertEqual(
-            [item[1:] for item in observations if item[0] == "publish"],
-            [
-                ("mb0", 0),
-                ("mb1", 1),
-                ("mb0", 0),
-                ("mb1", 1),
-            ],
-        )
-        self.assertEqual(
-            [item[1:] for item in observations if item[0] == "release"],
-            [("mb0", 1), ("mb1", 2), ("mb0", 3), ("mb1", 0)],
-        )
-        self.assertEqual(waits, [])
-        self.assertEqual(event_records, [])
-        self.assertEqual(
-            [
-                item
-                for item in observations
-                if item[0]
-                in {"wait", "wait_event", "fmha", "release", "record_event", "publish"}
-            ],
-            [
-                ("wait", "mb0", 0),
-                ("wait", "mb1", 1),
-                ("fmha", 0, 0, "mb0", backends[0]),
-                ("release", "mb0", 1),
-                ("publish", "mb0", 0),
-                ("wait", "mb0", 2),
-                ("fmha", 0, 1, "mb1", backends[1]),
-                ("release", "mb1", 2),
-                ("publish", "mb1", 1),
-                ("wait", "mb1", 3),
-                ("fmha", 1, 0, "mb0", backends[0]),
-                ("release", "mb0", 3),
-                ("publish", "mb0", 0),
-                ("fmha", 1, 1, "mb1", backends[1]),
-                ("release", "mb1", 0),
-                ("publish", "mb1", 1),
-            ],
-        )
+        if not graph_edges:
+            self.assertEqual(
+                [
+                    item
+                    for item in observations
+                    if item[0]
+                    in {"wait", "wait_event", "fmha", "release", "record_event", "publish"}
+                ],
+                [
+                    ("wait", "mb0", 0),
+                    ("wait", "mb1", 1),
+                    ("fmha", 0, 0, "mb0", backends[0]),
+                    ("release", "mb0", 1),
+                    ("publish", "mb0", 0),
+                    ("wait", "mb0", 2),
+                    ("fmha", 0, 1, "mb1", backends[1]),
+                    ("release", "mb1", 2),
+                    ("publish", "mb1", 1),
+                    ("wait", "mb1", 3),
+                    ("fmha", 1, 0, "mb0", backends[0]),
+                    ("release", "mb0", 3),
+                    ("publish", "mb0", 0),
+                    ("fmha", 1, 1, "mb1", backends[1]),
+                    ("release", "mb1", 0),
+                    ("publish", "mb1", 1),
+                ],
+            )
+            self.assertIsNone(ctx.attn_backend)
+
+            return
+
+        signal_turn.assert_not_called()
+        if hybrid:
+            quantize.assert_not_called()
+            self.assertEqual(signal.call_count, 2)
+            self.assertEqual(publish.call_count, 2)
+        else:
+            signal.assert_not_called()
+            publish.assert_not_called()
+        self.assertEqual([x for x in observations if x[0] == "release"], [])
+        self.assertEqual(event_records, [("attn0", "mb0"), ("attn1", "mb1"),
+                                         ("attn2", "mb0"), ("attn3", "mb1")])
+        self.assertEqual(waits, [("mb1", "attn0"), ("mb0", "attn1"),
+                                 ("mb1", "attn2")])
+        self.assertEqual(observations[:2], [("wait", "mb0", None), ("wait", "mb1", None)])
+        for index in range(4):
+            lane = f"mb{index % 2}"
+            operation = "linear" if hybrid and index < 2 else "fmha"
+            compute = observations.index((operation, index // 2, index % 2,
+                                          lane, backends[index % 2]))
+            self.assertEqual(observations[compute + 1], ("record_event", f"attn{index}", lane))
+            self.assertEqual(observations[compute + 2], ("publish", lane, index % 2))
+            if index:
+                self.assertEqual(observations[compute - 1], ("wait_event", lane, f"attn{index - 1}"))
+        self.assertEqual(len([x for x in observations if x[0] == "wait"]), 4)
+        self.assertTrue(all(x[2] is None for x in observations if x[0] == "wait"))
         self.assertIsNone(ctx.attn_backend)
 
     def test_eager_attention_body_does_not_use_decode_device_turn(self) -> None:
@@ -1587,7 +1619,6 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.o_descriptors = object()
         runtime.o_ready_descriptors = object()
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
-        runtime.o_quantization_counters = torch.zeros((2,), dtype=torch.int32)
         runtime.o_fp8_staging = torch.empty((2, 3, 1))
         runtime.o_scale_staging = torch.empty((2, 3, 1), dtype=torch.uint8)
         runtime._attention_turn = object()
@@ -1615,12 +1646,11 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                 ("wait", active_stream[0], kwargs.get("expected_turn"))
             )
 
-        def fake_publish_release(*args, **kwargs):
+        def fake_release(*args, **kwargs):
             observations.append(
                 (
                     "release",
                     active_stream[0],
-                    kwargs["slot"],
                     kwargs["next_turn"],
                 )
             )
@@ -1629,9 +1659,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
             patch(
-                "minisgl.afd_fmha_runtime.quantize_publish_o_fp8_release_turn",
-                side_effect=fake_publish_release,
+                "minisgl.afd_fmha_runtime.release_turn",
+                side_effect=fake_release,
             ),
+            patch("minisgl.afd_fmha_runtime.quantize_publish_o_fp8") as publish,
         ):
             runtime._run_attention_body(batch, 0, lane_streams=lanes)
 
@@ -1657,14 +1688,15 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertEqual(
             [item[1:] for item in observations if item[0] == "release"],
             [
-                ("lane0", 0, 1),
-                ("lane1", 1, 2),
-                ("lane0", 0, 3),
-                ("lane0", 1, 4),
-                ("lane1", 0, 5),
-                ("lane0", 1, 0),
+                ("lane0", 1),
+                ("lane1", 2),
+                ("lane0", 3),
+                ("lane0", 4),
+                ("lane1", 5),
+                ("lane0", 0),
             ],
         )
+        self.assertEqual([call.kwargs["slot"] for call in publish.call_args_list], [0, 1, 0, 1, 0, 1])
         self.assertIsNone(ctx.attn_backend)
 
     def test_mb2_attention_requires_device_turn(self) -> None:

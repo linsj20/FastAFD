@@ -8,6 +8,8 @@
 #           MEGAMOE_SMOKE_PROFILE_ONLY, MEGAMOE_SMOKE_FIXED_PERFECT_ONLY,
 #           MEGAMOE_SMOKE_PRODUCTION_ROUTES,
 #           MEGAMOE_SMOKE_TEST_SCRIPT,
+#           MEGAMOE_SMOKE_MEMCHECK (1 enables per-rank Compute Sanitizer logs),
+#           MEGAMOE_SMOKE_GPU_HEALTH (1 records nvidia-smi XML per node),
 #           MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX,
 #           MEGAMOE_SMOKE_COMBINE_MODES,
 #           MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES,
@@ -38,10 +40,39 @@ set -euo pipefail
 
 if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
     rank=${SLURM_PROCID:?}
+    case "${MEGAMOE_SMOKE_GPU_HEALTH:-0}" in
+        0) ;;
+        1)
+            if [[ ${SLURM_LOCALID:?} == 0 ]]; then
+                mkdir -p "$OUTPUT_ROOT/logs"
+                nvidia-smi -q -x > "$OUTPUT_ROOT/logs/gpu-health-${SLURMD_NODENAME:?}.xml"
+            fi
+            ;;
+        *) echo "MEGAMOE_SMOKE_GPU_HEALTH must be 0 or 1" >&2; exit 2 ;;
+    esac
     python_cmd=(
         "$FASTAFD_VENV/bin/python"
         "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
     )
+    case "${MEGAMOE_SMOKE_MEMCHECK:-0}" in
+        0) ;;
+        1)
+            [[ -z ${MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX:-} ]] || {
+                echo "Choose either memcheck or Nsight capture" >&2
+                exit 2
+            }
+            sanitizer=/usr/local/cuda/bin/compute-sanitizer
+            [[ -x $sanitizer ]] || {
+                echo "Compute Sanitizer is missing: $sanitizer" >&2
+                exit 2
+            }
+            mkdir -p "$OUTPUT_ROOT/logs"
+            exec "$sanitizer" --tool memcheck --error-exitcode 99 \
+                --log-file "$OUTPUT_ROOT/logs/memcheck-rank$rank.log" \
+                "${python_cmd[@]}"
+            ;;
+        *) echo "MEGAMOE_SMOKE_MEMCHECK must be 0 or 1" >&2; exit 2 ;;
+    esac
     if [[ -n ${MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX:-} &&
           $rank == ${MEGAMOE_SMOKE_NSYS_PROFILE_RANK:-0} ]]; then
         nsys=/usr/local/cuda/bin/nsys

@@ -298,7 +298,7 @@ PY
         continue
     fi
 
-    IFS=$'\t' read -r case_model case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays case_memory_ratio case_num_pages case_kv_capacity case_require_capacity_max case_expert_weight_dtype case_perf_mode case_perf_context_len case_perfect_routing case_perf_state_source < <(
+    IFS=$'\t' read -r case_model case_id context batch ratio attention_tp ffn_ep prompt_mode claimed_trays case_memory_ratio case_num_pages case_kv_capacity case_require_capacity_max case_expert_weight_dtype case_perf_mode case_perf_context_len case_perfect_routing case_perf_state_source case_attention_gpus case_force_overlap < <(
         python3 - "$action" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -336,10 +336,15 @@ if r["perfect_routing"] not in ("0", "1"):
     raise SystemExit("per-case perfect_routing must be 0 or 1")
 if r["afd_perf_mode"] == "1" and r["perf_state_source"] != "randomized_resident_kv_and_gdn":
     raise SystemExit("perf mode requires randomized resident KV and GDN state")
+attention_gpus = r.get("attention_gpus_override", "0")
+force_overlap = r.get("afd_force_multi_mb_graph_overlap", "0")
+if not attention_gpus.isdigit() or force_overlap not in ("0", "1"):
+    raise SystemExit("invalid per-case attention GPU count or graph overlap setting")
 print("\t".join([
     argv[0], c["case_id"], r["context_spec"], r["batch_per_attention_dp_lane"],
     r["normalized_af_ratio"], r["attention_tp"], r["ffn_ep"],
     r["prompt_mode"], r["allocated_trays"], *memory, precision, *perf,
+    attention_gpus, force_overlap,
 ]))
 PY
     )
@@ -357,6 +362,9 @@ PY
     fi
     if [[ "$case_num_pages" == none ]]; then
         case_num_pages=""
+    fi
+    if [[ "$case_attention_gpus" == 0 ]]; then
+        case_attention_gpus=""
     fi
     case_num_mb=$MAX_NUM_MB
     if (( case_num_mb > batch )); then
@@ -401,6 +409,8 @@ PY
         FASTAFD_AFD_MODEL_PLACEMENT="$MODEL_PLACEMENT" \
         FASTAFD_AFD_NUM_MB="$case_num_mb" \
         FASTAFD_AFD_PERF_MODE="$case_perf_mode" \
+        FASTAFD_ATTENTION_GPUS_OVERRIDE="$case_attention_gpus" \
+        FASTAFD_AFD_FORCE_MULTI_MB_GRAPH_OVERLAP="$case_force_overlap" \
         MINISGL_AFD_MOE_BACKEND="$MOE_BACKEND" \
         MINISGL_AFD_PERFECT_ROUTING="$case_perfect_routing" \
         FASTAFD_PROMPT_BASE_FILE="$PROMPT_BASE_FILE" \
