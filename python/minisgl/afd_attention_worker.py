@@ -78,12 +78,13 @@ class AfdAttentionState:
         self.tp_cpu_group = _init_tp_communication(config, self.dtype)
         free_memory = self._sync_get_memory()[1]
 
-        self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
-            config.model_config,
-            max_slots=config.max_running_req + 1,
-            dtype=self.dtype,
-            device=self.device,
-        )
+        if config.afd_model_placement != "attn-only":
+            self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+                config.model_config,
+                max_slots=config.max_running_req + 1,
+                dtype=self.dtype,
+                device=self.device,
+            )
         if self.ctx.gdn_state_pool is not None:
             logger.info_rank0(
                 "AFD allocated hybrid GDN state: layers=%d slots=%d bytes_per_slot=%d",

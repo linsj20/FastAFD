@@ -182,6 +182,7 @@ class MegaMoEAfdAdapter:
                 num_topk=self.top_k,
                 hidden=self.hidden_size,
                 intermediate_hidden=self.intermediate_size,
+                inband_combine=True,
             )
             for _ in range(self.num_lanes)
         ]

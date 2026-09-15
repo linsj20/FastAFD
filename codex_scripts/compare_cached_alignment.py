@@ -8,8 +8,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
+
+
+def validate_reference(result: dict) -> None:
+    """Reject malformed positions or scores before using cached prefix ranks."""
+    tokens = result["generated_token_ids"]
+    steps = result["steps"]
+    if result["num_generated_tokens"] != len(tokens) or len(steps) != len(tokens):
+        raise ValueError("cached reference token/step coverage differs")
+    for position, (token, step) in enumerate(zip(tokens, steps)):
+        if step["position"] != position or step["token_id"] != token:
+            raise ValueError("cached reference position/token differs")
+        rank = step["rank_in_vllm"]
+        if (type(rank) is not int or rank < 1
+                or not math.isfinite(step["logprob_in_vllm"])
+                or step["is_top1_in_vllm"] != (rank == 1)
+                or (rank == 1 and step["vllm_top1_token_id"] != token)):
+            raise ValueError("cached reference has an invalid chosen-token score")
+        candidate_tokens, candidate_ranks = set(), set()
+        for candidate in step.get("vllm_candidates", []):
+            candidate_token, candidate_rank = candidate["token_id"], candidate["rank"]
+            if (type(candidate_token) is not int or candidate_token < 0
+                    or type(candidate_rank) is not int or candidate_rank < 1
+                    or not math.isfinite(candidate["logprob"])
+                    or candidate_token in candidate_tokens or candidate_rank in candidate_ranks
+                    or (candidate_rank == 1 and candidate_token != step["vllm_top1_token_id"])):
+                raise ValueError("cached reference has an invalid candidate score")
+            candidate_tokens.add(candidate_token)
+            candidate_ranks.add(candidate_rank)
 
 
 def main() -> None:
@@ -26,8 +55,11 @@ def main() -> None:
             raise ValueError("cached references use different tokenizer/model profiles")
         model = data["tokenizer_model"]
         for result in data["results"]:
+            validate_reference(result)
             references[result["prompt"]].append(result)
     sample_data = json.loads(args.sample_json.read_text())
+    if sample_data["tokenizer_model"] != model:
+        raise ValueError("sample and cached references use different tokenizer/model profiles")
     samples = sample_data["samples"]
     if not samples:
         raise ValueError("sample bundle is empty")

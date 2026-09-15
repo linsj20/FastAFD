@@ -26,7 +26,7 @@ preflight_error() {
     exit 2
 }
 
-MODEL_KEY=${MODEL_KEY:-${1:-qwen3}}
+export MODEL_KEY=${MODEL_KEY:-${1:-qwen3}}
 export AFD_MODEL_PLACEMENT_REQUESTED=${FASTAFD_AFD_MODEL_PLACEMENT:-${AFD_MODEL_PLACEMENT:-legacy}}
 case "$AFD_MODEL_PLACEMENT_REQUESTED" in
     legacy|attn-only|qwen3-128k-adaptive) ;;
@@ -57,6 +57,7 @@ case "$SWEEP_CONTRACT" in
 esac
 CONTROL_DIR=$(dirname "$(realpath "$0")")
 TASK_ROOT=${FASTAFD_TASK_ROOT:-$PWD}
+export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$TASK_ROOT/cache/triton}
 CUDA_EXTRACT_SCRIPT=${FASTAFD_CUDA_EXTRACT_SCRIPT:-$CONTROL_DIR/extract_cuda_wall.py}
 CUDA_METRIC_PLAN=${FASTAFD_CUDA_METRIC_PLAN:-$TASK_ROOT/CASES.csv}
 CUDA_SPAN_MODULE=${FASTAFD_CUDA_SPAN_MODULE:-$CONTROL_DIR/cuda_execution_span.py}
@@ -68,7 +69,7 @@ BATCH_ARG=${BATCH:-${3:-}}
 RATIO_ARG=${AFD_ATTENTION_TO_FFN_TRAY_RATIO:-${NORMALIZED_AF_RATIO:-${4:-}}}
 ATTENTION_TP_ARG=${AFD_ATTN_TP_SIZE:-${ATTENTION_TP:-${5:-1}}}
 FFN_EP_ARG=${AFD_MLP_EP_SIZE:-${FFN_EP:-${6:-4}}}
-PROMPT_MODE=${PROMPT_MODE:-uniform}
+export PROMPT_MODE=${PROMPT_MODE:-uniform}
 NSYS=${NSYS:-1}
 [[ "$NSYS" == 0 || "$NSYS" == 1 ]] || {
     echo "NSYS must be 0 or 1" >&2
@@ -188,7 +189,12 @@ ROOT=${FASTAFD_REPRO_ROOT:-${ROOT:-}}
 RESULTS_ROOT=${FASTAFD_RESULTS_ROOT:-$TASK_ROOT/results}
 SOURCE_REPO=${FASTAFD_SOURCE_REPO:-${SOURCE_REPO:-}}
 : "${SOURCE_REPO:?set FASTAFD_SOURCE_REPO to the exact source checkout}"
-EXPECTED_HEAD=${FASTAFD_EXPECTED_HEAD:-$(git -C "$SOURCE_REPO" rev-parse HEAD)}
+VERIFY_SOURCE=${FASTAFD_VERIFY_SOURCE:-1}
+[[ "$VERIFY_SOURCE" == 0 || "$VERIFY_SOURCE" == 1 ]]
+EXPECTED_HEAD=${FASTAFD_EXPECTED_HEAD:-}
+if [[ "$VERIFY_SOURCE" == 1 && -z "$EXPECTED_HEAD" ]]; then
+    EXPECTED_HEAD=$(git -C "$SOURCE_REPO" rev-parse HEAD)
+fi
 EXPECTED_SOURCE_MANIFEST=${FASTAFD_EXPECTED_SOURCE_MANIFEST:-}
 ALLOW_DIRTY_SOURCE=${FASTAFD_ALLOW_DIRTY_SOURCE:-0}
 [[ "$ALLOW_DIRTY_SOURCE" == 0 || "$ALLOW_DIRTY_SOURCE" == 1 ]]
@@ -215,6 +221,10 @@ EP_VENV_DIR=${FASTAFD_EP_VENV_DIR:-${EP_VENV_DIR:-}}
 HF_CACHE=$ROOT/models/huggingface/hub
 
 validate_source_repo() {
+    if [[ "$VERIFY_SOURCE" == 0 ]]; then
+        SOURCE_VALIDATION_DETAIL=archive_authoritative
+        return 0
+    fi
     SOURCE_VALIDATION_DETAIL=unknown
     local actual_head
     actual_head=$(git -C "$SOURCE_REPO" rev-parse HEAD 2>&1) || {

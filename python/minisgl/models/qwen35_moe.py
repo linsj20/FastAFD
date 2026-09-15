@@ -42,6 +42,36 @@ if TYPE_CHECKING:
 _GDN_PROJECTION_AUX_STREAMS: dict[tuple[int, int], torch.cuda.Stream] = {}
 
 
+class GdnProjectionSync:
+    """Reusable device handshakes for one serialized GDN projection lane.
+
+    The owner publishes input readiness; the peer consumes and resets it, then
+    publishes gate completion. The owner consumes/resets completion before any
+    subsequent call can reuse the inputs or signals. Capture joins only at the
+    enclosing graph boundary, preserving two execution lanes.
+    """
+
+    def __init__(self, device, timeout_record, timeout_ms: int, head_dim: int):
+        self.ready = torch.zeros(1, dtype=torch.int64, device=device)
+        self.done = torch.zeros_like(self.ready)
+        self.timeout_record = timeout_record
+        self.timeout_ms = timeout_ms
+        self.head_dim = head_dim
+
+    def release(self, turn: torch.Tensor) -> None:
+        from minisgl.kernel.afd_fmha_transport import release_turn
+
+        release_turn(turn, next_turn=1, head_dim=self.head_dim)
+
+    def wait(self, turn: torch.Tensor) -> None:
+        from minisgl.kernel.afd_fmha_transport import wait_turn
+
+        wait_turn(
+            turn, self.timeout_record, timeout_ms=self.timeout_ms,
+            expected_turn=1, next_turn=0, head_dim=self.head_dim,
+        )
+
+
 def _qwen35_gdn_projection_aux_stream(
     main_stream: torch.cuda.Stream, device: torch.device
 ) -> torch.cuda.Stream:
@@ -120,11 +150,12 @@ class Qwen3_5LinearAttention(BaseOP):
         self._norm_eps = config.rms_norm_eps
         self._layer_id = layer_id
         self._projection_events: dict[
-            int, tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]
+            tuple[int, int], tuple[torch.cuda.Stream, torch.cuda.Event, torch.cuda.Event]
         ] = {}
 
     def _project_inputs(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, aux_stream: torch.cuda.Stream | None = None,
+        projection_sync: GdnProjectionSync | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -144,26 +175,40 @@ class Qwen3_5LinearAttention(BaseOP):
             return projected_qkvz, projected_ba, g, beta, None
 
         main_stream = torch.cuda.current_stream(hidden_states.device)
-        stream_key = int(main_stream.cuda_stream)
-        sync = self._projection_events.get(stream_key)
-        if sync is None:
-            aux_stream = _qwen35_gdn_projection_aux_stream(
-                main_stream, hidden_states.device
+        start_event = done_event = None
+        if projection_sync is not None:
+            if aux_stream is None or aux_stream.cuda_stream == main_stream.cuda_stream:
+                raise ValueError("GDN device dependencies require a distinct peer stream")
+            projection_sync.release(projection_sync.ready)
+        else:
+            stream_key = (
+                int(main_stream.cuda_stream),
+                0 if aux_stream is None else int(aux_stream.cuda_stream),
             )
-            sync = (aux_stream, torch.cuda.Event(), torch.cuda.Event())
-            self._projection_events[stream_key] = sync
-        aux_stream, start_event, done_event = sync
-
-        start_event.record(main_stream)
+            sync = self._projection_events.get(stream_key)
+            if sync is None:
+                if aux_stream is None:
+                    aux_stream = _qwen35_gdn_projection_aux_stream(main_stream, hidden_states.device)
+                sync = (aux_stream, torch.cuda.Event(), torch.cuda.Event())
+                self._projection_events[stream_key] = sync
+            aux_stream, start_event, done_event = sync
+            start_event.record(main_stream)
         projected_qkvz = self.in_proj_qkvz.forward(hidden_states)
         with torch.cuda.stream(aux_stream):
-            aux_stream.wait_event(start_event)
+            if projection_sync is not None:
+                projection_sync.wait(projection_sync.ready)
+            else:
+                aux_stream.wait_event(start_event)
             projected_ba = self.in_proj_ba.forward(hidden_states)
             b, a = projected_ba.view(-1, 2 * self._num_value_heads).split(
                 self._num_value_heads, dim=-1
             )
             g, beta = qwen35_gdn_gates(a, b, self.A_log, self.dt_bias)
-            done_event.record(aux_stream)
+            if projection_sync is not None:
+                projection_sync.release(projection_sync.done)
+            else:
+                done_event.record(aux_stream)
+        hidden_states.record_stream(aux_stream)
         projected_ba.record_stream(main_stream)
         g.record_stream(main_stream)
         beta.record_stream(main_stream)
@@ -174,6 +219,8 @@ class Qwen3_5LinearAttention(BaseOP):
         hidden_states: torch.Tensor,
         *,
         output: torch.Tensor | None = None,
+        projection_stream: torch.cuda.Stream | None = None,
+        projection_sync: GdnProjectionSync | None = None,
     ) -> torch.Tensor:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -183,7 +230,9 @@ class Qwen3_5LinearAttention(BaseOP):
         layer_state = state_pool.layer_state(self._layer_id)
 
         projected_qkvz, projected_ba, g, beta, side_done_event = (
-            self._project_inputs(hidden_states)
+            self._project_inputs(
+                hidden_states, aux_stream=projection_stream, projection_sync=projection_sync
+            )
         )
         qkv_width = 2 * self._local_key_dim + self._local_value_dim
         mixed_qkv = projected_qkvz[:, :qkv_width]
@@ -228,7 +277,9 @@ class Qwen3_5LinearAttention(BaseOP):
 
         # Keep the independent BA GEMM and fused gate preparation behind QKVZ
         # plus causal convolution; only recurrent-state update needs to join.
-        if side_done_event is not None:
+        if projection_sync is not None:
+            projection_sync.wait(projection_sync.done)
+        elif side_done_event is not None:
             torch.cuda.current_stream(hidden_states.device).wait_event(side_done_event)
 
         if batch.is_decode:

@@ -224,7 +224,7 @@ def startup_afd_workers(coord: Any) -> None:
                 ),
                 # MLP page-table slots are partitioned by attention DP.
                 "max_running_req": (
-                    (coord.attn_max_running_req + 1) * layout.attn_dp_size - 1
+                    (coord.attn_max_running_req + 1) * layout.attn_fanin_per_mlp_dp - 1
                 ),
                 "use_dummy_weight": coord.server_args.use_dummy_weight,
             }

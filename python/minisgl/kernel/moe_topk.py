@@ -113,7 +113,7 @@ def gate_topk(
     ] | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
     route_prepare: tuple[
-        torch.Tensor, torch.Tensor, int, int, int, int, bool
+        torch.Tensor, torch.Tensor, int, int, int, int, bool, bool
     ] | None = None,
     perfect_balance: bool = False,
     defer_route_dependent_launch: bool = False,
@@ -129,7 +129,8 @@ def gate_topk(
     of the top-k weights — the comm kernel then skips its quant phase.
 
     ``route_prepare`` = (symmetric buffer, device buffer-pointer table, rank,
-    ranks, aligned token capacity, MegaMoE SMs, rank-ready publication) groups
+    ranks, aligned token capacity, MegaMoE SMs, rank-ready publication, compact
+    payload push) groups
     and remotely publishes the selected routes before MegaMoE starts.
 
     ``num_token_non_padded`` is a scalar valid-prefix count, or a CUDA tensor
@@ -212,7 +213,7 @@ def gate_topk(
         x_q, x_sf, w_stage = quant_out
     route_workspace = route_buffer_ptrs = None
     route_rank = route_num_ranks = route_bucket = route_num_sms = 0
-    route_rank_ready = False
+    route_rank_ready = compact_push = False
     if route_prepare is not None:
         (
             route_workspace,
@@ -222,6 +223,7 @@ def gate_topk(
             route_bucket,
             route_num_sms,
             route_rank_ready,
+            compact_push,
         ) = route_prepare
         if (
             not route_workspace.is_cuda
@@ -267,6 +269,7 @@ def gate_topk(
         bool(route_rank_ready),
         bool(perfect_balance),
         bool(defer_route_dependent_launch),
+        bool(compact_push),
     )
     return ids, weights
 

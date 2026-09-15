@@ -15,10 +15,13 @@
 set -euo pipefail
 : "${SLURM_JOB_ID:?submit manually with sbatch}" "${MEGAMOE_SWEEP_ROOT:?}"
 : "${MEGAMOE_IKET_EP:?}" "${MEGAMOE_SWEEP_CASES:?}" "${FASTAFD_SOURCE_REPO:?}"
+megamoe_sweep_script=${MEGAMOE_SWEEP_SCRIPT:-$FASTAFD_SOURCE_REPO/codex_scripts/megamoe_input_sweep.sbatch}
+megamoe_profile_script=${MEGAMOE_SWEEP_PROFILE_SCRIPT:-$FASTAFD_SOURCE_REPO/codex_scripts/profile_megamoe_iket.sbatch}
+[[ -f "$megamoe_sweep_script" && -f "$megamoe_profile_script" ]]
 export FASTAFD_IKET_DEEPGEMM_CACHE_ROOT="${FASTAFD_IKET_DEEPGEMM_CACHE_ROOT:-$MEGAMOE_SWEEP_ROOT/cache/ep$MEGAMOE_IKET_EP/deepgemm}"
 export FASTAFD_IKET_PYTHON_DEPS="${FASTAFD_IKET_PYTHON_DEPS:?}"
 export MEGAMOE_SMOKE_BALANCE_RANKS=1
-export FASTAFD_IKET_TVM_CACHE_ROOT="$FASTAFD_IKET_DEEPGEMM_CACHE_ROOT/tvm_ffi"
+export FASTAFD_IKET_TVM_CACHE_ROOT="${FASTAFD_IKET_TVM_CACHE_ROOT:-$FASTAFD_IKET_DEEPGEMM_CACHE_ROOT/tvm_ffi}"
 if [[ ${FASTAFD_SWEEP_RANK_WORKER:-0} != 1 ]]; then
     case_specs=$(python3 - "$MEGAMOE_SWEEP_ROOT/manifest.json" "$MEGAMOE_SWEEP_CASES" "$MEGAMOE_IKET_EP" <<'PY'
 import json
@@ -55,7 +58,7 @@ PY
         --kill-on-bad-exit=1 --container-image="$FASTAFD_IMAGE" --container-mount-home \
         --container-mounts=/lustre:/lustre --no-container-remap-root \
         env -u CUDA_VISIBLE_DEVICES FASTAFD_SWEEP_RANK_WORKER=1 FASTAFD_IKET_IN_CONTAINER=1 \
-        bash "$FASTAFD_SOURCE_REPO/codex_scripts/megamoe_input_sweep.sbatch"
+        bash "$megamoe_sweep_script"
 fi
 : "${FASTAFD_SWEEP_CASE_SPECS:?}" "${SLURM_PROCID:?}"
 log_case() {
@@ -74,6 +77,6 @@ while IFS=$'\t' read -r case_id rows global_tokens model hidden intermediate exp
     export FASTAFD_IKET_ARTIFACT_ROOT="$MEGAMOE_SWEEP_ROOT/$case_id"
     log_case START
     # Child programs must not consume the remaining case list from stdin.
-    bash "$FASTAFD_SOURCE_REPO/codex_scripts/profile_megamoe_iket.sbatch" </dev/null
+    bash "$megamoe_profile_script" </dev/null
     log_case COMPLETE
 done <<< "$FASTAFD_SWEEP_CASE_SPECS"

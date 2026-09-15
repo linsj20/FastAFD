@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
+import shlex
+import subprocess
 from pathlib import Path
 
 
@@ -172,7 +175,50 @@ def collect(manifest_path: Path, root: Path) -> None:
                       "missing": len(missing), "equivalent_inputs": len(aliases)}))
 
 
-def audit(manifest_path: Path, root: Path) -> None:
+def artifact_files(manifest_path: Path, root: Path) -> None:
+    """Print an rsync files-from list without traversing caches or other ranks."""
+    manifest = json.loads(manifest_path.read_text())
+    paths = {manifest_path.relative_to(root)}
+    for name in ("coverage.json", "audit_summary.json", "decomposition.csv",
+                 "ep_scaling.csv", "equivalent_inputs.csv"):
+        if (root / name).is_file():
+            paths.add(Path(name))
+    for case in manifest["cases"]:
+        completed = list((root / case["case_id"]).glob("*/decomposition.json"))
+        if len(completed) > 1:
+            raise ValueError(f"Duplicate completed capture: {case['case_id']}")
+        if not completed:
+            continue
+        run = completed[0].parent
+        for name in ("decomposition.json", "decomposition.csv", "baseline.json",
+                     "profiled.json", "profile_megamoe_iket.sbatch",
+                     "ranks/rank-0/nsys/megamoe-rank0.cuda_gpu_kern_sum.csv",
+                     "ranks/rank-0/nsys/megamoe-rank0.nsys-rep"):
+            path = run / name
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            paths.add(path.relative_to(root))
+        if (run / "source-snapshot.txt").is_file():
+            paths.add((run / "source-snapshot.txt").relative_to(root))
+    print("\n".join(str(path) for path in sorted(paths)))
+
+
+def fetch(root: Path, remote_root: str, remote_script: str, host: str) -> None:
+    """Fetch completed rank-0 captures, then validate the actual local copies."""
+    command = ["python3", remote_script, "files", remote_root + "/manifest.json", remote_root]
+    listing = subprocess.check_output(["ssh", host, shlex.join(command)], text=True)
+    root.mkdir(parents=True, exist_ok=True)
+    files = root / "artifact_files.txt"
+    files.write_text(listing)
+    subprocess.run(["rsync", "-a", "--files-from=" + str(files),
+                    host + ":" + remote_root.rstrip("/") + "/", str(root) + "/"], check=True)
+    collect(root / "manifest.json", root)
+    report = audit(root / "manifest.json", root, quiet=True)
+    print(json.dumps({key: report[key] for key in (
+        "complete", "artifact_contracts_checked", "samples_checked", "expected_cases")}))
+
+
+def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
     """Check capture completeness and contracts without another GPU run."""
     manifest = json.loads(manifest_path.read_text())
     planned = manifest["contract"]
@@ -182,6 +228,16 @@ def audit(manifest_path: Path, root: Path) -> None:
                 for ratio in range(1, 72 // ep) for batch in batches}
     if 64 in eps:
         expected.update((64, "1:8", batch) for batch in batches)
+    for extra in manifest.get("supplemental_inputs", []):
+        key = (extra["ep"], extra["attention_to_ffn_ratio"],
+               extra["batch_per_attention_gpu"])
+        assert key not in expected, (key, "duplicate supplemental input")
+        assert key[0] in eps and key[2] > 0
+        expected.add(key)
+    required_iterations = manifest.get("final_validation", {}).get("baseline_iterations")
+    required_source = manifest.get("final_validation", {}).get("source")
+    required_samples = manifest.get("final_validation", {}).get("phase_samples", 3)
+    assert isinstance(required_samples, int) and required_samples > 0
     experts, top_k = planned["experts"], planned["top_k"]
     aliases = []
     unique_inputs = set()
@@ -208,7 +264,11 @@ def audit(manifest_path: Path, root: Path) -> None:
         path = paths[0]
         result = json.loads(path.read_text())
         contract = result["contract"]
+        if required_source:
+            source = (path.parent / "source-snapshot.txt").read_text().strip()
+            assert Path(source).name == required_source, (case["case_id"], source)
         assert (contract["ep_size"], contract["global_tokens_per_launch"]) == key
+        assert contract["bucket"] == planned["bucket"]
         assert tuple(contract[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms")) == tuple(planned[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms"))
         assert (contract["activation_dtype"], contract["weight_dtype"], contract["microbatches"]) == ("fp8", "fp4", 2)
         assert contract["iket_mode"] == "source-markers"
@@ -226,7 +286,7 @@ def audit(manifest_path: Path, root: Path) -> None:
         assert contract["routes_per_expert_max"] == (tokens * top_k + experts - 1) // experts
         with path.with_suffix(".csv").open() as stream:
             rows = list(csv.DictReader(stream))
-        assert len(rows) == len(result["samples"]) == 3
+        assert len(rows) == len(result["samples"]) == required_samples
         for sample, row in zip(result["samples"], rows):
             assert set(sample["marker_counts"]) == markers
             assert min(sample["marker_counts"].values()) > 0
@@ -248,16 +308,29 @@ def audit(manifest_path: Path, root: Path) -> None:
             assert info["routing"] == "fixed_global_sequence_rank_interleaved_balance"
             if ep == 64 and name == "baseline.json":
                 assert info["combine_exact_checked"]
+            if name == "baseline.json":
+                iterations = info["timing_iterations"]
+                if required_iterations is not None:
+                    assert iterations == required_iterations, (case["case_id"], iterations)
+                csv_path = path.parent / "ranks/rank-0/nsys/megamoe-rank0.cuda_gpu_kern_sum.csv"
+                text = csv_path.read_text()
+                kernels = [row for row in csv.DictReader(io.StringIO(text[text.index("Time (%),"):]))
+                           if "sm100_fp8_fp4_mega_moe_impl" in row["Name"]]
+                assert len(kernels) == 1 and int(kernels[0]["Instances"]) == iterations
         checked += 1
     assert set(aliases) == expected and len(aliases) == len(expected)
     report = {"complete": not missing, "artifact_contracts_checked": checked,
-              "samples_checked": checked * 3, "expected_cases": len(manifest["cases"]),
+              "samples_checked": checked * required_samples, "expected_cases": len(manifest["cases"]),
               "equivalent_inputs_checked": len(aliases), "missing": missing,
               "checks": ["scope and deduplication", "input and balance contracts",
-                         "three samples and six markers", "per-sample phase closure",
-                         "normal/profiled success", "EP64 exact-combine results"]}
+                         *(["final source archive"] if required_source else []),
+                         f"{required_samples} samples and six markers", "per-sample phase closure",
+                         "normal/profiled success", "ordinary kernel sample count",
+                         "EP64 exact-combine results"]}
     (root / "audit_summary.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report))
+    if not quiet:
+        print(json.dumps(report))
+    return report
 
 
 if __name__ == "__main__":
@@ -274,10 +347,22 @@ if __name__ == "__main__":
     p = sub.add_parser("audit")
     p.add_argument("manifest", type=Path)
     p.add_argument("root", type=Path)
+    p = sub.add_parser("files", help="List completed capture artifacts for rsync --files-from")
+    p.add_argument("manifest", type=Path)
+    p.add_argument("root", type=Path)
+    p = sub.add_parser("fetch", help="Fetch completed rank-0 captures and audit local copies")
+    p.add_argument("root", type=Path)
+    p.add_argument("--remote-root", required=True)
+    p.add_argument("--remote-script", required=True)
+    p.add_argument("--host", default="oci-hsg")
     args = parser.parse_args()
     if args.command == "plan":
         plan(args.output, args.model, args.batch_max, args.capacity)
     elif args.command == "collect":
         collect(args.manifest, args.root)
+    elif args.command == "files":
+        artifact_files(args.manifest, args.root)
+    elif args.command == "fetch":
+        fetch(args.root, args.remote_root, args.remote_script, args.host)
     else:
         audit(args.manifest, args.root)

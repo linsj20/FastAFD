@@ -52,9 +52,11 @@ class _Layer:
         self.ctx = ctx
         self.tp_plugin = tp_plugin
         self.self_attn = SimpleNamespace(
+            prepare_qkv=lambda hidden: hidden,
             finish_attention=self.finish_attention,
             finish_attention_fp8=self.finish_attention_fp8,
         )
+        self.input_layernorm = SimpleNamespace(forward=self.prepare_attention)
         self.post_attention_layernorm = SimpleNamespace(forward=self.post_norm)
         self.mlp = SimpleNamespace(
             forward=self.run_mlp,
@@ -238,6 +240,8 @@ class _FakeEvent:
 class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
     def test_decode_replay_preserves_each_sources_padding(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.role = "mlp"
         runtime.num_mb = 2
         runtime.config = SimpleNamespace(max_running_req=16)
@@ -265,11 +269,17 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         entry = SimpleNamespace(
             batch=batch,
             valid_token_counts=tuple(torch.zeros(9, dtype=torch.int64) for _ in range(2)),
-            valid_token_counts_host=tuple(torch.zeros(9, dtype=torch.int64) for _ in range(2)),
             valid_token_iota_host=torch.arange(8).numpy(),
         )
         # Balanced batch7, unequal source counts, and an empty source reuse the
         # same graph buffers. The last real row of source1 must stay valid.
+        retained = []
+        empty = torch.empty
+
+        def cpu_pinned_allocation(*args, **kwargs):
+            self.assertTrue(kwargs.pop("pin_memory"))
+            return empty(*args, **kwargs)
+
         for source_counts in (((3, 4), (3, 4)), ((1, 3), (3, 4)), ((0, 0), (2, 4))):
             plan = SimpleNamespace(
                 microbatch_real_token_counts=tuple(map(sum, zip(*source_counts))),
@@ -278,7 +288,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                     SimpleNamespace(microbatch_real_token_counts=c) for c in source_counts
                 ),
             )
-            runtime._prepare_graph_replay(entry, batch, plan, 16)
+            with patch("minisgl.afd_fmha_runtime.torch.empty", cpu_pinned_allocation):
+                runtime._prepare_graph_replay(entry, batch, plan, 16)
             for mb in range(2):
                 expected = [sum(c[mb] for c in source_counts)]
                 prefix = 0
@@ -287,10 +298,15 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                     expected.extend([-1] * (4 - counts[mb]))
                     prefix += counts[mb]
                 self.assertEqual(entry.valid_token_counts[mb].tolist(), expected)
+                retained.append((batch.afd_fmha_valid_token_counts_host[mb], expected))
+        for tensor, expected in retained:
+            self.assertEqual(tensor.tolist(), expected)
 
     def test_selected_weight_uses_parameter_dtype_for_bf16_checkpoint_scale(self) -> None:
         key = "model.layers.0.linear_attn.in_proj_qkv.weight_scale"
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.config = SimpleNamespace(model_path="unused", dtype=torch.bfloat16)
         runtime.device = torch.device("cpu")
         model = SimpleNamespace(
@@ -305,6 +321,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_shared_publication_arena_is_imported_once_for_all_views(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime._imports = {}
         runtime._imported_allocations = {}
         shared_allocation = object()
@@ -349,6 +367,9 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_model_plan_tables_are_namespaced_per_attention_dp(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
+        runtime._mapped_attn_dp_ranks = (2, 5)
         runtime._table_namespace_stride = 7
         token_block = SimpleNamespace(
             table_idx=3,
@@ -364,10 +385,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         namespaced = runtime._namespace_model_plan(plan, 2)
 
-        self.assertEqual(namespaced.table_indices, (14, 19))
-        self.assertEqual(namespaced.free_table_indices, (15,))
-        self.assertEqual(namespaced.exec_table_indices, (14, 20))
-        self.assertEqual(namespaced.token_blocks[0].table_idx, 17)
+        self.assertEqual(namespaced.table_indices, (0, 5))
+        self.assertEqual(namespaced.free_table_indices, (1,))
+        self.assertEqual(namespaced.exec_table_indices, (0, 6))
+        self.assertEqual(namespaced.token_blocks[0].table_idx, 3)
         self.assertEqual(plan.table_indices, (0, 5))
         self.assertEqual(token_block.table_idx, 3)
         with self.assertRaisesRegex(RuntimeError, "outside"):
@@ -378,7 +399,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                     exec_table_indices=(),
                     token_blocks=(),
                 ),
-                0,
+                2,
             )
 
     def test_ready_descriptor_selects_writer_word_in_each_slot(self) -> None:
@@ -405,6 +426,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_model_o_receive_waits_once_for_all_sources(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.is_hybrid_attention = False
         runtime.fanin = 2
         runtime.source_max_rows = 3
@@ -466,6 +489,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                 }
 
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.device = torch.device("cpu")
         runtime.num_mb = 2
         runtime._mapped_attn_dp_ranks = (0, 1)
@@ -486,6 +511,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                         input_ids=values,
                         positions=values.clone(),
                         out_loc=values.clone(),
+                        state_indices=values.to(torch.int64),
                     )
                 )
             return SimpleNamespace(
@@ -513,6 +539,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
 
         self.assertEqual(merged.input_ids.tolist(), [10, 11, 20, 21, 12, 13, 22, 23])
+        self.assertEqual(merged.state_indices.tolist(), [10, 11, 20, 21, 12, 13, 22, 23])
         self.assertEqual(merged.afd_microbatch_token_offsets, (0, 4, 8))
         self.assertEqual(
             [sub.afd_fmha_source_token_offsets for sub in merged.afd_mb_subbatches],
@@ -557,6 +584,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                 batch.positions_host = positions
                 batch.positions = positions
                 batch.out_loc = table_indices.to(torch.int32) + 100
+                batch.state_indices = table_indices
                 batch.afd_req_table_indices_gpu = table_indices
                 self.mapping_calls.append(
                     ([req.table_idx for req in batch.padded_reqs], plan.phase)
@@ -580,6 +608,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         materializer = _Materializer()
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
         runtime._mapped_attn_dp_ranks = (0, 1)
         runtime.worker = SimpleNamespace(runtime=materializer)
@@ -618,6 +648,11 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertEqual(materializer.mapping_calls, [(expected_order, "decode")])
         self.assertEqual(materializer.recorded_stages, [2])
         self.assertEqual(merged.input_ids.tolist(), expected_order)
+        self.assertEqual(merged.state_indices.tolist(), expected_order)
+        self.assertEqual(
+            [sub.state_indices.tolist() for sub in merged.afd_mb_subbatches],
+            [expected_order[:4], expected_order[4:]],
+        )
         self.assertEqual(merged.out_loc.tolist(), [value + 100 for value in expected_order])
         self.assertEqual(merged.afd_microbatch_offsets, (0, 4, 8))
         self.assertEqual(merged.afd_microbatch_token_offsets, (0, 4, 8))
@@ -666,6 +701,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
     def test_mb2_model_fanin_runs_two_rounds_per_layer(self) -> None:
         calls: list[tuple] = []
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
         runtime.model_config = SimpleNamespace(
             layer_types=("full_attention", "full_attention")
@@ -736,6 +773,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         calls: list[tuple] = []
         live_epochs: dict[int, int] = {}
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 6
         runtime.model_config = SimpleNamespace(
             layer_types=("full_attention", "full_attention")
@@ -818,6 +857,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         original_communicator = tp_plugin.comm
 
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
         runtime.is_hybrid_attention = False
         runtime.model_config = SimpleNamespace(
@@ -1007,6 +1048,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         tp_plugin = SimpleNamespace(comm=object())
 
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0,)
+        runtime.num_lanes = 2
         runtime.num_mb = 3
         runtime.is_hybrid_attention = False
         runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
@@ -1094,189 +1137,70 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             any(item[0] == 'combine_release' for item in observations)
         )
 
-    def test_hybrid_ping_pong_publishes_linear_hidden_without_qkv_split(self) -> None:
-        calls: list[tuple] = []
-        waits: list[tuple[str, str]] = []
-        lanes = (_FakeStream("mb0", waits), _FakeStream("mb1", waits))
-
-        runtime = object.__new__(AfdFmhaRuntime)
-        runtime.num_mb = 2
-        runtime.is_hybrid_attention = True
-        runtime.model_config = SimpleNamespace(layer_types=("linear_attention",))
-        runtime.state = SimpleNamespace(ctx=_Context())
-        runtime._moe_buffers = ()
-        runtime._tp_lane_communicators = ()
-        runtime._tp_distributed_plugin = None
-        runtime._model_compute_turn = object()
-        runtime._shared_expert_turns = ()
-        runtime._shared_expert_final_turn = None
-        runtime._mega_moe = None
-        runtime.timeout_record = object()
-        runtime.timeout_ms = 1
-        runtime.head_dim = 256
-        runtime.model = _Model([_Layer(0, calls)])
-        runtime.prepare_model_qkv = lambda *args, **kwargs: self.fail(
-            "linear-attention hidden state must not enter the full-QKV splitter"
-        )
-        def publish_linear(
-            hidden,
-            residual,
-            sub,
-            *,
-            shared,
-            shared_gate,
-            release_turn,
-            next_turn,
-            layer,
-            epoch,
-        ):
-            self.assertIsNone(shared)
-            self.assertIsNone(shared_gate)
-            calls.append(
-                (
-                    "publish_linear",
-                    layer,
-                    epoch,
-                    int(hidden.shape[0]),
-                    release_turn,
-                    next_turn,
+    def test_hybrid_local_intervals_surround_only_full_attention_handoffs(self) -> None:
+        # Include an irregular interval and a trailing linear layer; neither
+        # placement nor ticket numbering may assume a fixed four-layer model.
+        for pipelined in (False, True):
+            calls = []
+            runtime = object.__new__(AfdFmhaRuntime)
+            runtime.num_mb = runtime.num_lanes = 2
+            runtime.remote_attention_layers = (3, 5)
+            runtime.is_hybrid_attention = True
+            runtime.model_config = SimpleNamespace(
+                layer_types=("linear_attention",) * 3 +
+                            ("full_attention", "linear_attention", "full_attention", "linear_attention")
+            )
+            runtime.state = SimpleNamespace(ctx=_Context())
+            runtime._moe_buffers = runtime._tp_lane_communicators = ()
+            runtime._tp_distributed_plugin = runtime._mega_moe = None
+            runtime._model_compute_turn = object()
+            runtime._shared_expert_turns = ()
+            runtime.timeout_record = object()
+            runtime.timeout_ms, runtime.head_dim = 1, 256
+            layers = [_Layer(i, calls) for i in range(7)]
+            for i in (0, 1, 2, 4, 6):
+                def linear(hidden, layer_id=i, *, projection_stream=None, projection_sync=None):
+                    calls.append(("linear", layer_id))
+                    return hidden + 1
+                layers[i].linear_attn = SimpleNamespace(forward=linear)
+            runtime.model = _Model(layers)
+            payloads = {}
+            def publish(qkv, sub, *, layer, epoch, **kwargs):
+                self.assertIn(layer, (3, 5))
+                calls.append(("publish", layer, epoch))
+                payloads[epoch] = qkv.clone()
+            def receive(sub, epoch, layer, **kwargs):
+                calls.append(("receive", layer, epoch))
+                return payloads.pop(epoch), None
+            runtime.publish_model_qkv = publish
+            runtime.receive_attention_o = receive
+            subs = [SimpleNamespace(positions=torch.arange(2)) for _ in range(2)]
+            batch = SimpleNamespace(
+                input_ids=torch.arange(4, dtype=torch.int32), positions=torch.arange(4),
+                afd_mb_subbatches=subs, afd_microbatch_token_offsets=(0, 2, 4),
+            )
+            lanes = tuple(_FakeStream(f"mb{i}", []) for i in range(2)) if pipelined else ()
+            with patch("torch.cuda.stream", side_effect=contextlib.nullcontext), \
+                 patch("minisgl.afd_fmha_runtime.wait_turn"), \
+                 patch("minisgl.afd_fmha_runtime.release_turn"):
+                output = runtime._run_model_forward(
+                    batch, slot_base=0, real_token_counts=(2, 2),
+                    dispatch_bucket=2, lane_streams=lanes,
                 )
-            )
-            return hidden if residual is None else residual
-
-        runtime.publish_qwen35_linear_attention_input = publish_linear
-        def receive(sub, epoch, layer=None, *, turn=None, expected_turn=None):
-            calls.append(("receive", epoch, turn, expected_turn))
-            return (
-                torch.full((int(sub.positions.numel()), 1), float(epoch)),
-                None,
-            )
-
-        runtime.receive_attention_o = receive
-        subs = [SimpleNamespace(positions=torch.arange(2)) for _ in range(2)]
-        batch = SimpleNamespace(
-            input_ids=torch.arange(4, dtype=torch.int32),
-            positions=torch.arange(4),
-            afd_mb_subbatches=subs,
-            afd_microbatch_token_offsets=(0, 2, 4),
-        )
-
-        with patch(
-            "torch.cuda.stream", side_effect=contextlib.nullcontext
-        ), patch("minisgl.afd_fmha_runtime.wait_turn") as wait_turn_mock, patch(
-            "minisgl.afd_fmha_runtime.release_turn"
-        ) as release_turn_mock:
-            output = runtime._run_model_forward(
-                batch,
-                slot_base=0,
-                real_token_counts=(2, 2),
-                dispatch_bucket=2,
-                lane_streams=lanes,
-            )
-
-        self.assertEqual(tuple(output.shape), (4, 1))
-        self.assertEqual(
-            [call for call in calls if call[0] == "publish_linear"],
-            [
-                ("publish_linear", 0, 0, 2, runtime._model_compute_turn, 1),
-                ("publish_linear", 0, 1, 2, runtime._model_compute_turn, 0),
-            ],
-        )
-        self.assertEqual(
-            [call for call in calls if call[0] == "receive"],
-            [
-                ("receive", 0, runtime._model_compute_turn, 0),
-                ("receive", 1, runtime._model_compute_turn, 1),
-            ],
-        )
-        self.assertEqual(wait_turn_mock.call_count, 1)
-        self.assertEqual(release_turn_mock.call_count, 2)
-
-    def test_direct_linear_o_selects_the_decode_source_partition(self) -> None:
-        runtime = object.__new__(AfdFmhaRuntime)
-        runtime.is_hybrid_attention = True
-        runtime.transport_slots = 2
-        runtime.linear_payload_heads = 2
-        runtime.model_config = SimpleNamespace(hidden_size=2)
-        runtime._direct_linear_o_source_index = 1
-        runtime._direct_linear_o_slots = torch.arange(
-            24, dtype=torch.bfloat16
-        ).view(2, 6, 2, 1)
-        batch = SimpleNamespace(phase="decode", positions=torch.arange(2))
-
-        output = runtime._direct_linear_o_output(batch, epoch=1)
-
-        self.assertTrue(output.is_contiguous())
-        torch.testing.assert_close(
-            output,
-            torch.tensor([[16, 17], [18, 19]], dtype=torch.bfloat16),
-        )
-
-    def test_linear_attention_writes_directly_then_signals_ready(self) -> None:
-        runtime = object.__new__(AfdFmhaRuntime)
-        runtime.is_hybrid_attention = True
-        runtime.transport_slots = 2
-        runtime.max_rows = 2
-        runtime.head_dim = 1
-        runtime.model_config = SimpleNamespace(
-            layer_types=("linear_attention",), hidden_size=1
-        )
-        runtime.q_slots = torch.tensor(
-            [[[[2.0]], [[4.0]]], [[[0.0]], [[0.0]]]],
-            dtype=torch.bfloat16,
-        )
-        runtime.linear_o_descriptors = object()
-        runtime.o_ready_descriptors = object()
-        runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
-        direct_output = torch.empty((2, 1), dtype=torch.bfloat16)
-        runtime._direct_linear_o_output = lambda batch, *, epoch: direct_output
-
-        class _AttentionModel:
-            @staticmethod
-            def forward_linear(layer, hidden, *, output=None):
-                self.assertIs(output, direct_output)
-                output.copy_(hidden * 2)
-                return output
-
-        runtime.attention_model = _AttentionModel()
-        batch = SimpleNamespace(positions=torch.arange(2), phase="decode")
-        turn = object()
-
-        with (
-            patch("minisgl.afd_fmha_runtime.publish_o") as publish,
-            patch("minisgl.afd_fmha_runtime.release_turn") as release,
-            patch(
-                "minisgl.afd_fmha_runtime.signal_direct_o_release_turn"
-            ) as signal,
-        ):
-            runtime.run_attention_fmha(
-                batch,
-                layer=0,
-                epoch=0,
-                lane_stream=object(),
-                q_wait_already_enqueued=True,
-                attention_turn=turn,
-                expected_turn=0,
-                next_turn=1,
-            )
-
-        torch.testing.assert_close(
-            direct_output,
-            torch.tensor([[4.0], [8.0]], dtype=torch.bfloat16),
-        )
-        publish.assert_not_called()
-        release.assert_not_called()
-        signal.assert_called_once_with(
-            runtime.o_ready_descriptors,
-            turn,
-            slot=0,
-            next_turn=1,
-            head_dim=1,
-            ready_value=1,
-        )
+            torch.testing.assert_close(output[:, 0], torch.arange(4, dtype=torch.float32) + 5)
+            self.assertEqual([c for c in calls if c[0] == "publish"],
+                             [("publish", 3, 0), ("publish", 3, 1),
+                              ("publish", 5, 2), ("publish", 5, 3)])
+            self.assertEqual([c[1] for c in calls if c[0] == "linear"],
+                             [0, 1, 2, 0, 1, 2, 4, 4, 6, 6])
+            self.assertEqual(sorted(c[1] for c in calls if c[0] == "mlp"),
+                             sorted(list(range(7)) * 2))
+            self.assertFalse(payloads)
 
     def test_hybrid_full_attention_uses_bf16_output_transport(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.is_hybrid_attention = True
         runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
         runtime.q_transport_multiplier = 2
@@ -1331,8 +1255,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertEqual(tuple(finished.shape), (2, 1))
         self.assertEqual(calls, [("finish", 0, 2)])
 
-    def test_hybrid_receive_preserves_distinct_linear_and_full_widths(self) -> None:
+    def test_hybrid_receive_preserves_full_attention_width(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.is_hybrid_attention = True
         runtime.transport_slots = 2
         runtime.fanin = 1
@@ -1344,9 +1270,6 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.model_config = SimpleNamespace(
             layer_types=("linear_attention", "full_attention")
         )
-        runtime.linear_o_slots = torch.arange(
-            0, 8, 2, dtype=torch.bfloat16
-        ).view(2, 2, 1, 1)
         runtime.hybrid_o_slots = torch.arange(8, dtype=torch.bfloat16).view(
             2, 2, 2, 1
         )
@@ -1358,31 +1281,22 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
 
         with patch("minisgl.afd_fmha_runtime.wait_ready"):
-            linear, linear_scale = runtime.receive_attention_o(batch, 0, 0)
             full, full_scale = runtime.receive_attention_o(batch, 0, 1)
 
-        self.assertEqual(tuple(linear.shape), (2, 1))
         self.assertEqual(tuple(full.shape), (2, 2))
-        self.assertIsNone(linear_scale)
         self.assertIsNone(full_scale)
-        torch.testing.assert_close(
-            linear[:, 0], torch.tensor([0.0, 2.0], dtype=torch.bfloat16)
-        )
         torch.testing.assert_close(
             full,
             torch.tensor([[0.0, 1.0], [2.0, 3.0]], dtype=torch.bfloat16),
         )
 
-    def test_mb2_attention_runs_wait_fmha_and_publish_on_matching_main_stream(self) -> None:
-        self._check_attention_schedule(hybrid=False, graph_edges=False)
-
     def test_mb2_attention_graph_edges_release_before_publication(self) -> None:
         self._check_attention_schedule(hybrid=False)
 
-    def test_hybrid_attention_graph_edges_preserve_direct_gdn_output(self) -> None:
+    def test_hybrid_attention_graph_edges_skip_linear_layers(self) -> None:
         self._check_attention_schedule(hybrid=True)
 
-    def _check_attention_schedule(self, *, hybrid: bool, graph_edges: bool = True) -> None:
+    def _check_attention_schedule(self, *, hybrid: bool) -> None:
         observations: list[tuple] = []
         waits: list[tuple[str, str]] = []
         event_records: list[tuple[str, str]] = []
@@ -1405,6 +1319,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         backends = (make_backend(0), make_backend(1))
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
         runtime.transport_slots = 2
         runtime.model_config = SimpleNamespace(
@@ -1412,6 +1328,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             layer_types=("linear_attention" if hybrid else "full_attention", "full_attention"),
             hidden_size=1,
         )
+        runtime.remote_attention_layers = (3, 7) if hybrid else (0, 1)
         runtime.is_hybrid_attention = hybrid
         runtime.q_transport_multiplier = 2 if hybrid else 1
         runtime.state = SimpleNamespace(ctx=ctx, stream=root, attn_backends=backends)
@@ -1429,19 +1346,6 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
         runtime.o_fp8_staging = torch.empty((2, 4, 1))
         runtime.o_scale_staging = torch.empty((2, 4, 1), dtype=torch.uint8)
-        runtime._attention_turn = object()
-        if hybrid:
-            direct_outputs = [torch.empty((4, 1)), torch.empty((4, 1))]
-            runtime._direct_linear_o_output = lambda batch, *, epoch: direct_outputs[epoch % 2]
-
-            def forward_linear(layer, hidden, *, output):
-                mb = int(active_stream[0][-1])
-                self.assertIs(output, direct_outputs[mb])
-                observations.append(("linear", layer, mb, active_stream[0], ctx.attn_backend))
-                output.fill_(mb)
-                return output
-
-            runtime.attention_model = SimpleNamespace(forward_linear=forward_linear)
         sub0 = SimpleNamespace(positions=torch.arange(4), phase="decode")
         sub1 = SimpleNamespace(positions=torch.arange(4), phase="decode")
         batch = SimpleNamespace(
@@ -1474,7 +1378,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         done_events = tuple(
             _FakeEvent(f"attn{index}", event_records, observations) for index in range(4)
-        ) if graph_edges else ()
+        )
         with (
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
@@ -1487,8 +1391,6 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                 side_effect=fake_publish,
             ) as quantize,
             patch("minisgl.afd_fmha_runtime.publish_o", side_effect=fake_publish) as publish,
-            patch("minisgl.afd_fmha_runtime.signal_direct_o", side_effect=fake_publish) as signal,
-            patch("minisgl.afd_fmha_runtime.signal_direct_o_release_turn") as signal_turn,
         ):
             runtime._run_attention_body(
                 batch,
@@ -1497,44 +1399,10 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
                 attention_done_events=done_events,
             )
 
-        if not graph_edges:
-            self.assertEqual(
-                [
-                    item
-                    for item in observations
-                    if item[0]
-                    in {"wait", "wait_event", "fmha", "release", "record_event", "publish"}
-                ],
-                [
-                    ("wait", "mb0", 0),
-                    ("wait", "mb1", 1),
-                    ("fmha", 0, 0, "mb0", backends[0]),
-                    ("release", "mb0", 1),
-                    ("publish", "mb0", 0),
-                    ("wait", "mb0", 2),
-                    ("fmha", 0, 1, "mb1", backends[1]),
-                    ("release", "mb1", 2),
-                    ("publish", "mb1", 1),
-                    ("wait", "mb1", 3),
-                    ("fmha", 1, 0, "mb0", backends[0]),
-                    ("release", "mb0", 3),
-                    ("publish", "mb0", 0),
-                    ("fmha", 1, 1, "mb1", backends[1]),
-                    ("release", "mb1", 0),
-                    ("publish", "mb1", 1),
-                ],
-            )
-            self.assertIsNone(ctx.attn_backend)
-
-            return
-
-        signal_turn.assert_not_called()
         if hybrid:
             quantize.assert_not_called()
-            self.assertEqual(signal.call_count, 2)
-            self.assertEqual(publish.call_count, 2)
+            self.assertEqual(publish.call_count, 4)
         else:
-            signal.assert_not_called()
             publish.assert_not_called()
         self.assertEqual([x for x in observations if x[0] == "release"], [])
         self.assertEqual(event_records, [("attn0", "mb0"), ("attn1", "mb1"),
@@ -1544,8 +1412,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertEqual(observations[:2], [("wait", "mb0", None), ("wait", "mb1", None)])
         for index in range(4):
             lane = f"mb{index % 2}"
-            operation = "linear" if hybrid and index < 2 else "fmha"
-            compute = observations.index((operation, index // 2, index % 2,
+            operation = "fmha"
+            compute = observations.index((operation, runtime.remote_attention_layers[index // 2], index % 2,
                                           lane, backends[index % 2]))
             self.assertEqual(observations[compute + 1], ("record_event", f"attn{index}", lane))
             self.assertEqual(observations[compute + 2], ("publish", lane, index % 2))
@@ -1555,17 +1423,19 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertTrue(all(x[2] is None for x in observations if x[0] == "wait"))
         self.assertIsNone(ctx.attn_backend)
 
-    def test_eager_attention_body_does_not_use_decode_device_turn(self) -> None:
+    def test_eager_attention_body_uses_no_lane_handoff(self) -> None:
         calls: list[dict] = []
         backend = object()
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
+        runtime.remote_attention_layers = (0,)
         runtime.model_config = SimpleNamespace(num_layers=1)
         runtime.state = SimpleNamespace(
             ctx=_Context(),
             attn_backends=(backend, backend),
         )
-        runtime._attention_turn = object()
         runtime.run_attention_fmha = lambda *args, **kwargs: calls.append(kwargs)
         batch = SimpleNamespace(
             positions=torch.arange(8),
@@ -1581,14 +1451,16 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         for call in calls:
             self.assertIsNone(call["lane_stream"])
-            self.assertIsNone(call["attention_turn"])
-            self.assertIsNone(call["expected_turn"])
-            self.assertIsNone(call["next_turn"])
+            self.assertIsNone(call["attention_done_event"])
+            self.assertFalse(call["q_wait_already_enqueued"])
+            self.assertFalse(call["enqueue_next_q_wait"])
 
     def test_three_microbatches_ping_pong_on_two_streams_and_slots(self) -> None:
         observations: list[tuple] = []
         active_stream = ["root"]
-        lanes = tuple(_FakeStream(f"lane{lane}", []) for lane in range(2))
+        waits = []
+        lanes = tuple(_FakeStream(f"lane{lane}", waits, observations) for lane in range(2))
+        done_events = tuple(_FakeEvent(f"attention{i}", [], observations) for i in range(6))
         ctx = _Context()
 
         def make_backend(mb: int):
@@ -1599,6 +1471,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             return SimpleNamespace(forward_prepared=forward_prepared)
 
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 3
         runtime.transport_slots = 2
         runtime.model_config = SimpleNamespace(
@@ -1621,7 +1495,6 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.o_publish_counters = torch.zeros((2,), dtype=torch.int32)
         runtime.o_fp8_staging = torch.empty((2, 3, 1))
         runtime.o_scale_staging = torch.empty((2, 3, 1), dtype=torch.uint8)
-        runtime._attention_turn = object()
         subs = [
             SimpleNamespace(positions=torch.arange(3), phase="decode")
             for _ in range(3)
@@ -1643,28 +1516,15 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
         def fake_wait_ready(*args, **kwargs):
             observations.append(
-                ("wait", active_stream[0], kwargs.get("expected_turn"))
-            )
-
-        def fake_release(*args, **kwargs):
-            observations.append(
-                (
-                    "release",
-                    active_stream[0],
-                    kwargs["next_turn"],
-                )
+                ("wait", active_stream[0], kwargs["expected_ready"])
             )
 
         with (
             patch("torch.cuda.stream", side_effect=use_stream),
             patch("minisgl.afd_fmha_runtime.wait_ready", side_effect=fake_wait_ready),
-            patch(
-                "minisgl.afd_fmha_runtime.release_turn",
-                side_effect=fake_release,
-            ),
             patch("minisgl.afd_fmha_runtime.quantize_publish_o_fp8") as publish,
         ):
-            runtime._run_attention_body(batch, 0, lane_streams=lanes)
+            runtime._run_attention_body(batch, 0, lane_streams=lanes, attention_done_events=done_events)
 
         self.assertEqual(
             [item for item in observations if item[0] == "fmha"],
@@ -1676,35 +1536,25 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
         self.assertEqual(
             [item[1:] for item in observations if item[0] == "wait"],
-            [
-                ("lane0", 0),
-                ("lane1", 1),
-                ("lane0", 2),
-                ("lane0", 3),
-                ("lane1", 4),
-                ("lane0", 5),
-            ],
+            [(f"lane{mb % 2}", layer * 3 + mb + 1)
+             for layer in range(2) for mb in range(3)],
         )
-        self.assertEqual(
-            [item[1:] for item in observations if item[0] == "release"],
-            [
-                ("lane0", 1),
-                ("lane1", 2),
-                ("lane0", 3),
-                ("lane0", 4),
-                ("lane1", 5),
-                ("lane0", 0),
-            ],
-        )
+        for index in range(6):
+            compute = observations.index(("fmha", index // 3, index % 3, f"lane{index % 3 % 2}"))
+            self.assertEqual(observations[compute + 1][0:2], ("record_event", f"attention{index}"))
+            if index:
+                self.assertEqual(observations[compute - 1][0::2], ("wait_event", f"attention{index - 1}"))
         self.assertEqual([call.kwargs["slot"] for call in publish.call_args_list], [0, 1, 0, 1, 0, 1])
         self.assertIsNone(ctx.attn_backend)
 
-    def test_mb2_attention_requires_device_turn(self) -> None:
+    def test_mb2_attention_requires_event_grid(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
+        runtime.remote_attention_layers = (0,)
         runtime.model_config = SimpleNamespace(num_layers=1)
         runtime.state = SimpleNamespace(ctx=_Context())
-        runtime._attention_turn = None
         batch = SimpleNamespace(
             positions=torch.arange(8),
             afd_mb_subbatches=[
@@ -1713,7 +1563,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
             ],
             afd_microbatch_token_offsets=(0, 4, 8),
         )
-        with self.assertRaisesRegex(RuntimeError, "device turn"):
+        with self.assertRaisesRegex(RuntimeError, "attention event grid"):
             runtime._run_attention_body(
                 batch,
                 0,
@@ -1722,6 +1572,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_ping_pong_event_grid_must_match_layers_and_microbatches(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 2
         runtime.is_hybrid_attention = False
         runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
@@ -1754,6 +1606,8 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
 
     def test_decode_uses_exactly_two_lanes_for_multiple_microbatches(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
+        runtime.remote_attention_layers = (0, 1)
+        runtime.num_lanes = 2
         runtime.num_mb = 3
         with self.assertRaisesRegex(RuntimeError, "exactly two streams"):
             runtime._validate_lane_streams((_FakeStream("mb0", []),))

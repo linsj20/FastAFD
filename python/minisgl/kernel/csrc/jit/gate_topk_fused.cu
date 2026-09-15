@@ -1,14 +1,11 @@
-// Fused router: gate GEMM (bf16, TENSOR CORES) + softmax + top-k
-// (+ optional renormalize) in ONE kernel, replacing the cublas gate GEMM +
-// splitK reduce + topk_gating launches on the per-layer decode path.
-//
-// v2: the gate GEMM runs on tensor cores via mma.sync.m16n8k16 (the v1
-// CUDA-core GEMV measured 53us/layer vs cublas nvjet's ~5us — never move a
-// GEMM off the tensor cores).  Mapping: one thread block per 16-token tile;
-// the block owns ALL experts, so the top-k epilogue needs no cross-block
-// sync: cp.async double-buffered K loop -> ldmatrix -> mma -> logits in
-// shared memory -> a per-token grid covering all experts -> per-token warp
-// top-k (iterative warp arg-max).
+// Two-stage fused router shared by the routed-expert FFN paths:
+// 1. Tensor-core gate GEMM and optional activation quantization, tiled over
+//    tokens and experts.
+// 2. Top-k selection, optional route metadata, and optional payload push.
+// The supported renormalized 128/8 and 512/10 shapes share one CTA per token;
+// the generic selector retains one warp per token for other configurations.
+// PDL overlaps the producer tail with dependent work without removing its
+// data-readiness dependencies.
 
 #include <minisgl/tensor.h>
 #include <minisgl/utils.cuh>
@@ -27,6 +24,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <limits>
 #include <type_traits>
 
@@ -102,7 +101,6 @@ __device__ __forceinline__ uint32_t warp_redux_max_u32(uint32_t value) {
 inline constexpr int kQuantSplits = 16;
 inline constexpr int kStages = 4;   // cp.async pipeline depth (latency-bound kernel)
 
-
 __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
     const __nv_bfloat16* __restrict__ hidden,  // [num_tokens, hidden_size]
     const __nv_bfloat16* __restrict__ gate_w,  // [num_experts, hidden_size]
@@ -177,16 +175,14 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
   float acc[4] = {};
   const int num_chunks = k_slice / kKChunk;
 
-  // Optional fused per-32 FP8 quant of the hidden states (the gate GEMV
-  // streams every token row through smem anyway).  Block `nsplit` owns the
-  // The first kQuantSplits expert blocks also partition and quantize K. This
-  // remains exactly one owner per hidden value when the expert grid grows for
-  // Qwen3.5-397B's 512 experts.
-  const int q_size = hidden_size / kQuantSplits;             // bytes of K per block
-  const bool q_on = (x_q != nullptr) && (nsplit < kQuantSplits) &&
-                    (warp == nsplit / 2);
-  const int q_chunk_begin = (nsplit % 2) * (q_size / kKChunk);
-  const int q_chunk_end = q_chunk_begin + q_size / kKChunk;
+  // Each warp's two K halves have distinct logical owners. Fold those owners
+  // onto available expert blocks for small grids; retain the original owners
+  // for 128+ experts. Every hidden value still has exactly one quantizer.
+  const bool full_quant_grid = num_expert_splits >= kQuantSplits;
+  const int first_owner = full_quant_grid ? warp * 2 : (warp * 2) % num_expert_splits;
+  const int second_owner = full_quant_grid ? warp * 2 + 1 : (warp * 2 + 1) % num_expert_splits;
+  const bool quant_first = x_q != nullptr && nsplit == first_owner;
+  const bool quant_second = x_q != nullptr && nsplit == second_owner;
   const auto quant_chunk = [&](int stage, int c) {
     const int row = lane / 2, grp = lane % 2;
     if (m0 + row >= num_tokens) return;
@@ -260,7 +256,7 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
           : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
           : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
     }
-    if (q_on && c >= q_chunk_begin && c < q_chunk_end)
+    if (c < num_chunks / 2 ? quant_first : quant_second)
       quant_chunk(cur, c);
     __syncwarp();
   }
@@ -293,12 +289,156 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
   device::PDL::launch<true>();
 }
 
+// Reserve 1 KiB for static state; generic selectors may use up to 16 warps.
+// The runtime block width controls each warp's bounded, 128B-aligned chunk.
+constexpr int kFinalPushSharedBudget = 48 * 1024 - 1024;
+__host__ __device__ inline int compact_push_chunk_bytes(int warps, int hidden, int topk) {
+  const int frame = (hidden + hidden / 32 + topk * 4 + 127) / 128 * 128;
+  const int limit = kFinalPushSharedBudget / warps / 128 * 128;
+  return frame < limit ? frame : limit;
+}
+// Bound a cooperatively shared frame stage independently of per-warp staging.
+// Qwen-sized frames remain one chunk; wide rows reuse a modest shared tile.
+__host__ __device__ inline int cooperative_frame_chunk_bytes(int hidden, int topk) {
+  const int frame = (hidden + hidden / 32 + topk * 4 + 127) / 128 * 128;
+  return frame < 16 * 1024 ? frame : 16 * 1024;
+}
+template <typename IndexT>
+__device__ __forceinline__ void push_final_activation_row(
+    const IndexT* ids, const float* weights, const uint8_t* x, const uint8_t* sf,
+    const deep_gemm::layout::Workspace& workspace, const int64_t* peers,
+    int rank, int token, int hidden, int topk, int first_topk, int topk_stride) {
+  if (first_topk >= topk) return;
+  extern __shared__ __align__(16) uint8_t compact_push_stage[];
+  const int lane = threadIdx.x % 32;
+  const int expert = lane < topk ? static_cast<int>(ids[token * topk + lane]) : -1;
+  const int destination = expert >= 0 && expert < workspace.num_experts ?
+      static_cast<int>(expert / workspace.num_experts_per_rank) : -1;
+  const auto equal = __match_any_sync(0xffffffffu, destination);
+  const auto unique = __ballot_sync(0xffffffffu, destination >= 0 && lane == __ffs(equal) - 1);
+  uint32_t assigned = 0;
+  for (int k = first_topk; k < topk; k += topk_stride) assigned |= unique & (1u << k);
+  if (!assigned) return;
+  const int chunk_bytes = compact_push_chunk_bytes(blockDim.x / 32, hidden, topk);
+  auto* stage = compact_push_stage + (threadIdx.x / 32) * chunk_bytes;
+  const uint64_t activation_offset = reinterpret_cast<uintptr_t>(
+      workspace.get_compact_frame_base_ptr(hidden, topk)) - reinterpret_cast<uintptr_t>(workspace.base);
+  const uint64_t row = workspace.get_source_l1_row(rank, token);
+  const int frame_bytes = static_cast<int>(workspace.get_source_frame_bytes(hidden));
+  for (int offset = 0; offset < frame_bytes; offset += chunk_bytes) {
+    const int bytes = min(chunk_bytes, frame_bytes - offset);
+    const auto* input = reinterpret_cast<const uint4*>(x + static_cast<uint64_t>(token) * hidden);
+    for (int i = lane * 16; i < bytes && offset + i < hidden; i += 32 * 16)
+      *reinterpret_cast<uint4*>(stage + i) = input[(offset + i) / 16];
+    // Scale factors and exact FP32 weights occupy the frame tail; padding is zero.
+    const int auxiliary_start = max(0, hidden - offset);
+    for (int i = auxiliary_start + lane * 4; i < bytes; i += 32 * 4) {
+      const int position = offset + i;
+      uint32_t value = 0;
+      if (position < hidden + hidden / 32)
+        value = reinterpret_cast<const uint32_t*>(sf + static_cast<uint64_t>(token) * hidden / 32)[(position - hidden) / 4];
+      else if (position < hidden + hidden / 32 + topk * 4)
+        value = __float_as_uint(weights[static_cast<uint64_t>(token) * topk + (position - hidden - hidden / 32) / 4]);
+      *reinterpret_cast<uint32_t*>(stage + i) = value;
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncwarp();
+    if (lane == 0) {
+      for (int k = first_topk; k < topk; k += topk_stride) {
+        if (!(assigned & (1u << k))) continue;
+        const int dst = static_cast<int>(ids[token * topk + k]) / workspace.num_experts_per_rank;
+        auto* output = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(peers[dst]) +
+            activation_offset + row * frame_bytes + offset);
+        asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                     :: "l"(output), "r"(smem_u32(stage)), "r"(bytes) : "memory");
+      }
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      // Wait for destination writes, not just shared-source reads, before publication.
+      asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+    __syncwarp();
+  }
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+  __syncwarp();
+}
+
+// Stage a frame chunk with any cooperating thread subset. During selection,
+// warp 0 owns weights while the remaining warps load activation/SF and padding.
+__device__ __forceinline__ void stage_compact_frame_chunk(
+    uint8_t* stage, const uint8_t* x, const uint8_t* sf, const float* weights,
+    int token, int hidden, int topk, int offset, int bytes,
+    int first, int stride, bool include_weights) {
+  const auto* input = reinterpret_cast<const uint4*>(x + static_cast<uint64_t>(token) * hidden);
+  for (int i = first * 16; i < bytes && offset + i < hidden; i += stride * 16)
+    *reinterpret_cast<uint4*>(stage + i) = input[(offset + i) / 16];
+  for (int i = max(0, hidden - offset) + first * 4; i < bytes; i += stride * 4) {
+    const int position = offset + i;
+    uint32_t value = 0;
+    if (position < hidden + hidden / 32)
+      value = reinterpret_cast<const uint32_t*>(sf + static_cast<uint64_t>(token) * hidden / 32)[(position - hidden) / 4];
+    else if (position < hidden + hidden / 32 + topk * 4) {
+      if (!include_weights) continue;
+      value = __float_as_uint(weights[static_cast<uint64_t>(token) * topk + (position - hidden - hidden / 32) / 4]);
+    }
+    *reinterpret_cast<uint32_t*>(stage + i) = value;
+  }
+}
+
+template <typename IndexT>
+__device__ __forceinline__ void push_preloaded_frame_cta(
+    const IndexT* ids, const float* weights, const uint8_t* x, const uint8_t* sf,
+    const deep_gemm::layout::Workspace& workspace, const int64_t* peers,
+    int rank, int token, int hidden, int topk, uint8_t* stage) {
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32 - 1;
+  const int warps = blockDim.x / 32 - 1;
+  const int expert = lane < topk ? static_cast<int>(ids[token * topk + lane]) : -1;
+  const int destination = expert >= 0 && expert < workspace.num_experts ?
+      static_cast<int>(expert / workspace.num_experts_per_rank) : -1;
+  const auto equal = __match_any_sync(0xffffffffu, destination);
+  const auto unique = __ballot_sync(0xffffffffu, destination >= 0 && lane == __ffs(equal) - 1);
+  // All copy warps see the same source IDs and leave this group together.
+  if (!unique) return;
+  uint32_t assigned = 0;
+  for (int k = warp; k < topk; k += warps) assigned |= unique & (1u << k);
+  const uint64_t activation_offset = reinterpret_cast<uintptr_t>(
+      workspace.get_compact_frame_base_ptr(hidden, topk)) - reinterpret_cast<uintptr_t>(workspace.base);
+  const uint64_t row = workspace.get_source_l1_row(rank, token);
+  const int frame_bytes = static_cast<int>(workspace.get_source_frame_bytes(hidden));
+  const int chunk_bytes = cooperative_frame_chunk_bytes(hidden, topk);
+  for (int offset = 0; offset < frame_bytes; offset += chunk_bytes) {
+    const int bytes = min(chunk_bytes, frame_bytes - offset);
+    if (offset != 0) {
+      stage_compact_frame_chunk(stage, x, sf, weights, token, hidden, topk,
+                              offset, bytes, threadIdx.x - kWarpSize, blockDim.x - kWarpSize, true);
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      asm volatile("barrier.cta.sync 1, %0;" :: "r"(blockDim.x - kWarpSize) : "memory");
+    }
+    if (lane == 0 && assigned) {
+      for (int k = warp; k < topk; k += warps) {
+        if (!(assigned & (1u << k))) continue;
+        const int dst = static_cast<int>(ids[token * topk + k]) / workspace.num_experts_per_rank;
+        auto* output = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(peers[dst]) +
+            activation_offset + row * frame_bytes + offset);
+        asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                     :: "l"(output), "r"(smem_u32(stage)), "r"(bytes) : "memory");
+      }
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+    // Barrier 1 belongs to the seven copy warps; warp 0 writes metadata.
+    // The caller's CTA barrier joins both tasks after the final chunk.
+    if (offset + bytes < frame_bytes) asm volatile("barrier.cta.sync 1, %0;" :: "r"(blockDim.x - kWarpSize) : "memory");
+  }
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+
 // Second kernel: top-k over the assembled logits (one block per token tile,
 // one warp per token).  The kernel boundary is the cheapest device-wide
 // barrier — much faster than an in-kernel ticket + memory fence round.
 template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
           bool kRankReadyRoutePublish, bool kPerfectBalance,
-          bool kRenormalize>
+          bool kRenormalize, bool kCompactPush>
 __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_kernel(
     const float* __restrict__ logits_gmem,  // [mtiles, 16, kMaxExperts]
     float* __restrict__ topk_weights,
@@ -312,12 +452,14 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     const int route_rank, const int route_num_ranks,
     const int route_bucket, const int route_num_sms,
     const int num_tokens, const int num_experts, const int topk,
-    const bool defer_route_dependent_launch) {
+    const bool defer_route_dependent_launch,
+    const uint8_t* dispatch_x, const uint8_t* dispatch_sf, const int dispatch_hidden) {
   const int mtile = blockIdx.x;
   const int m0 = mtile * kTokensPerBlock;
   const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
   const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
   device::PDL::wait<true>();
+
   const float* block_logits =
       logits_gmem + static_cast<size_t>(mtile) * kTokensPerBlock * kMaxExperts;
 
@@ -436,27 +578,60 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
           const auto workspace = deep_gemm::layout::Workspace(
               route_workspace, route_num_ranks, num_experts,
               route_bucket, topk);
-          auto* send_count = reinterpret_cast<unsigned int*>(
-              workspace.get_expert_send_count_ptr(
-                  static_cast<uint32_t>(mapped_expert)));
-          const auto dst_slot = atomicAdd(send_count, 1u);
-          const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
-                                workspace.num_experts_per_rank;
-          const auto dst_local_expert =
-              static_cast<uint32_t>(mapped_expert) %
-              workspace.num_experts_per_rank;
-          auto* local_dst = workspace.get_src_token_topk_idx_ptr(
-              dst_local_expert, route_rank, dst_slot);
-          const auto byte_offset =
-              reinterpret_cast<uintptr_t>(local_dst) -
-              reinterpret_cast<uintptr_t>(route_workspace);
-          auto* remote_dst = reinterpret_cast<uint32_t*>(
-              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-              byte_offset);
-          *remote_dst = static_cast<uint32_t>(token_topk_idx);
+          if constexpr (kRankReadyRoutePublish) {
+            // Allocate compact expert rows before the existing all-rank release.
+            const uint32_t expert = static_cast<uint32_t>(mapped_expert);
+            const uint32_t dst_rank = expert / workspace.num_experts_per_rank;
+            const uint32_t local_expert = expert % workspace.num_experts_per_rank;
+            const auto sum_offset = reinterpret_cast<uintptr_t>(
+                workspace.get_expert_recv_count_sum_ptr(local_expert)) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_sum = reinterpret_cast<uint64_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + sum_offset);
+            const uint64_t slot = deep_gemm::ptx::atomic_add_sys(remote_sum, 1);
+            DG_DEVICE_ASSERT(slot < workspace.num_max_recv_tokens_per_expert);
+            const auto offset = reinterpret_cast<uintptr_t>(
+                workspace.get_src_token_topk_idx_ptr(local_expert,
+                  workspace.num_ranks == 1 ? 0 : workspace.metadata_slot, static_cast<uint32_t>(slot))) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_dst = reinterpret_cast<uint32_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + offset);
+            *remote_dst = static_cast<uint32_t>(route_rank) * route_bucket * topk +
+                static_cast<uint32_t>(token_topk_idx);
+          } else {
+            auto* send_count = reinterpret_cast<unsigned int*>(
+                workspace.get_expert_send_count_ptr(
+                    static_cast<uint32_t>(mapped_expert)));
+            const auto dst_slot = atomicAdd(send_count, 1u);
+            const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
+                                  workspace.num_experts_per_rank;
+            const auto dst_local_expert =
+                static_cast<uint32_t>(mapped_expert) %
+                workspace.num_experts_per_rank;
+            auto* local_dst = workspace.get_src_token_topk_idx_ptr(
+                dst_local_expert, route_rank, dst_slot);
+            const auto byte_offset =
+                reinterpret_cast<uintptr_t>(local_dst) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_dst = reinterpret_cast<uint32_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+                byte_offset);
+            *remote_dst = static_cast<uint32_t>(token_topk_idx);
+          }
         }
       }
     }
+    }
+  }
+
+  if constexpr (kCompactPush) {
+    __syncwarp();
+    const int token = m0 + warp;
+    if (token < num_tokens) {
+      const auto workspace = deep_gemm::layout::Workspace(
+          route_workspace, route_num_ranks, num_experts, route_bucket, topk);
+      push_final_activation_row(topk_ids, topk_weights, dispatch_x, dispatch_sf, workspace, route_buffer_ptrs,
+                                route_rank, token, dispatch_hidden, topk, 0, 1);
     }
   }
 
@@ -483,35 +658,37 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
     }
     __syncthreads();
     if (is_last_block) {
-      for (int expert = static_cast<int>(threadIdx.x);
-           expert < num_experts;
-           expert += static_cast<int>(blockDim.x)) {
-        const auto count = static_cast<uint32_t>(
-            *workspace.get_expert_send_count_ptr(expert));
-        const auto dst_rank = expert / workspace.num_experts_per_rank;
-        const auto dst_local_expert = expert % workspace.num_experts_per_rank;
-        const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
-            route_rank, dst_local_expert);
-        const auto recv_count_offset =
-            reinterpret_cast<uintptr_t>(recv_count_ptr) -
-            reinterpret_cast<uintptr_t>(route_workspace);
-        auto* remote_recv_count = reinterpret_cast<uint64_t*>(
-            static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-            recv_count_offset);
-        *remote_recv_count = count;
-
-        if constexpr (not kRankReadyRoutePublish) {
-          const auto recv_sum_ptr =
-              workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
-          const auto recv_sum_offset =
-              reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+      if constexpr (!kRankReadyRoutePublish) {
+        for (int expert = static_cast<int>(threadIdx.x);
+             expert < num_experts;
+             expert += static_cast<int>(blockDim.x)) {
+          const auto count = static_cast<uint32_t>(
+              *workspace.get_expert_send_count_ptr(expert));
+          const auto dst_rank = expert / workspace.num_experts_per_rank;
+          const auto dst_local_expert = expert % workspace.num_experts_per_rank;
+          const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
+              route_rank, dst_local_expert);
+          const auto recv_count_offset =
+              reinterpret_cast<uintptr_t>(recv_count_ptr) -
               reinterpret_cast<uintptr_t>(route_workspace);
-          auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+          auto* remote_recv_count = reinterpret_cast<uint64_t*>(
               static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-              recv_sum_offset);
-          const uint64_t completed_count =
-              (static_cast<uint64_t>(route_num_sms) << 32) | count;
-          deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+              recv_count_offset);
+          *remote_recv_count = count;
+
+          if constexpr (not kRankReadyRoutePublish) {
+            const auto recv_sum_ptr =
+                workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
+            const auto recv_sum_offset =
+                reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+                recv_sum_offset);
+            const uint64_t completed_count =
+                (static_cast<uint64_t>(route_num_sms) << 32) | count;
+            deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+          }
         }
       }
       __syncthreads();
@@ -525,8 +702,9 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
           auto* remote_route_ready = reinterpret_cast<uint64_t*>(
               static_cast<uintptr_t>(route_buffer_ptrs[dst]) +
               route_ready_offset);
-          // One release per destination orders every per-expert count and
-          // source-index store above while avoiding a system atomic per expert.
+          // One readiness release orders the published source descriptors and
+          // whichever count representation this specialization produces.
+
           deep_gemm::ptx::atomic_add_rel_sys(remote_route_ready, 1);
         }
         __syncthreads();
@@ -535,17 +713,15 @@ __launch_bounds__(kTokensPerBlock * kWarpSize) __global__ void gate_topk_select_
         *workspace.get_route_prepare_counter_ptr() = 0;
     }
   }
+
 }
 
-// Qwen3.5's 512-expert/top-10 selector otherwise exposes only one warp per
-// token in a two-block grid at the hard-MB2 rows. Give each token a full CTA:
-// every thread owns two logits, warp 0 reduces the eight candidates for each
-// original selector lane, and the ten exact winners publish routes in
-// parallel. Ties retain the original lower-local-index/lower-lane rule and
-// routing remains data-dependent.
-template <typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
-          bool kRankReadyRoutePublish, bool kPerfectBalance>
-__launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
+// Share one CTA per token across the supported renormalized MoE shapes.
+// Warp 0 selects in registers with the original strict tie order; the CTA
+// cooperates in route publication.
+template <int kExperts, int kTopK, typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
+          bool kRankReadyRoutePublish, bool kPerfectBalance, bool kCompactPush>
+__launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
     const float* __restrict__ logits_gmem,
     float* __restrict__ topk_weights,
     IndexT* __restrict__ topk_ids,
@@ -557,99 +733,69 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
     const int64_t* __restrict__ route_buffer_ptrs,
     const int route_rank, const int route_num_ranks,
     const int route_bucket, const int route_num_sms,
-    const int num_tokens, const bool defer_route_dependent_launch) {
-  constexpr int kExperts = 512;
-  constexpr int kTopK = 10;
-  constexpr int kWarps = kTPB / kWarpSize;
+    const int num_tokens, const bool defer_route_dependent_launch,
+    const uint8_t* dispatch_x, const uint8_t* dispatch_sf, const int dispatch_hidden) {
+  static_assert(kExperts <= kMaxExperts && kExperts % kWarpSize == 0);
+  static_assert(kTopK > 0 && kTopK <= kWarpSize);
   const int token = static_cast<int>(blockIdx.x);
   const int tid = static_cast<int>(threadIdx.x);
   const int warp = tid / kWarpSize;
   const int lane = tid % kWarpSize;
   device::PDL::wait<true>();
 
-  __shared__ float warp_values[kWarps * kWarpSize];
-  __shared__ int warp_experts[kWarps * kWarpSize];
-  __shared__ int selected_experts[kTopK];
-  __shared__ float selected_logits[kTopK];
   const auto validity =
       minisgl::token_validity(token, num_tokens, valid_token_count, valid_count_size);
+  extern __shared__ __align__(16) uint8_t staged_row[];
   const bool valid = validity.valid;
+  if constexpr (kCompactPush) {
+    if (valid && warp != 0)
+      stage_compact_frame_chunk(staged_row, dispatch_x, dispatch_sf, topk_weights,
+          token, dispatch_hidden, kTopK, 0,
+          cooperative_frame_chunk_bytes(dispatch_hidden, kTopK),
+          tid - kWarpSize, kTPB - kWarpSize, false);
+  }
 
-  if (valid) {
-    const float* token_logits =
-        logits_gmem + static_cast<size_t>(token) * kMaxExperts;
-    // Warp `w` owns local-index pairs (2w, 2w+1) for every one of the
-    // original selector's 32 lanes. Reducing warps in ascending order below
-    // reconstructs that lane's strict-`>` scan over all 16 local experts.
-    const int expert0 = lane + (warp * 2) * kWarpSize;
-    const int expert1 = expert0 + kWarpSize;
-    const float value0 = token_logits[expert0];
-    const float value1 = token_logits[expert1];
+  if (valid && warp == 0) {
+    constexpr int kPerLane = kExperts / kWarpSize;
+    float logits[kPerLane];
+    #pragma unroll
+    for (int i = 0; i < kPerLane; ++i)
+      logits[i] = logits_gmem[static_cast<size_t>(token) * kMaxExperts + i * kWarpSize + lane];
     uint32_t used = 0;
-
+    float my_logit = -FLT_MAX, top0 = -FLT_MAX;
+    int my_expert = -1;
     #pragma unroll
     for (int j = 0; j < kTopK; ++j) {
       float best = -FLT_MAX;
-      int best_expert = -1;
-      if ((used & 1u) == 0 && value0 > best) {
-        best = value0;
-        best_expert = expert0;
-      }
-      if ((used & 2u) == 0 && value1 > best) {
-        best = value1;
-        best_expert = expert1;
-      }
-
-      const int candidate_index = warp * kWarpSize + lane;
-      warp_values[candidate_index] = best;
-      warp_experts[candidate_index] = best_expert;
-      __syncthreads();
-
-      if (warp == 0) {
-        float lane_best = -FLT_MAX;
-        int lane_expert = -1;
-        #pragma unroll
-        for (int candidate_warp = 0; candidate_warp < kWarps;
-             ++candidate_warp) {
-          const int index = candidate_warp * kWarpSize + lane;
-          const float candidate = warp_values[index];
-          if (candidate > lane_best) {
-            lane_best = candidate;
-            lane_expert = warp_experts[index];
-          }
-        }
-        const uint32_t value_key = ordered_float_key(lane_best);
-        const uint32_t max_key = warp_redux_max_u32(value_key);
-        const uint32_t lane_key = value_key == max_key
-                                      ? 0xffffffffu - lane
-                                      : 0;
-        const uint32_t src_lane =
-            0xffffffffu - warp_redux_max_u32(lane_key);
-        const int winner = __shfl_sync(
-            0xffffffffu, lane_expert, static_cast<int>(src_lane));
-        const float winner_value = __shfl_sync(
-            0xffffffffu, lane_best, static_cast<int>(src_lane));
-        if (lane == 0) {
-          selected_experts[j] = winner;
-          selected_logits[j] = winner_value;
+      int best_i = -1;
+      #pragma unroll
+      for (int i = 0; i < kPerLane; ++i) {
+        if (!(used & (1u << i)) && logits[i] > best) {
+          best = logits[i];
+          best_i = i;
         }
       }
-      __syncthreads();
-      const int winner = selected_experts[j];
-      if (winner == expert0) used |= 1u;
-      if (winner == expert1) used |= 2u;
+      const uint32_t key = ordered_float_key(best);
+      const uint32_t max_key = warp_redux_max_u32(key);
+      const uint32_t src = 0xffffffffu - warp_redux_max_u32(
+          key == max_key ? 0xffffffffu - lane : 0);
+      const float value = __shfl_sync(0xffffffffu, best, src);
+      const int winner_i = __shfl_sync(0xffffffffu, best_i, src);
+      if (lane == static_cast<int>(src)) used |= 1u << winner_i;
+      if (j == 0) top0 = value;
+      if (lane == j) {
+        my_logit = value;
+        my_expert = winner_i * kWarpSize + static_cast<int>(src);
+      }
     }
-
-    if (tid < kWarpSize) {
-      float w = tid < kTopK
-                    ? __expf(selected_logits[tid] - selected_logits[0])
-                    : 0.f;
+    {
+      float w = tid < kTopK ? __expf(my_logit - top0) : 0.f;
       float w_sum = w;
       #pragma unroll
       for (int off = 16; off > 0; off >>= 1)
         w_sum += __shfl_xor_sync(0xffffffffu, w_sum, off);
       if (tid < kTopK) {
-        int expert = selected_experts[tid];
+        int expert = my_expert;
         if constexpr (kPerfectBalance) {
           expert =
               ((route_rank * validity.total + validity.compact_index) * kTopK + tid) &
@@ -663,42 +809,105 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
         topk_ids[token_topk_idx] = static_cast<IndexT>(mapped_expert);
         const float w_out = w / w_sum;
         topk_weights[token_topk_idx] = w_out;
+        if constexpr (kCompactPush) {
+          const int weight_offset = dispatch_hidden + dispatch_hidden / 32 + tid * 4;
+          if (weight_offset < cooperative_frame_chunk_bytes(dispatch_hidden, kTopK))
+            *reinterpret_cast<float*>(staged_row + weight_offset) = w_out;
+        }
         if (w_stage != nullptr)
           w_stage[token_topk_idx] = w_out;
 
-        if constexpr (kPrepareMegaMoERoutes) {
+        if constexpr (kPrepareMegaMoERoutes && !kCompactPush) {
           if (mapped_expert >= 0 && mapped_expert < kExperts) {
             const auto workspace = deep_gemm::layout::Workspace(
                 route_workspace, route_num_ranks, kExperts,
                 route_bucket, kTopK);
-            auto* send_count = reinterpret_cast<unsigned int*>(
-                workspace.get_expert_send_count_ptr(
-                    static_cast<uint32_t>(mapped_expert)));
-            const auto dst_slot = atomicAdd(send_count, 1u);
-            const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
-                                  workspace.num_experts_per_rank;
-            const auto dst_local_expert =
-                static_cast<uint32_t>(mapped_expert) %
-                workspace.num_experts_per_rank;
-            auto* local_dst = workspace.get_src_token_topk_idx_ptr(
-                dst_local_expert, route_rank, dst_slot);
-            const auto byte_offset =
-                reinterpret_cast<uintptr_t>(local_dst) -
-                reinterpret_cast<uintptr_t>(route_workspace);
-            auto* remote_dst = reinterpret_cast<uint32_t*>(
-                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-                byte_offset);
-            *remote_dst = static_cast<uint32_t>(token_topk_idx);
+            if constexpr (kRankReadyRoutePublish) {
+              // Allocate compact expert rows before the existing all-rank release.
+              const uint32_t expert = static_cast<uint32_t>(mapped_expert);
+              const uint32_t dst_rank = expert / workspace.num_experts_per_rank;
+              const uint32_t local_expert = expert % workspace.num_experts_per_rank;
+              const auto sum_offset = reinterpret_cast<uintptr_t>(
+                  workspace.get_expert_recv_count_sum_ptr(local_expert)) -
+                  reinterpret_cast<uintptr_t>(route_workspace);
+              auto* remote_sum = reinterpret_cast<uint64_t*>(
+                  static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + sum_offset);
+              const uint64_t slot = deep_gemm::ptx::atomic_add_sys(remote_sum, 1);
+              DG_DEVICE_ASSERT(slot < workspace.num_max_recv_tokens_per_expert);
+              const auto offset = reinterpret_cast<uintptr_t>(
+                  workspace.get_src_token_topk_idx_ptr(local_expert,
+                  workspace.num_ranks == 1 ? 0 : workspace.metadata_slot, static_cast<uint32_t>(slot))) -
+                  reinterpret_cast<uintptr_t>(route_workspace);
+              auto* remote_dst = reinterpret_cast<uint32_t*>(
+                  static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + offset);
+              *remote_dst = static_cast<uint32_t>(route_rank) * route_bucket * kTopK +
+                  static_cast<uint32_t>(token_topk_idx);
+            } else {
+              auto* send_count = reinterpret_cast<unsigned int*>(
+                  workspace.get_expert_send_count_ptr(
+                      static_cast<uint32_t>(mapped_expert)));
+              const auto dst_slot = atomicAdd(send_count, 1u);
+              const auto dst_rank = static_cast<uint32_t>(mapped_expert) /
+                                    workspace.num_experts_per_rank;
+              const auto dst_local_expert =
+                  static_cast<uint32_t>(mapped_expert) %
+                  workspace.num_experts_per_rank;
+              auto* local_dst = workspace.get_src_token_topk_idx_ptr(
+                  dst_local_expert, route_rank, dst_slot);
+              const auto byte_offset =
+                  reinterpret_cast<uintptr_t>(local_dst) -
+                  reinterpret_cast<uintptr_t>(route_workspace);
+              auto* remote_dst = reinterpret_cast<uint32_t*>(
+                  static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+                  byte_offset);
+              *remote_dst = static_cast<uint32_t>(token_topk_idx);
+            }
           }
         }
       }
     }
-  } else if (tid < kTopK) {
+  } else if (!valid && tid < kTopK) {
     const auto token_topk_idx = static_cast<size_t>(token) * kTopK + tid;
     topk_ids[token_topk_idx] = static_cast<IndexT>(-1);
     topk_weights[token_topk_idx] = 0.0f;
     if (w_stage != nullptr)
       w_stage[token_topk_idx] = 0.0f;
+  }
+
+  if constexpr (kCompactPush) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+    const auto workspace = deep_gemm::layout::Workspace(
+        route_workspace, route_num_ranks, kExperts, route_bucket, kTopK);
+    if (warp == 0) {
+      // The source-indexed address is already known. Metadata slot allocation
+      // can run concurrently with the other warps' direct payload transfer.
+      if (valid && tid < kTopK) {
+        const auto token_topk_idx = static_cast<uint32_t>(token) * kTopK + tid;
+        const int mapped_expert = static_cast<int>(topk_ids[token_topk_idx]);
+        if (mapped_expert >= 0 && mapped_expert < kExperts) {
+          const uint32_t dst_rank = mapped_expert / workspace.num_experts_per_rank;
+          const uint32_t local_expert = mapped_expert % workspace.num_experts_per_rank;
+          const auto sum_offset = reinterpret_cast<uintptr_t>(
+              workspace.get_expert_recv_count_sum_ptr(local_expert)) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_sum = reinterpret_cast<uint64_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + sum_offset);
+          const uint64_t slot = deep_gemm::ptx::atomic_add_sys(remote_sum, 1);
+          DG_DEVICE_ASSERT(slot < workspace.num_max_recv_tokens_per_expert);
+          const auto offset = reinterpret_cast<uintptr_t>(
+              workspace.get_src_token_topk_idx_ptr(local_expert,
+              workspace.num_ranks == 1 ? 0 : workspace.metadata_slot, static_cast<uint32_t>(slot))) -
+              reinterpret_cast<uintptr_t>(route_workspace);
+          auto* remote_dst = reinterpret_cast<uint32_t*>(
+              static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) + offset);
+          *remote_dst = static_cast<uint32_t>(route_rank) * route_bucket * kTopK + token_topk_idx;
+        }
+      }
+    } else {
+      push_preloaded_frame_cta(topk_ids, topk_weights, dispatch_x, dispatch_sf, workspace, route_buffer_ptrs,
+                              route_rank, token, dispatch_hidden, kTopK, staged_row);
+    }
   }
 
   if constexpr (kPrepareMegaMoERoutes) {
@@ -715,34 +924,36 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
     }
     __syncthreads();
     if (is_last_block) {
-      for (int expert = tid; expert < kExperts; expert += kTPB) {
-        const auto count = static_cast<uint32_t>(
-            *workspace.get_expert_send_count_ptr(expert));
-        const auto dst_rank = expert / workspace.num_experts_per_rank;
-        const auto dst_local_expert =
-            expert % workspace.num_experts_per_rank;
-        const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
-            route_rank, dst_local_expert);
-        const auto recv_count_offset =
-            reinterpret_cast<uintptr_t>(recv_count_ptr) -
-            reinterpret_cast<uintptr_t>(route_workspace);
-        auto* remote_recv_count = reinterpret_cast<uint64_t*>(
-            static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-            recv_count_offset);
-        *remote_recv_count = count;
-
-        if constexpr (not kRankReadyRoutePublish) {
-          const auto recv_sum_ptr =
-              workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
-          const auto recv_sum_offset =
-              reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+      if constexpr (!kRankReadyRoutePublish) {
+        for (int expert = tid; expert < kExperts; expert += kTPB) {
+          const auto count = static_cast<uint32_t>(
+              *workspace.get_expert_send_count_ptr(expert));
+          const auto dst_rank = expert / workspace.num_experts_per_rank;
+          const auto dst_local_expert =
+              expert % workspace.num_experts_per_rank;
+          const auto recv_count_ptr = workspace.get_expert_recv_count_ptr(
+              route_rank, dst_local_expert);
+          const auto recv_count_offset =
+              reinterpret_cast<uintptr_t>(recv_count_ptr) -
               reinterpret_cast<uintptr_t>(route_workspace);
-          auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+          auto* remote_recv_count = reinterpret_cast<uint64_t*>(
               static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
-              recv_sum_offset);
-          const uint64_t completed_count =
-              (static_cast<uint64_t>(route_num_sms) << 32) | count;
-          deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+              recv_count_offset);
+          *remote_recv_count = count;
+
+          if constexpr (not kRankReadyRoutePublish) {
+            const auto recv_sum_ptr =
+                workspace.get_expert_recv_count_sum_ptr(dst_local_expert);
+            const auto recv_sum_offset =
+                reinterpret_cast<uintptr_t>(recv_sum_ptr) -
+                reinterpret_cast<uintptr_t>(route_workspace);
+            auto* remote_recv_sum = reinterpret_cast<uint64_t*>(
+                static_cast<uintptr_t>(route_buffer_ptrs[dst_rank]) +
+                recv_sum_offset);
+            const uint64_t completed_count =
+                (static_cast<uint64_t>(route_num_sms) << 32) | count;
+            deep_gemm::ptx::atomic_add_rel_sys(remote_recv_sum, completed_count);
+          }
         }
       }
       __syncthreads();
@@ -755,6 +966,7 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
           auto* remote_route_ready = reinterpret_cast<uint64_t*>(
               static_cast<uintptr_t>(route_buffer_ptrs[dst]) +
               route_ready_offset);
+
           deep_gemm::ptx::atomic_add_rel_sys(remote_route_ready, 1);
         }
         __syncthreads();
@@ -763,6 +975,7 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_qwen35_cta_kernel(
         *workspace.get_route_prepare_counter_ptr() = 0;
     }
   }
+
 }
 
 }  // namespace
@@ -789,7 +1002,8 @@ struct GateTopkFusedKernel {
       int route_num_sms,
       bool route_rank_ready,
       bool perfect_balance,
-      bool defer_route_dependent_launch) {
+      bool defer_route_dependent_launch,
+      bool compact_push) {
     using namespace host;
     auto num_tokens = SymbolicSize{"M"};
     auto topk = SymbolicSize{"K"};
@@ -849,6 +1063,8 @@ struct GateTopkFusedKernel {
                  valid_token_count.size(0));
 
     const bool prepare_routes = route_workspace.has_value();
+    RuntimeCheck(!compact_push || (prepare_routes && route_rank_ready && x_q.has_value() && x_sf.has_value()),
+                 "compact payload push requires rank-ready metadata and fused quantization");
     RuntimeCheck(
         prepare_routes == route_buffer_ptrs.has_value(),
         "route_workspace and route_buffer_ptrs must be provided together");
@@ -890,6 +1106,9 @@ struct GateTopkFusedKernel {
           "route workspace is smaller than the MegaMoE metadata region");
     }
 
+    RuntimeCheck(!prepare_routes || !route_rank_ready ||
+        static_cast<uint64_t>(route_num_ranks) * route_bucket * topk_value <= 0xffffffffu,
+        "Dense source descriptor exceeds uint32");
     const auto stream = LaunchKernel::resolve_device(device_ref.unwrap());
     const int num_mtiles = (rows + kTokensPerBlock - 1) / kTokensPerBlock;
     const int num_expert_splits = experts / 8;
@@ -944,46 +1163,65 @@ struct GateTopkFusedKernel {
           ? static_cast<const int64_t*>(route_buffer_ptrs.value().data_ptr())
           : nullptr;
       const auto launch = [&](auto prepare_tag, auto rank_ready_tag,
-                              auto perfect_tag, auto renormalize_tag) {
+                              auto perfect_tag, auto renormalize_tag, auto compact_tag) {
+        constexpr bool kCompactPush = decltype(compact_tag)::value;
         constexpr bool kPrepareRoutes = decltype(prepare_tag)::value;
         constexpr bool kRankReady = decltype(rank_ready_tag)::value;
         constexpr bool kPerfect = decltype(perfect_tag)::value;
         constexpr bool kRenormalize = decltype(renormalize_tag)::value;
         if constexpr (kRenormalize) {
-          if (experts == 512 && topk_value == 10) {
-            const auto kernel = gate_topk_select_qwen35_cta_kernel<
-                IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect>;
-            LaunchKernel(rows, kTPB, stream).with_attr(true)(kernel,
+          const auto launch_cta = [&](auto experts_tag, auto topk_tag) {
+            constexpr int kExperts = decltype(experts_tag)::value;
+            constexpr int kTopK = decltype(topk_tag)::value;
+            const auto kernel = gate_topk_select_cta_kernel<
+                kExperts, kTopK, IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect, kCompactPush>;
+            LaunchKernel(rows, kTPB, stream, kCompactPush ? cooperative_frame_chunk_bytes(hsize, kTopK) : 0).with_attr(true)(kernel,
                 static_cast<const float*>(partials.data_ptr()),
                 static_cast<float*>(topk_weights.data_ptr()),
                 static_cast<IndexT*>(topk_indices.data_ptr()),
                 map_ptr, count_ptr, count_size, w_stage_ptr,
                 route_workspace_ptr, route_buffer_ptrs_ptr,
                 route_rank, route_num_ranks, route_bucket, route_num_sms,
-                rows, defer_route_dependent_launch);
+                rows, defer_route_dependent_launch, x_q_ptr, x_sf_ptr, hsize);
+          };
+          if (experts == 128 && topk_value == 8) {
+            launch_cta(std::integral_constant<int, 128>{}, std::integral_constant<int, 8>{});
+            return;
+          }
+          if (experts == 512 && topk_value == 10) {
+            launch_cta(std::integral_constant<int, 512>{}, std::integral_constant<int, 10>{});
             return;
           }
         }
         const auto kernel =
             gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady,
-                                    kPerfect, kRenormalize>;
+                                    kPerfect, kRenormalize, kCompactPush>;
         LaunchKernel(num_mtiles,
                      std::min(kTokensPerBlock, rows) * kWarpSize,
-                     stream).with_attr(true)(kernel,
+                     stream, kCompactPush ? std::min(kTokensPerBlock, rows) * compact_push_chunk_bytes(std::min(kTokensPerBlock, rows), hsize, topk_value) : 0).with_attr(true)(kernel,
             static_cast<const float*>(partials.data_ptr()),
             static_cast<float*>(topk_weights.data_ptr()),
             static_cast<IndexT*>(topk_indices.data_ptr()),
             map_ptr, count_ptr, count_size, w_stage_ptr,
             route_workspace_ptr, route_buffer_ptrs_ptr,
             route_rank, route_num_ranks, route_bucket, route_num_sms,
-            rows, experts, topk_value, defer_route_dependent_launch);
+            rows, experts, topk_value, defer_route_dependent_launch, x_q_ptr, x_sf_ptr, hsize);
       };
       const auto launch_policy = [&](auto prepare_tag, auto rank_ready_tag,
                                      auto perfect_tag) {
-        if (renormalize)
-          launch(prepare_tag, rank_ready_tag, perfect_tag, std::true_type{});
-        else
-          launch(prepare_tag, rank_ready_tag, perfect_tag, std::false_type{});
+        const auto launch_renormalize = [&](auto compact_tag) {
+          if (renormalize)
+            launch(prepare_tag, rank_ready_tag, perfect_tag, std::true_type{}, compact_tag);
+          else
+            launch(prepare_tag, rank_ready_tag, perfect_tag, std::false_type{}, compact_tag);
+        };
+        if constexpr (decltype(prepare_tag)::value && decltype(rank_ready_tag)::value) {
+          if (compact_push) {
+            launch_renormalize(std::true_type{});
+            return;
+          }
+        }
+        launch_renormalize(std::false_type{});
       };
       if (prepare_routes) {
         if (route_rank_ready) {
@@ -1001,15 +1239,18 @@ struct GateTopkFusedKernel {
         launch_policy(std::false_type{}, std::false_type{}, std::false_type{});
       }
     };
-    if (use_int32_indices && use_int32_map) {
-      launch_select(TypeTag<int32_t>{}, TypeTag<int32_t>{});
-    } else if (use_int32_indices && !use_int32_map) {
-      launch_select(TypeTag<int32_t>{}, TypeTag<int64_t>{});
-    } else if (!use_int32_indices && use_int32_map) {
-      launch_select(TypeTag<int64_t>{}, TypeTag<int32_t>{});
-    } else {
-      launch_select(TypeTag<int64_t>{}, TypeTag<int64_t>{});
-    }
+    auto launch_index_types = [&]() {
+      if (use_int32_indices && use_int32_map) {
+        launch_select(TypeTag<int32_t>{}, TypeTag<int32_t>{});
+      } else if (use_int32_indices && !use_int32_map) {
+        launch_select(TypeTag<int32_t>{}, TypeTag<int64_t>{});
+      } else if (!use_int32_indices && use_int32_map) {
+        launch_select(TypeTag<int64_t>{}, TypeTag<int32_t>{});
+      } else {
+        launch_select(TypeTag<int64_t>{}, TypeTag<int64_t>{});
+      }
+    };
+    launch_index_types();
   }
 
  private:

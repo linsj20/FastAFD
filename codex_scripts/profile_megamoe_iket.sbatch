@@ -5,6 +5,7 @@
 #                     FASTAFD_IKET_INCLUDE FASTAFD_IKET_PYTHON_DEPS
 #                     FASTAFD_IKET_ARTIFACT_ROOT FASTAFD_IKET_DEEPGEMM_CACHE_ROOT
 #                     DG_JIT_CACHE_DIR
+#                     FASTAFD_IKET_VERIFY_SOURCE (0 for archive-authoritative sources)
 #                     MEGAMOE_IKET_EP MEGAMOE_IKET_GLOBAL_TOKENS
 #                     MEGAMOE_IKET_DISPATCH_DETAIL (diagnostic source required)
 #                     MEGAMOE_BASELINE_{WARMUPS,ITERATIONS}
@@ -98,10 +99,10 @@ if [[ ${FASTAFD_IKET_RANK_MODE:-} == normal || \
         # Peers must join both worlds, with identical rank IDs and inputs.
         if [[ $FASTAFD_IKET_RANK_MODE == profile ]]; then
             "$FASTAFD_VENV/bin/python" \
-                "$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py"
+                "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
         fi
         exec "$FASTAFD_VENV/bin/python" \
-            "$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py"
+            "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
     fi
     # Add optional SModel dependencies only to the profiler interpreter.
     # Its child workload retains the original Python environment.
@@ -110,12 +111,14 @@ import os, runpy, shutil, sys
 deps = os.environ["FASTAFD_IKET_PYTHON_DEPS"]
 if deps:
     sys.path.insert(0, deps)
+if os.environ.get("FASTAFD_IKET_EVENT_REGISTER_LIMITS"):
+    runpy.run_path(os.environ["FASTAFD_IKET_REGISTER_LIMIT_SCRIPT"], run_name="__main__")
 runpy.run_path(shutil.which("run-iket"), run_name="__main__")
 ' --output-dir "$rank_root/iket" --clobber \
         --context-buffer-size 268435456 --log-level info \
         profile --max-ts-cnt-per-warp 1024 --postprocess json -- \
         "$FASTAFD_VENV/bin/python" \
-        "$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py"
+        "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
 fi
 
 script_path=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -149,7 +152,7 @@ if (( ! analyze_only )); then
     echo "MEGAMOE_IKET_PROFILE_RANK must be within the EP world" >&2
     exit 2
 }
-[[ -f $FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py ]] || {
+[[ -f "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}" ]] || {
     echo "missing FastAFD MegaMoE smoke: $FASTAFD_SOURCE_REPO" >&2
     exit 2
 }
@@ -189,14 +192,21 @@ mkdir -p "$run_root/ranks" "$deepgemm_cache" "$tvm_cache"
 export FASTAFD_IKET_RUN_ROOT=$run_root
 if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} != 1 || $SLURM_PROCID == "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
     cp "$script_path" "$run_root/profile_megamoe_iket.sbatch"
-    git -C "$FASTAFD_SOURCE_REPO" rev-parse HEAD > "$run_root/source-head.txt"
-    git -C "$FASTAFD_SOURCE_REPO" status --short > "$run_root/source-status.txt"
-    git -C "$FASTAFD_SOURCE_REPO" diff -- \
-        tests/afd_megamoe_same_rank_smoke.py \
-        python/minisgl/kernel/csrc/deepgemm/csrc/jit/compiler.hpp \
-        python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh \
-        python/minisgl/kernel/csrc/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp \
-        > "$run_root/source.patch"
+    if [[ ${FASTAFD_IKET_VERIFY_SOURCE:-1} == 1 ]]; then
+        git -C "$FASTAFD_SOURCE_REPO" rev-parse HEAD > "$run_root/source-head.txt"
+        git -C "$FASTAFD_SOURCE_REPO" status --short > "$run_root/source-status.txt"
+        git -C "$FASTAFD_SOURCE_REPO" diff -- \
+            tests/afd_megamoe_same_rank_smoke.py \
+            python/minisgl/kernel/csrc/deepgemm/csrc/jit/compiler.hpp \
+            python/minisgl/kernel/csrc/deepgemm/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh \
+            python/minisgl/kernel/csrc/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp \
+            > "$run_root/source.patch"
+    elif [[ ${FASTAFD_IKET_VERIFY_SOURCE:-1} == 0 ]]; then
+        printf '%s\n' "$FASTAFD_SOURCE_REPO" > "$run_root/source-snapshot.txt"
+    else
+        echo 'FASTAFD_IKET_VERIFY_SOURCE must be 0 or 1' >&2
+        exit 2
+    fi
 fi
 
 if [[ ${FASTAFD_IKET_IN_CONTAINER:-0} == 1 ]]; then

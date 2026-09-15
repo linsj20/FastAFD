@@ -69,7 +69,7 @@ class GB200OverlapContractTests(unittest.TestCase):
             "gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady,",
             select,
         )
-        self.assertIn("kPerfect, kRenormalize>", select)
+        self.assertIn("kPerfect, kRenormalize, kCompactPush>", select)
         self.assertIn("if constexpr (!kRenormalize)", select)
         self.assertIn("if (renormalize)", select)
         perfect_start = select.index("if constexpr (kPerfectBalance)")
@@ -665,7 +665,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertNotIn("output = output + shared", moe_source)
         exact_norm = runtime_source.index(
             "layer.post_attention_layernorm.forward(",
-            runtime_source.index("if shared_expert_turns:"),
+            runtime_source.index("def _finish_model_layer("),
         )
         fused_shared_input = runtime_source.index(
             "fp8_quant_shared_gate(", exact_norm
@@ -681,7 +681,6 @@ class GB200OverlapContractTests(unittest.TestCase):
         qwen35_transport = (
             ROOT / "python/minisgl/kernel/csrc/jit/qwen35_qkv_transport.cu"
         ).read_text()
-        self.assertEqual(qwen35_transport.count("release_peer_lane(params);"), 2)
         norm_quant_source = (
             ROOT / "python/minisgl/kernel/csrc/jit/fp8_quant_shared_gate.cu"
         ).read_text()
@@ -713,23 +712,16 @@ class GB200OverlapContractTests(unittest.TestCase):
             / "python/minisgl/kernel/csrc/deepep/deep_ep/include/deep_ep/impls/combine.cuh"
         ).read_text()
         self.assertNotIn("__threadfence();", combine_source)
-        self.assertEqual(source.count("publication_blocks(tasks)"), 6)
-        self.assertEqual(source.count("global_task - edge_base"), 2)
-        self.assertEqual(source.count("ready_edges.unwrap() == 1"), 6)
-        self.assertEqual(source.count("single_ready and edges.unwrap() == 1"), 5)
         fused_start = source.index("__global__ void quantize_publish_o_fp8_kernel(")
         fused_end = source.index("__global__ void wait_ready_kernel", fused_start)
         fused_source = source[fused_start:fused_end]
         quantize_at = fused_source.index("quantize_o_fp8_to_stage")
-        release_at = fused_source.index("atomicAdd(params.quantization_counter, 1)")
+        join_at = fused_source.index("__syncthreads();")
         publish_at = fused_source.index("publish_staged_o_fp8_payload")
-        self.assertLess(quantize_at, release_at)
-        self.assertLess(release_at, publish_at)
-        release_start = source.index("void publish_o_kernel_release_turn(")
-        release_end = source.index("__global__ void wait_ready_kernel", release_start)
-        release_source = source[release_start:release_end]
-        self.assertNotIn("__threadfence();", release_source)
-        self.assertNotIn("__threadfence_system();", release_source)
+        ready_at = fused_source.index("finish_payload_publication")
+        self.assertLess(quantize_at, join_at)
+        self.assertLess(join_at, publish_at)
+        self.assertLess(publish_at, ready_at)
         self.assertNotIn("atomicAdd(ticket", source)
 
     def test_fmha_capture_uses_prewarms_instead_of_fabric_eager_execution(self) -> None:
@@ -964,9 +956,8 @@ class GB200OverlapContractTests(unittest.TestCase):
         ).read_text()
         self.assertIn("normalize_and_rope", qwen35_transport)
         self.assertIn("params.q_gate", qwen35_transport)
-        self.assertIn("qwen35_publish_linear_input_kernel", qwen35_transport)
+        self.assertNotIn("qwen35_publish_linear_input_kernel", qwen35_transport)
         self.assertIn("qwen35_shared_add_rmsnorm_kernel", qwen35_transport)
-        self.assertIn("params.has_shared", qwen35_transport)
         self.assertIn("params.residual", qwen35_transport)
         self.assertIn("__threadfence_system()", qwen35_transport)
         self.assertNotIn("printf(", qwen35_transport)
@@ -980,21 +971,6 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn("q, k, v = self.prepare_model_qkv", publish_source)
         self.assertIn("self.publish_model_qkv_payload(", publish_source)
 
-        ping_pong_start = runtime_source.index(
-            "        def prepare_and_publish_qkv("
-        )
-        ping_pong_end = runtime_source.index(
-            "        total_rounds =", ping_pong_start
-        )
-        ping_pong_source = runtime_source[ping_pong_start:ping_pong_end]
-        linear_start = ping_pong_source.index(
-            "self.publish_qwen35_linear_attention_input("
-        )
-        handoff_start = ping_pong_source.rfind(
-            "handoff_event.record", 0, linear_start
-        )
-        self.assertNotEqual(handoff_start, -1)
-        self.assertLess(handoff_start, linear_start)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ public:
         bool rank_gated_combine;
         bool route_ready_dispatch;
         bool rank_ready_route_publish;
+        bool inband_combine;
+        bool compact_push;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -82,6 +84,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -104,7 +108,9 @@ static void __instantiate_kernel() {{
     args.routes_prepared ? "true" : "false",
     args.rank_gated_combine ? "true" : "false",
     args.route_ready_dispatch ? "true" : "false",
-    args.rank_ready_route_publish ? "true" : "false");
+    args.rank_ready_route_publish ? "true" : "false",
+    args.inband_combine ? "true" : "false",
+    args.compact_push ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -147,7 +153,8 @@ static void sm100_fp8_mega_moe_impl(
     const bool& routes_prepared,
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
-    const bool& rank_ready_route_publish
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -160,10 +167,11 @@ static void sm100_fp8_mega_moe_impl(
 
     // Make tensormap
     constexpr int kGranK = 32;
+    const auto frame_workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, config.num_max_pool_tokens,
-                                                     config.block_k, config.load_block_m,
-                                                     static_cast<int>(l1_acts.stride(-2)),
+                                                     hidden, compact_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
+                                                     config.block_k, compact_push ? 1 : config.load_block_m,
+                                                     compact_push ? static_cast<int>(frame_workspace.get_source_frame_bytes(hidden)) : static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
@@ -229,6 +237,8 @@ static void sm100_fp8_mega_moe_impl(
         .rank_gated_combine = rank_gated_combine,
         .route_ready_dispatch = route_ready_dispatch,
         .rank_ready_route_publish = rank_ready_route_publish,
+        .inband_combine = inband_combine,
+        .compact_push = compact_push,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -277,7 +287,8 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& routes_prepared,
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
-    const bool& rank_ready_route_publish
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
@@ -286,7 +297,7 @@ static void sm100_fp8_fp4_mega_moe(
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
         activation_clamp, fast_math, /* use_fp8_weights */ false,
-        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish);
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
 }
 
 static void sm100_fp8_fp8_mega_moe(
@@ -307,7 +318,8 @@ static void sm100_fp8_fp8_mega_moe(
     const bool& routes_prepared,
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
-    const bool& rank_ready_route_publish
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
@@ -316,7 +328,7 @@ static void sm100_fp8_fp8_mega_moe(
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
         activation_clamp, fast_math, /* use_fp8_weights */ true,
-        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish);
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
 }
 
 } // namespace deep_gemm

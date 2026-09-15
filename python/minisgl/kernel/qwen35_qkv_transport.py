@@ -14,7 +14,6 @@ def _jit_module():
         cuda_files=["qwen35_qkv_transport.cu"],
         cuda_wrappers=[
             ("publish", "Qwen35QKVTransportKernel::publish"),
-            ("publish_linear", "Qwen35QKVTransportKernel::publish_linear"),
             ("shared_add_rmsnorm", "Qwen35QKVTransportKernel::shared_add_rmsnorm"),
         ],
     )
@@ -166,131 +165,6 @@ def publish_qwen35_qkv(
     )
 
 
-def publish_qwen35_linear_input(
-    hidden: torch.Tensor,
-    residual: torch.Tensor | None,
-    weight: torch.Tensor,
-    source_offsets: torch.Tensor,
-    q_descriptors: torch.Tensor,
-    ready_descriptors: torch.Tensor,
-    completion_counter: torch.Tensor,
-    *,
-    shared: torch.Tensor | None = None,
-    shared_gate: torch.Tensor | None = None,
-    release_turn: torch.Tensor | None = None,
-    next_turn: int | None = None,
-    slot: int,
-    ready_value: int,
-    eps: float,
-) -> None:
-    """Fuse residual-add/RMSNorm with Qwen3.5 linear-input publication."""
-
-    if (
-        hidden.dtype != torch.bfloat16
-        or not hidden.is_cuda
-        or hidden.ndim != 2
-        or hidden.stride(1) != 1
-        or int(hidden.shape[0]) < 1
-        or int(hidden.shape[1]) % 1024
-        or int(hidden.shape[1]) > 8192
-    ):
-        raise ValueError(
-            "Qwen3.5 linear input must be a nonempty strided CUDA BF16 matrix "
-            "with hidden size divisible by 1024 and at most 8192"
-        )
-    if shared is not None and residual is None:
-        raise ValueError(
-            "Qwen3.5 shared linear input requires an existing residual"
-        )
-    shared_input = hidden if shared is None else shared
-    if shared_gate is not None and shared is None:
-        raise ValueError("Qwen3.5 shared gate requires a shared output")
-    if (
-        shared_input.dtype != hidden.dtype
-        or not shared_input.is_cuda
-        or shared_input.shape != hidden.shape
-        or shared_input.stride(1) != 1
-    ):
-        raise ValueError("Qwen3.5 shared output must match the linear hidden input")
-    if shared_gate is not None and (
-        shared_gate.dtype != hidden.dtype
-        or not shared_gate.is_cuda
-        or tuple(shared_gate.shape) != (int(hidden.shape[0]), 1)
-        or not shared_gate.is_contiguous()
-    ):
-        raise ValueError("Qwen3.5 shared gate must be contiguous CUDA BF16 [rows, 1]")
-    residual_input = hidden if residual is None else residual
-    if (
-        residual_input.dtype != hidden.dtype
-        or not residual_input.is_cuda
-        or residual_input.shape != hidden.shape
-        or residual_input.stride(1) != 1
-    ):
-        raise ValueError("Qwen3.5 residual must match the linear hidden input")
-    if (
-        weight.dtype != hidden.dtype
-        or not weight.is_cuda
-        or not weight.is_contiguous()
-        or tuple(weight.shape) != (int(hidden.shape[1]),)
-    ):
-        raise ValueError("Qwen3.5 linear RMSNorm weight must match hidden width")
-    if (
-        source_offsets.dtype != torch.int64
-        or not source_offsets.is_cuda
-        or not source_offsets.is_contiguous()
-        or source_offsets.ndim != 1
-        or source_offsets.numel() < 2
-    ):
-        raise ValueError("Qwen3.5 source offsets must be a contiguous CUDA int64 vector")
-    for name, descriptor, width in (
-        ("q", q_descriptors, 7),
-        ("ready", ready_descriptors, 3),
-    ):
-        if (
-            descriptor.dtype != torch.int64
-            or not descriptor.is_cuda
-            or not descriptor.is_contiguous()
-            or descriptor.ndim != 2
-            or descriptor.shape[0] < 1
-            or int(descriptor.shape[1]) != width
-        ):
-            raise ValueError(
-                f"Qwen3.5 {name} descriptors must be nonempty contiguous "
-                f"CUDA int64[:, {width}]"
-            )
-    if (
-        completion_counter.dtype != torch.int32
-        or not completion_counter.is_cuda
-        or not completion_counter.is_contiguous()
-        or completion_counter.numel() != 1
-    ):
-        raise ValueError("Qwen3.5 completion counter must be one CUDA int32")
-    _validate_optional_turn(release_turn, next_turn)
-    if slot not in (0, 1) or ready_value <= 0 or eps <= 0:
-        raise ValueError(
-            "Qwen3.5 publication requires slot 0/1, a positive readiness "
-            "ticket, and positive epsilon"
-        )
-    _jit_module().publish_linear(
-        hidden,
-        shared_input,
-        shared_gate,
-        residual_input,
-        weight,
-        source_offsets,
-        q_descriptors,
-        ready_descriptors,
-        completion_counter,
-        release_turn,
-        -1 if next_turn is None else int(next_turn),
-        int(slot),
-        int(ready_value),
-        float(eps),
-        int(shared is not None),
-        int(residual is not None),
-    )
-
-
 def _validate_optional_turn(
     turn: torch.Tensor | None, next_turn: int | None
 ) -> None:
@@ -368,7 +242,6 @@ def qwen35_shared_add_rmsnorm(
 
 __all__ = [
     "ensure_qwen35_qkv_transport_built",
-    "publish_qwen35_linear_input",
     "publish_qwen35_qkv",
     "qwen35_shared_add_rmsnorm",
 ]

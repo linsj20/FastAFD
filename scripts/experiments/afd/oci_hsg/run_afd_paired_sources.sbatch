@@ -3,8 +3,10 @@
 # Required export: FASTAFD_PAIR_CONFIG.  Each TSV row is:
 # label<TAB>task_root<TAB>plan<TAB>pool<TAB>source_repo<TAB>expected_head
 # All ordinary run_afd_bundle.sh exports remain required and are shared.
-# Optional FASTAFD_PAIRED_CACHE_ROOT defaults beside the pair config.  Each
-# source gets separate DeepGEMM and TVM-FFI caches so differing bindings cannot
+# Optional FASTAFD_PAIRED_CACHE_ROOT defaults beside the pair config.
+# Optional FASTAFD_PAIRED_CONTROL_DIR uses a common launcher for both sources.
+# Optional FASTAFD_PAIRED_ENV_DIR contains trusted <label>.env export files.
+# Each source gets separate DeepGEMM and TVM-FFI caches so differing bindings cannot
 # reuse an ABI-incompatible extension within the shared allocation.
 # This wrapper exists to remove allocation-to-allocation hardware variance from
 # source A/B comparisons; it does not change either source tree or case policy.
@@ -56,7 +58,12 @@ done < "$FASTAFD_PAIR_CONFIG"
 for index in "${!labels[@]}"; do
     label=${labels[$index]}
     source_repo=${source_repos[$index]}
-    control_dir=$source_repo/scripts/experiments/afd/oci_hsg
+    if [[ -n ${FASTAFD_PAIRED_ENV_DIR:-} ]]; then
+        env_file=$FASTAFD_PAIRED_ENV_DIR/$label.env
+        [[ -f "$env_file" ]]
+        source "$env_file"
+    fi
+    control_dir=${FASTAFD_PAIRED_CONTROL_DIR:-$source_repo/scripts/experiments/afd/oci_hsg}
     cache_root=$PAIR_CACHE_ROOT/$label
     mkdir -p "$cache_root/deepgemm" "$cache_root/tvm_ffi"
     printf 'FASTAFD_PAIRED_SOURCE_BEGIN label=%s index=%s source=%s head=%s\n' \

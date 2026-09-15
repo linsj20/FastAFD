@@ -109,14 +109,18 @@ def _time_graph(
     warmups: int,
     iterations: int,
 ) -> tuple[float, float]:
+    graph_batch = int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1"))
+    if graph_batch < 1 or iterations % graph_batch:
+        raise ValueError("graph batch must be positive and divide timing iterations")
     run_stage()
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run_stage()
+        for _ in range(graph_batch):
+            run_stage()
     dist.barrier()
-    for _ in range(warmups):
+    for _ in range((warmups + graph_batch - 1) // graph_batch):
         graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
@@ -128,7 +132,7 @@ def _time_graph(
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(iterations):
+    for _ in range(iterations // graph_batch):
         graph.replay()
     end.record()
     end.synchronize()
@@ -319,6 +323,23 @@ def _stage(
     buffer.topk_idx[:rows].copy_(ids)
     buffer.topk_weights[:rows].copy_(weights)
     return x_q, x_sf
+
+
+def _check_fused_quant_coverage() -> None:
+    """Check complete producer ownership across small and full expert grids."""
+    hidden = torch.randn((3, 1024), dtype=torch.bfloat16, device="cuda")
+    expected_x, expected_sf = per_token_cast_to_fp8(
+        hidden, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True, backend="torch"
+    )
+    for experts in (8, 16, 24, 64, 128, 512):
+        gate = torch.randn((experts, 1024), dtype=torch.bfloat16, device="cuda")
+        x = torch.empty_like(expected_x)
+        sf = torch.full_like(expected_sf, -1)
+        x.view(torch.uint8).fill_(0xFF)
+        gate_topk(hidden, gate, 2, renormalize=True, quant_out=(x, sf, None))
+        if (not torch.equal(x.view(torch.uint8), expected_x.view(torch.uint8))
+                or not torch.equal(sf, expected_sf)):
+            raise RuntimeError(f"fused quantization coverage mismatch: experts={experts}")
 
 
 def _numeric_case(rank: int, world_size: int) -> dict[str, float]:
@@ -633,16 +654,18 @@ def _numeric_row_sweep(rank: int, world_size: int) -> dict[str, dict[str, float]
 
 
 def _exact_qwen_fixed_perfect_case(
-    rank: int, world_size: int
+    rank: int, world_size: int, *, rows: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     row_counts = _positive_int_list("MEGAMOE_SMOKE_ROWS", "3")
     sm_counts = _positive_int_list(
         "MEGAMOE_SMOKE_SMS",
         str(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count),
     )
-    if len(row_counts) != 1 or len(sm_counts) != 1:
-        raise RuntimeError("fixed-perfect MegaMoE smoke requires one row and SM count")
-    rows, num_sms = row_counts[0], sm_counts[0]
+    if len(sm_counts) != 1 or (rows is None and len(row_counts) != 1):
+        raise RuntimeError("fixed-perfect MegaMoE case requires one row and SM count")
+    rows, num_sms = row_counts[0] if rows is None else rows, sm_counts[0]
+    if rows not in row_counts:
+        raise RuntimeError("fixed-perfect row is absent from the requested cases")
     warmups = int(os.environ.get("MEGAMOE_SMOKE_WARMUPS", "10"))
     iterations = int(os.environ.get("MEGAMOE_SMOKE_ITERATIONS", "100"))
     bucket = int(os.environ.get("MEGAMOE_SMOKE_BUCKET", str(rows)))
@@ -763,12 +786,32 @@ def _exact_qwen_fixed_perfect_case(
         raise RuntimeError("MEGAMOE_SMOKE_COMPARE_COMBINE must be 0 or 1")
     if compare_combine:
         expected_output = output.clone()
-        rank_gated_combine = False
-        run_megamoe()
-        torch.cuda.synchronize()
-        if not torch.equal(output.view(torch.uint8), expected_output.view(torch.uint8)):
-            raise RuntimeError("rank-gated combine differs from full-barrier output")
-        rank_gated_combine = True
+        # The full-barrier reference uses the conventional combine arena.
+        # Keep its allocation and generations independent from the selected path.
+        selected = buffer, output, ids, weights
+        selected_combine = os.environ.get("DG_MEGAMOE_LAMPORT_COMBINE")
+        try:
+            os.environ["DG_MEGAMOE_LAMPORT_COMBINE"] = "0"
+            buffer = megamoe_mega.MegaMoESymmBuffer(
+                dist.group.WORLD, num_experts=num_experts,
+                num_max_tokens_per_rank=bucket, num_topk=top_k,
+                hidden=hidden, intermediate_hidden=intermediate,
+            )
+            output, ids, weights = buffer.y[:rows], buffer.topk_idx[:rows], buffer.topk_weights[:rows]
+            if not production_routes:
+                _stage(buffer, hidden_states, fixed_ids, fixed_weights)
+            rank_gated_combine = False
+            run_megamoe()
+            torch.cuda.synchronize()
+            if not torch.equal(output.view(torch.uint8), expected_output.view(torch.uint8)):
+                raise RuntimeError("rank-gated combine differs from full-barrier output")
+        finally:
+            buffer, output, ids, weights = selected
+            rank_gated_combine = True
+            if selected_combine is None:
+                os.environ.pop("DG_MEGAMOE_LAMPORT_COMBINE", None)
+            else:
+                os.environ["DG_MEGAMOE_LAMPORT_COMBINE"] = selected_combine
         dist.barrier()
         print(f"MEGAMOE_COMBINE_EXACT_OK rank={rank} global_tokens={global_tokens}", flush=True)
     _check_source_results(
@@ -790,8 +833,12 @@ def _exact_qwen_fixed_perfect_case(
             "global_tokens": global_tokens,
             "valid_rows_per_rank": [base_rows + int(r < extra_rows) for r in range(world_size)],
             "combine_exact_checked": bool(compare_combine),
+            "payload_mode": getattr(buffer, "payload_mode", None),
             "timing_warmups": warmups,
             "timing_iterations": iterations,
+            "timing_graph_batch": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
+            "timing_rank_reduction": "max",
+            "timing_cuda_profiler_range": int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0")),
             "milliseconds": elapsed,
             "output_max": output_max,
             "max_active_experts": max_active,
@@ -976,12 +1023,15 @@ def _exact_qwen_case(
 
         rank_ready_route_publish_mode = 0
 
+        validity = None
+
         def prepare_input() -> None:
             gate_topk(
                 hidden_view,
                 gate_weight,
                 top_k,
                 renormalize=True,
+                num_token_non_padded=validity,
                 expert_map=expert_map,
                 topk_idx_dtype=torch.int64,
                 quant_out=(buffer.x[:rows], buffer.x_sf[:rows], None),
@@ -1090,6 +1140,48 @@ def _exact_qwen_case(
                         f"dispatch_mode={route_ready_dispatch_mode}"
                         f" rank_ready_mode={rank_ready_route_publish_mode}"
                     )
+                # Exercise arbitrary and empty-destination routing even when
+                # the timed case deliberately uses perfect balancing.
+                saved_perfect_routing = perfect_routing
+                perfect_routing = 0
+                for phase, hidden_view in enumerate(
+                    (*hidden_views, torch.zeros_like(hidden_views[0]))
+                ):
+                    output.fill_(float("nan"))
+                    run_stage()
+                    torch.cuda.synchronize()
+                    if (not torch.isfinite(output).all()
+                            or (phase == 2 and torch.count_nonzero(output))):
+                        raise RuntimeError(
+                            f"normal/zero route output mismatch: rows={rows} phase={phase}"
+                        )
+                    _check_source_results(
+                        result_case + f"_normal{phase}", rank, x=buffer.x[:rows],
+                        sf=buffer.x_sf[:rows], ids=ids, weights=weights, output=output,
+                    )
+                hidden_view = hidden_views[0]
+                prefix = rows // 2 if rank % 2 else 0
+                row_map = []
+                compact = 0
+                for row in range(rows):
+                    real = (row + rank) % 3 != 0
+                    row_map.append(compact if real else -1)
+                    compact += int(real)
+                for phase, metadata in enumerate(([prefix], [compact, *row_map])):
+                    validity = torch.tensor(metadata, dtype=torch.int64, device="cuda")
+                    output.fill_(float("nan"))
+                    run_stage()
+                    torch.cuda.synchronize()
+                    padding = (torch.arange(rows, device="cuda") >= prefix if phase == 0
+                               else validity[1:] < 0)
+                    if (not torch.isfinite(output).all() or torch.count_nonzero(output[padding])
+                            or (ids[padding] >= 0).any() or torch.count_nonzero(weights[padding])):
+                        raise RuntimeError(f"padding/empty-rank output mismatch: rows={rows} phase={phase}")
+                    _check_source_results(
+                        result_case + f"_padding{phase}", rank, ids=ids, weights=weights, output=output,
+                    )
+                validity = None
+                perfect_routing = saved_perfect_routing
                 hidden_view = hidden_views[0]
                 max_active = _max_active_experts(current[0], local_experts, world_size)
                 elapsed, output_max = _time_graph(
@@ -1109,6 +1201,7 @@ def _exact_qwen_case(
                     "output_max": output_max,
                     "max_active_experts": max_active,
                     "timed_scope": "router_and_megamoe",
+                    "calls_per_graph": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
                 }
                 if debug_timings:
                     timing_tensor = torch.zeros(
@@ -1259,15 +1352,29 @@ def main() -> None:
     numeric = None
     numeric_rows = None
     if not profile_only:
+        _check_fused_quant_coverage()
         numeric = _numeric_case(rank, world_size)
         dist.barrier()
         numeric_rows = _numeric_row_sweep(rank, world_size)
         dist.barrier()
-    exact = (
-        _exact_qwen_fixed_perfect_case(rank, world_size)
-        if fixed_perfect_only
-        else _exact_qwen_case(rank, world_size)
-    )
+    if fixed_perfect_only:
+        row_counts = _positive_int_list("MEGAMOE_SMOKE_ROWS", "3")
+        if len(set(row_counts)) != len(row_counts):
+            raise RuntimeError("fixed-perfect cases must have distinct row counts")
+        if len(row_counts) > 1 and "MEGAMOE_SMOKE_GLOBAL_TOKENS" in os.environ:
+            raise RuntimeError("multi-row fixed cases derive global tokens from rows and EP")
+        exact = {}
+        for rows in row_counts:
+            # Match standalone case inputs regardless of case order or prior RNG use.
+            if len(row_counts) > 1:
+                torch.manual_seed(20260825 + rank)
+            exact.update(_exact_qwen_fixed_perfect_case(rank, world_size, rows=rows))
+            torch.cuda.synchronize()
+            dist.barrier()
+            if rank == 0:
+                print(f"MEGAMOE_FIXED_CASE_OK rows={rows}", flush=True)
+    else:
+        exact = _exact_qwen_case(rank, world_size)
     if rank == 0:
         payload = {
             "status": "ok",

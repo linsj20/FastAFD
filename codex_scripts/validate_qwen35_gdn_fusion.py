@@ -22,7 +22,7 @@ def _max_abs(left: torch.Tensor, right: torch.Tensor) -> float:
     return float((left.float() - right.float()).abs().max().item())
 
 
-def _bench_ms(function, iterations: int) -> float:
+def _bench_ms(function, iterations: int, peer_stream=None) -> float:
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -31,8 +31,12 @@ def _bench_ms(function, iterations: int) -> float:
     torch.cuda.current_stream().wait_stream(warmup_stream)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=warmup_stream):
+        if peer_stream is not None:
+            peer_stream.wait_stream(warmup_stream)
         captured_output = function()
+        if peer_stream is not None:
+            warmup_stream.wait_stream(peer_stream)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -43,23 +47,134 @@ def _bench_ms(function, iterations: int) -> float:
     return start.elapsed_time(end) / iterations
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--rows", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=20260906)
-    parser.add_argument("--bench-iters", type=int, default=0)
-    args = parser.parse_args()
-    if args.rows <= 0:
-        raise ValueError("--rows must be positive")
-    if args.bench_iters < 0:
-        raise ValueError("--bench-iters must be non-negative")
-    if not torch.cuda.is_available():
-        raise RuntimeError("Qwen3.5 GDN fusion validation requires CUDA")
+def _check_projection_streams(config_path: str, rows: int, iterations: int) -> None:
+    """Compare complete GDN decode with owned versus caller-supplied side streams."""
+    import json
+    from dataclasses import replace
+    from pathlib import Path
+    from types import SimpleNamespace
 
-    torch.manual_seed(args.seed)
+    from minisgl.core import get_global_ctx
+    from minisgl.distributed.info import set_tp_info, try_get_tp_info
+    from minisgl.kvcache import create_hybrid_gdn_state_pool
+    from minisgl.models.config import ModelConfig
+    from minisgl.models.qwen35_moe import GdnProjectionSync, Qwen3_5LinearAttention
+    from minisgl.utils import torch_dtype
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    config = ModelConfig.from_hf(json.loads(Path(config_path).read_text()))
+    config = replace(config, num_layers=1, layer_types=("linear_attention",))
+    device = torch.device("cuda")
+    with torch.device("meta"), torch_dtype(torch.bfloat16):
+        layer = Qwen3_5LinearAttention(config, 0)
+    weights = {}
+    for key, value in layer.state_dict().items():
+        if key.endswith("weight_scale"):
+            tensor = torch.full(value.shape, 0.01, device=device)
+        elif key == "norm.weight":
+            tensor = torch.ones(value.shape, device=device)
+        elif key in ("A_log", "dt_bias"):
+            tensor = torch.zeros(value.shape, device=device)
+        else:
+            tensor = torch.randn(value.shape, device=device) * 0.02
+        weights[key] = tensor.to(value.dtype)
+    layer.load_state_dict(weights)
+    ctx = get_global_ctx()
+    pool = ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+        config, max_slots=rows, dtype=torch.bfloat16, device=device
+    )
+    pool.conv_state.uniform_(-0.01, 0.01)
+    pool.recurrent_state.uniform_(-0.01, 0.01)
+    initial_conv, initial_state = pool.conv_state.clone(), pool.recurrent_state.clone()
+    hidden = torch.randn(rows, config.hidden_size, device=device, dtype=torch.bfloat16) * 0.1
+    batch = SimpleNamespace(
+        is_decode=True, state_indices=torch.arange(rows, device=device, dtype=torch.int64),
+        positions=torch.ones(rows, device=device, dtype=torch.int32),
+    )
+    peer = torch.cuda.Stream()
+    timeout = torch.zeros(2, dtype=torch.int64, device=device)
+    sync = GdnProjectionSync(device, timeout, 30000, 256)
+    with ctx.forward_batch(batch):
+        expected = layer.forward(hidden)
+        expected_conv, expected_state = pool.conv_state.clone(), pool.recurrent_state.clone()
+        pool.conv_state.copy_(initial_conv)
+        pool.recurrent_state.copy_(initial_state)
+        actual = layer.forward(hidden, projection_stream=peer)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(pool.conv_state, expected_conv, rtol=0, atol=0)
+        torch.testing.assert_close(pool.recurrent_state, expected_state, rtol=0, atol=0)
+        pool.conv_state.copy_(initial_conv)
+        pool.recurrent_state.copy_(initial_state)
+        actual = layer.forward(hidden, projection_stream=peer, projection_sync=sync)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(pool.conv_state, expected_conv, rtol=0, atol=0)
+        torch.testing.assert_close(pool.recurrent_state, expected_state, rtol=0, atol=0)
+
+        # Exercise both ownership directions and signal reuse across local
+        # layers and graph replays. Compare every output plus both mutable states.
+        from minisgl.cuda_graph_utils import capture_cuda_graph
+
+        owner = torch.cuda.Stream()
+        peer_sync = GdnProjectionSync(device, timeout, 30000, 256)
+        handoff = GdnProjectionSync(device, timeout, 30000, 256)
+        expected_outputs = []
+        pool.conv_state.copy_(initial_conv)
+        pool.recurrent_state.copy_(initial_state)
+        for _ in range(6):
+            expected_outputs.append(layer.forward(hidden).clone())
+        expected_conv, expected_state = pool.conv_state.clone(), pool.recurrent_state.clone()
+        captured_outputs = []
+
+        def body():
+            pool.conv_state.copy_(initial_conv)
+            pool.recurrent_state.copy_(initial_state)
+            for _ in range(3):
+                captured_outputs.append(layer.forward(
+                    hidden, projection_stream=peer, projection_sync=sync
+                ))
+            handoff.release(handoff.ready)
+            with torch.cuda.stream(peer):
+                handoff.wait(handoff.ready)
+                for _ in range(3):
+                    captured_outputs.append(layer.forward(
+                        hidden, projection_stream=owner, projection_sync=peer_sync
+                    ))
+
+        # Compile/warm each ownership direction before capture.
+        owner.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(owner):
+            body()
+        torch.cuda.synchronize()
+        captured_outputs.clear()
+        graph, _ = capture_cuda_graph(
+            device=device, engine_stream=owner, comm_stream=peer,
+            overlap_comm=True, pool=None, fn=body,
+        )
+        for _ in range(8):
+            graph.replay()
+            torch.cuda.synchronize()
+            for actual, expected in zip(captured_outputs, expected_outputs, strict=True):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(pool.conv_state, expected_conv, rtol=0, atol=0)
+            torch.testing.assert_close(pool.recurrent_state, expected_state, rtol=0, atol=0)
+        assert not timeout.any().item()
+        for signals in (sync, peer_sync, handoff):
+            assert signals.ready.item() == signals.done.item() == 0
+
+        timings = []
+        for name, signals in (("events", None), ("device", sync), ("device", sync), ("events", None)):
+            timings.append((name, _bench_ms(
+                lambda: layer.forward(hidden, projection_stream=peer, projection_sync=signals),
+                iterations, peer_stream=peer,
+            )))
+    print(f"PROJECTION_STREAMS rows={rows} exact_output_and_state=PASS bidirectional_replays=8 abba_ms={timings}", flush=True)
+
+
+def _check_fusions(rows: int, seed: int, bench_iters: int) -> None:
+    torch.manual_seed(seed)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    rows = args.rows
     slots = rows + 1
     key_heads = 16
     value_heads = 64
@@ -175,7 +290,7 @@ def main() -> None:
         f"fp8_max={_max_abs(fp8_candidate.flatten(1), fp8_control):.3e}"
     )
 
-    if args.bench_iters:
+    if bench_iters:
         def control_conv():
             mixed_output = qwen35_causal_conv1d_decode(
                 x, weight, conv_control_state, state_indices, positions
@@ -241,27 +356,27 @@ def main() -> None:
             )
 
         timings = {
-            "control_conv_materialize_ms": _bench_ms(control_conv, args.bench_iters),
+            "control_conv_materialize_ms": _bench_ms(control_conv, bench_iters),
             "candidate_conv_scale_pack_ms": _bench_ms(
-                candidate_conv, args.bench_iters
+                candidate_conv, bench_iters
             ),
             "candidate_gate_ms": _bench_ms(
-                lambda: qwen35_gdn_gates(a, b, A_log, dt_bias), args.bench_iters
+                lambda: qwen35_gdn_gates(a, b, A_log, dt_bias), bench_iters
             ),
             "control_recurrent_ms": _bench_ms(
-                control_recurrent, args.bench_iters
+                control_recurrent, bench_iters
             ),
             "candidate_recurrent_ms": _bench_ms(
-                candidate_recurrent, args.bench_iters
+                candidate_recurrent, bench_iters
             ),
             "control_norm_quant_ms": _bench_ms(
-                control_norm_quant, args.bench_iters
+                control_norm_quant, bench_iters
             ),
             "candidate_norm_quant_ms": _bench_ms(
                 lambda: qwen35_rmsnorm_gated_fp8(
                     candidate, z, norm_weight, 1.0e-6
                 ),
-                args.bench_iters,
+                bench_iters,
             ),
         }
         timings["conv_delta_us"] = 1000.0 * (
@@ -278,6 +393,35 @@ def main() -> None:
             - timings["control_norm_quant_ms"]
         )
         print("BENCH " + " ".join(f"{key}={value:.6f}" for key, value in timings.items()))
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rows", type=int, nargs="+", default=[3])
+    parser.add_argument("--seed", type=int, default=20260906)
+    parser.add_argument("--bench-iters", type=int, default=0)
+    parser.add_argument("--model-config", help="Optional HF config for complete synthetic-weight GDN checks")
+    parser.add_argument("--projection-rows", type=int, nargs="*", default=[])
+    args = parser.parse_args()
+    if any(rows <= 0 for rows in args.rows):
+        raise ValueError("--rows must be positive")
+    if args.bench_iters < 0:
+        raise ValueError("--bench-iters must be non-negative")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Qwen3.5 GDN fusion validation requires CUDA")
+
+    if args.projection_rows and (not args.model_config or args.bench_iters <= 0):
+        raise ValueError("projection checks require --model-config and --bench-iters > 0")
+    if any(rows <= 0 for rows in args.projection_rows):
+        raise ValueError("projection rows must be positive")
+
+    for rows in args.rows:
+        _check_fusions(rows, args.seed, args.bench_iters)
+
+    if args.projection_rows:
+        from minisgl.core import Context, set_global_ctx
+        set_global_ctx(Context(64))
+    for projection_rows in args.projection_rows:
+        _check_projection_streams(args.model_config, projection_rows, args.bench_iters)
 
 
 if __name__ == "__main__":

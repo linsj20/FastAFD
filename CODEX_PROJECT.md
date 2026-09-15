@@ -1,4 +1,946 @@
+## Checkpoint: script consolidation and accumulated progress — September 15
+
+User requested cleaning `codex_scripts` and committing all our progress.
+Included documented MegaMoE work and the earlier staged AFD attention/GDN cleanup.
+Scripts reduced **53 → 44**, removing 1,031 lines; see
+[codex_scripts/README.md](codex_scripts/README.md) for retained commands/migrations.
+- `submit_plan.py sbatch|afd` replaces the two submission helpers; records/logs,
+  AFD dry runs and duplicate-submission refusal preserved. Scheduler stderr is
+  logged separately from parsing the job ID.
+- `seed_native_cache.py` combines DeepGEMM and TVM seeding, preserving locked
+  host-module links/copies, TVM node/rank module links and overwrite refusal.
+- Removed superseded automatic validation/report runners, three experimental
+  marker analyzers and the standalone experimental Lamport transport probe.
+  Moved the used full-path audit unchanged into `compare_megamoe_fullchain.py`.
+- Archived every pre-cleanup script under
+  `scratch/megamoe/commit_cleanup_20260915/scripts_before` and the matching remote
+  artifact root. Historical source/workflow snapshots remain intact.
+
+Validation against the synced remote candidate: **65 CPU tests PASS in2.092s**,
+all retained shell launchers PASS syntax, three actual saved cases from7150076
+replay identical gain/component values. Initial stale `kPush` source assertion
+updated to `kCompactPush`; no runtime change for that fix. Existing GPU evidence
+below applies; no new GPU jobs, py_check, hash/version check or kernel edits here.
+Evidence: `scratch/megamoe/commit_cleanup_20260915/{cleanup_manifest.json,checks}`.
+Remote candidate: R/artifacts/commit_cleanup_20260915/workspace; canonical mirror
+synced with the cleaned files and obsolete helpers removed. No global skills or
+AGENTS changes needed. Commit is a progress checkpoint: **both full-model strict
+alignment gates still fail by two tokens**, causes unisolated; no correctness
+promotion, threshold relaxation or additional464-case sweep. No push requested.
+
+## Complete: serving tests; both strict alignment gates fail — September 15
+
+User scope: Qwen3 A3:F1 EP8 B4 and Qwen3.5 A1:F1 EP16 B40 in one
+128K perf job (perfect balance, no prefill); standard alignment with real prefill,
+changed to nominal 8K. History comparison required; user accepts missing exact
+Qwen3.5 EP16 history and authorized an additional EP32 historical case, still perf mode.
+Keep metadata push / payload pull / push combine; compact payload push remains an
+alternative. No new kernel search, promotion, rollback, commit, or 464-case sweep.
+
+P=`scratch/megamoe/final_serving_cases_20260915`.
+R=`/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD`.
+Remote artifacts: R/artifacts/final_serving_cases_20260915.
+Base source S=R/source/ffn_final_cleanup_20260915. CUDA/kernel math unchanged here.
+Full evidence and readable report: P/{SUMMARY.md,STATE.json,perf_results.json}.
+
+### Performance complete and audited
+
+All 15 measured steps retained after one warmup, zero outliers. Metric: mean of
+maximum complete CUDA graph span across representative attention and FFN ranks
+per step, not client latency or max over every rank. FP8 activations / FP4 experts,
+MB2 overlap, perf1/perfect1/no prefill throughout. Historical runs use separate
+allocations/source stacks; comparisons are observational, not isolated kernel gains.
+
+- Job7157769 COMPLETED0:0/12:11, 8nodes32GPUs, original two cases sequential;
+  all16 case/rank completions audited. Q3:18.329570067ms/163.669960TPS/GPU vs best
+  exact pull/push history7061094:18.670507467ms/160.681224, latency−1.826%, TPS+1.860%.
+  Model/shape/metric/memory/actual KV match. Q35EP16:22.643118733ms/883.270553TPS/GPU;
+  exact history absent (accepted gap).
+- Additional final-kernel EP32/A1/B40/128K job7158018 COMPLETED0:0/8:35,
+  16nodes64GPUs, all16 rank completions audited:22.618707933ms/884.223805TPS/GPU
+  vs Sep12 pull/push history7112916 candidate22.601254333ms/884.906639;
+  latency+0.077224%, effectively unchanged. Both memory.82, actualKV5260736,
+  MB2=20+20. This does not supply an exact EP16 baseline. Older push-dispatch
+  history excluded. Discovery inspected290 result files, matching geometry/model
+  paths where historical model_key was null. Raw times and sources preserved.
+
+### Alignment complete: both numerical FAIL
+
+Q3:96prompts×17=1632tokens; top1=1384(84.803922%), top10=1630(99.877451%).
+Full ordered prompt/token/position coverage and finite chosen/candidate logprobs
+PASS; strict100% top10 FAIL. Zero-based misses: prompt48/position9/token1968/rank30,
+prompt95/position2/token19801/rank11. Cause unisolated; do not attribute to MegaMoE
+or claim final normal-routing correctness. Generation7157806 preserved; five
+fresh reference shards7158117 plus only missing36prompts612tokens7158404
+(COMPLETED0:0/8:21,3nodes) merged into original order. Complete audit:
+P/alignment_final/qwen3/{alignment.json,audit.json,audit.log,context_audit.json}.
+Actual raw prompt length8184, nominal8192: existing prompt builder counts chat
+wrapper overhead, batch sampler sends raw strings. Generation/reference encode
+identical raw prefix, so comparison valid. User informed; record actual lengths.
+
+Q35 generation7158571 PASS640prompts×17=10880tokens, downloaded with prompt file
+and generation audit to P/alignment_final/qwen35. Reference shard2 TP3 failed
+TorchInductor static CUDA kernel load: CUDA driver file not found. JobFAILED143:0
+in27:34. Seven completed shards were only in Ray scorer memory; no merged score.
+Attempted same-allocation recovery was rejected after job expired; no scoring ran.
+Failure evidence: P/alignment_qwen35_cache/{collected,failure.json}.
+Reference-only7158962 FAILED143:0/7:38 before scoring: standalone adapter omitted
+Q35 --language-model-only; vision warmup failed missing cutlass.cute.core.ThrMma
+and blake3. Operator error acknowledged; failed plan/logs retained. Corrected
+text-only job7159116 used4nodes16GPUs, same sample, and saved all four160prompt
+shards plus full ordered640prompt merge before strict gate. Final FAILED1:0/14:38:
+top1=10603/10880(97.454044%); top10=10878/10880(99.981618%); all chosen/candidate
+logprobs finite and full ordered coverage PASS. Misses zero-based prompt127 and639,
+position1/token311/rank17. These inputs are identical text; full continuations
+differ. Actual raw context8182 for all640, nominal8192, matched generation/reference
+prefix contract as Q3. Complete score/audits: P/alignment_final/qwen35.
+Reference TP4, language-model-only, eager/triton, chunks1024/concurrency1/maxseqs1/
+util.75/maxlen8256. Node-local /dev/shm TMPDIR, separate persistent node caches.
+All task allocations ended; no outstanding jobs. Cause of numerical misses remains
+unisolated. Do not claim final correctness, automatically rollback, or relax gate.
+
+### Recovery fixes and remaining work
+
+Initial7157517/19 failed seeding KeyError ATTENTION_WORKERS before model execution;
+7157564 failed postprocess KeyError PROMPT_MODE,7157565 canceled to avoid same error.
+Explicit seeding vars and MODEL_KEY/PROMPT_MODE exports fixed; successful perf
+artifact wrapper validates fixes. Superseded128K alignment7157783 canceled pending,
+zero GPU use. Q3 reference7157806 OOM required only reference memory/chunk reduction;
+7158117 early numerical gate interrupted three shards, recovered above without
+repeating generation or successful shards. Full negative audit saves both misses.
+
+Q35 previous7158380 failed143:0/9:46 during real prefill with Triton metadata
+OSError116 stale file handle. New source S+'_triton_cache' uses a hardlink snapshot
+plus atomic replacement of only afd_support.py and server/supervisor_ray.py:
+TRITON_CACHE_DIR forwarded and scoped by existing node/rank helper. All16 FFN
+cache scopes evidenced; subsequent generation succeeded. No CUDA/math changes.
+Local maintained run_afd.sh also supplies TASK_ROOT/cache/triton default.
+
+Maintained sequence runner, monitor, sample auditor, sharded scorer, launcher and
+two cache runtime files synced explicitly to R/local-mirror; remote bash syntax
+checks PASS. Actual submitted artifact workflows stay immutable. No py_check or
+manual hash/version check. Preserve unrelated dirty/staged work.
+
+Final reports: P/SUMMARY.md and P/final_audit.json; STATE preserves every failed
+attempt and completed job. Final explicit report/docs sync to remote performed.
+Requested serving tests are complete; both strict alignment failures reported.
+No additional kernel search/sweep/commit. Follow-up ideas require a new bounded
+diagnosis: numerical misses vs full-model historical reference; explicit raw/chat
+prompt-length contract; DeepEP cache preseeding; persist Ray score shards before merge.
+
+## Completed: cleanup slowdown retest — keep cleanup (September 15)
+
+User authorized retesting and recovering cleanup if the pattern persists.
+Retest P=scratch/megamoe/final_cleanup_20260915/retest: same24 manifestcases,
+4pullconfigs (cleaned, immediately-before cleanup, Sep13dense, Sep12previous),
+2symmetricrepeats,2000calls/200warmups/batch100/MAXrankCUDAevents/no profiling.
+Jobs7157096Q3EP8/7157099Q35EP16 COMPLETED0:0 in11:36/12:19. StrictauditPASS
+16records192measurements2304rankexactchecks; allsamples retained, no partials.
+All48cleanedpull measurements within -0.168..+0.154% of matched immediately-before
+source. Mean per-case cleaned vs precleanup: Q3+0.009%,Q35-0.011%; vs best of
+bothhistoricalpull/push reruns: Q3+0.032%,Q35-0.118%. No rollback indicated.
+Three oldslowcases didnotrecur: Q3rows8 cleaned47.968/47.901us vs precleanup
+47.894/47.927; Q3rows18 48.877/49.025 vs48.868/49.079; Q35rows2
+47.901/48.071 vs47.944/48.151. Old evidence retained; transient cause unproven.
+All11production/protocol snapshotfiles identical to frozen before source; smoke
+only differs in multi-rowdriver support and allvariants use common currenttest.
+No production changes, knobs, staging, commit. Existing audit generalized to
+summarize historical comparisons without compact; actualretestauditPASS. Plot
+adds precleanup label. Read-only snapshotfetch JSON-list mistake corrected with
+line-based sync_files.txt, no GPU/source effect. Evidence SUMMARY.md, REPORT.md,
+audit.json, decision.json, timings.csv. Full-modelalignments/464sweep unsubmitted;
+this turn completed retest/conditionalrollback decision, retaining pull default.
+Collector96267 and finalone-shot98347 EXIT0; bothGPUallocations released.
+
+## Final cleanup: correctness passed; stopped for performance report (September 15)
+
+User chose metadata push + payload pull + push combine as the default, retaining
+compact payload push as the alternative, and explicitly resumed final cleanup and
+both model sweeps. Both modes keep metadata push. Earlier STOP outcomes below
+remain historical evidence; this request authorizes the bounded finalization.
+No new optimization search or automatic default promotion. Preserve frozen best
+pull/push baselines and compact source; compare both cleaned modes against them.
+Work/evidence: `scratch/megamoe/final_cleanup_20260915`; pre-edit snapshots saved.
+Implemented one per-buffer payload mode: explicit payload_mode or
+MINISGL_MEGAMOE_PAYLOAD_MODE=pull|compact_push (default pull). Producer, arena
+sizing, host validation and both FP4/FP8 launch paths share the pinned selection.
+Rejected dispatch switches/branches remain absent; preserved dense metadata,
+contiguous pull consumer, tested compact frame/gather path, combine arithmetic.
+CPU7155439 benchmark26.05/CUDA13.2 PASS native+host+3protocoltests,7:48
+(0.041s tests). Serving25.10/CUDA13.0 CPU7155779 PASS native+host6:14, separate
+cache/serving donor+native cache wired into both alignment plans.
+Correctness PASS684 byteexact comparisons: pull7155542 264/5records6:20,
+compact7155543 180/3/4:24, compactlarge7155731 176/2/3:19,
+compactM327155840 64/4/5:01. Compact covers actualM16/32/64/96. Initial large-
+shape expectationM32 wrong (selectedM64/96); preserved expected.json/coverage_gap,
+audited actualtiles separately, then closedM32gap vsfreshdensecontrol. No CUDA
+implementation edits after initial cleanup. correctness_summary.json records all.
+Old collectors11657/37913/7354 EXIT0, allpreviousGPU/CPUjobscompleted.
+Five-config24case timing jobs7155992Q3EP8/7155993Q35EP16 COMPLETED0:0,
+14:58/15:56. Strict audit PASS20records240measurements2880rankexactchecks,
+actual candidate payload mode checked. Collector97884 and one-shot44231 EXIT0.
+All24cases/repeats retained. Mean per-case delta vs faster matched historical
+pull/push: cleaned pull Q3+0.742%, Q35+0.172%; cleaned compact Q3-1.232%,
+Q35+2.536%. Three unresolved slow pull repeats: Q3rows8 47.502/52.186us
+(dense47.529/47.358, mean+5.061%); Q3rows18 53.130/49.270us
+(dense49.052/49.271, +4.146%); Q35rows2 56.436/48.324us
+(dense48.049/48.294, +8.735%). Other repeats close to dense; historical sources
+also contain slow samples, so no established consistent regression or cause.
+No sample filtering, reroll, or unsupported nonregression claim. STOP/REPORT
+before full-model alignment and464-case sweep, per retained user rule. Known
+compact model tradeoff persists; pull default unchanged, no promotion/search.
+Evidence P/SUMMARY.md, comparison/{REPORT.md,audit.json,cleanup_comparison.json}.
+Original missing-wrapper sbatch rejection occurred before allocation and was fixed.
+Bothnormal-routingalignmentdryrunsPASS; noactualalignments/sweepsubmissionsyet.
+Default sweep11groups464cases validated/synced, report plan prepared. Historical
+fullpath928observations/464cases frozen fromonlytwo pull-dispatch/push-combine
+sources; previous-source timelineindex copies are derived existingdata, no capture
+changes. compare_megamoe_fullchain.py now accepts repeated --reference for per-case
+lowest historicalmean. No staging/commit; preserveindex/unrelatedwork.
+Serving review added payload env to afd_support.runtime_env explicit allowlist;
+CPU7156038 COMPLETED0:0/1:14 PASS4protocoltests (0.045s), including realRay-env
+forwarding; no CUDA changes.
+Driver->coordinator also uses supervisor_ray._build_ray_runtime_env whitelist;
+addedpayloadmode there andextendedsame4teststofullycoverbothhops. CPU7156083
+COMPLETED0:0/1:51 PASS4tests(0.050s). NoCUDAbuild/retestneededforthisPython-onlyfix.
+New artifact workflow/run_afd_seeded.sh retains oldhostseeding and adds maintained
+seed_tvm_ffi_cache.py beforeworkers, matching-serving donor -> distinctmodel/node/
+rankcaches. Alignment env/launch plansupdated, shellsyntaxPASS. Oldfrozenworkflow
+untouched. Initial wrapper-preparation heredocdelimitercollision causedparseerror,
+fixedbeforeactualCPUsubmission; no source/kernel/test execution fromfailedcommand.
+
+## Completed: crossed EP comparison, user-selected8 Q3 EP16 +12 Q35 EP8
+
+User selected ONLY8Q3EP16manifest cases after clarification; no supplemental cases
+in finalcomparison. Q35 retainedfresh12/83draw,seed1035385404524719568.
+Evidence scratch/megamoe/pull_compact_cross_ep24_20260915 (namepredates20cases):
+SUMMARY.md,REPORT.md,audit.json,config_audit.json,ep_comparison.json,all_config_latencies.png.
+Jobs7154879Q3/7154787Q35 COMPLETED0:0 in11:45/13:12; strictauditPASS20cases,
+16records160timings1792rankexactchecks; all1792runtimeconfigsrecorded and selected/
+compact configsidenticalpercase/rank/repeat. No missing/filtered/partial finalcases.
+
+Meanpercase latencydelta vsfastermatched historical pull-dispatch/push-combine:
+Q3EP16 selected+0.349%,compact+0.458%; Q35EP8 selected+0.277%,compact+6.635%.
+Q3compact beats history1/8(rows3), loses7/8; lowestmean previousmetadata5/dense2/
+compact1. Versusselected compact+0.109%average,3/8lowermeans,1/8bothrepeats;
+selectedwinsboth4/8,overlappingranges6/8: small/mixed, notclearcompactadvantage.
+Q35compact losesALL12bothrepeats vshistoryANDselected; rangevshistory+3.136..+10.086%,
+vsselectedaverage+6.331%. Lowestmean previousmetadata5/selected5/dense2.
+Historicalbest sourcevaries: Q3previous6/dense2;Q35previous5/dense7, so keephistory.
+
+EarlierEP8Q3compact-1.455%vshistory(all12wins) didnotcarryovertoEP16. SevenQ3
+sameglobaltokencases: compactadvantagevanishes/reverses6/7; rows3/global48 stillwins.
+EarlierQ35EP16compact+3.278%, newEP8+6.635%; shapesdiffer(48-1024vs32-576tokens),
+noexactglobaloverlap, so noisolatedEPcausalclaim. NewQ3localexperts8,Q35local64;
+both8distinctdestinationranks/token. Q35getsframecopydedup8vs10butstillloses.
+Commonheuristics; Q3M16/32 stages11/10,8experts/wave;Q35M16/32/64 stages11/10/9,
+64experts/wave atrows6 else32. No newkernelknobs/variants orhardwareprofile.
+No universalmodel/EPpreferenceestablished. STOP/REPORTretained; no promotion,
+finalcleanup/kernelsweep/staging/commit. AllGPUjobs/collectorsreleased.
+
+OriginalQ3job7154781 cancelled4:18 onusercoveragechange. Its2completeprocessrecords
+andpartialtrial preserved/excluded under localqwen3_superseded_12cases; originalplan
+superseded_12case_plan.json retained. NO splicing acrossallocations orrerollbytiming.
+Remote mapping: currentlocalqwen3 ->remoteqwen3_manifest8; localqwen35 ->remoteqwen35;
+remoteqwen3 holds CANCELLED original andmustnotbeoverwritten. Finalartifactsync
+usesexplicitrootfiles and currentmodeltargets; never uploadcomparelogs.
+Commonmethod2000calls/200warmups/graphbatch100/MAXrankCUDAevents/noNSys,FP4/FP8,
+150SM/bucket3840,fixedbalancedroutes,exactcombinebeforetiming; fullproducer+MegaMoE,
+notwholemodel/requestE2E. Priorfullmodelalignmentnotrerunfor thisbenchmarkonlytask.
+
+## Completed: model-difference diagnosis and historical pull/push comparison
+
+Latest user requested cause investigation plus historical best with payload-pull
+DISPATCH / push COMBINE. Completed matched rerun of all24 previous random cases,
+4 frozen sources: selectedexplicit, compactlinear, September13dense, September12
+previousmetadata. Evidence scratch/megamoe/pull_compact_history24_20260915:
+SUMMARY.md, DIAGNOSIS.md, audit.json, historical_evidence.json, phase_evidence.json,
+workload_metrics.json, all_config_latencies.png. Jobs7154497Q3/7154500Q35 both
+COMPLETED0:0 in11:28/12:09. PASS16records192measurements2304rankexactchecks,
+all24cases4sources2repeats, no missing/filtered/partial records. All12shapes/process
+and reversed second-pass order reduce startup. Same2000/200/100 MAX-rank CUDAevents,
+FP4/FP8, fixed perfect rank-interleaved routing, noNSys, exact combine before timing.
+
+Historical dense wins vs previousmetadata all24 in matched reruns (old unpaired
+rank0archive min provenance22dense/2previous remains preserved). Relative to best
+historical rerun mean: selected Q3-0.043%,Q35+0.085%; compactQ3-1.455%,Q35+3.278%.
+Compact wins bothrepeats12/12Q3 and loses bothrepeats12/12Q35 against selected AND
+history. Selected lower mean vsdense9/12Q3,5/12Q35, bothrepeats5/12,2/12: small/mixed,
+not bestproof. Q35selected vsdense range-0.065..+0.753%; don't hide worstcase.
+No universalwinner/promotion/finalknobcleanup/kernelsweep/staging/commit.
+STOP/REPORT retained; only these explicitly requested comparisons/diagnosis resumed.
+
+Cause: noQ3-only knob found; selected/compact actualconfigs identical percase/rank/
+repeat (1152configlines initial24); sameheuristic source,150SM,bucket3840,N/K128,
+M16/32 stages11/10, threads128/128/256. Router explicitlyspecializesBOTH128/top8 and
+512/top10 with256threads,4352Bcompactframe. Q3EP8/local16/top8/I1536 vsQ35EP16/
+local32/top10/I1024 causes waves16vs32,25%more framecopies/token, more consumer
+activationgather work. Saved matched phases: compactvsdense Q3compute+.176..+.752us;
+Q35compute+1.568..+3.296us,producer+.513..+2.681us despite dispatch-1.152..-1.328us.
+Prior contiguousconsumer push experiment recoversQ35compute2.208..3.584us while
+producer worsens1.531..1.691us. Supports layout/producertradeoff, not isolated
+hardwarecounter attribution; EP/topk/experts confounded. No new variant/knob created.
+Initial2source24 evidence remains pull_compact_random24_20260914: compactQ3-1.158%,
+Q35+2.969%,96measurements1152rankchecks. Don't mix oldNSys rank0 minima withnewevents.
+
+Artifact-sync incident fully recovered: assistant uploaded experimenttree during
+runtime and replaced active log pathnames withstale copies. Originalbatchfdstreams
+retained complete logs; copied via /proc PIDs641960/3959619 throughbatchexit to.live
+files; bothrecoveryprocesses EXIT0. Preserved stale/live originals; restoredcomplete
+canonical logs; strictaudit PASS allrecords. No recordsplicing or GPUrerun. Collector
+45731 stopped143; finaloneshots EXIT0. AllGPU/collector/recoverytasks ended.
+Lesson: never upload local result logs into an active remote experiment; sync only
+explicit plans/workflows/docs (exclude compare logs), fetch results one way. Recovery
+script is incident evidence in scratch, not a new production workflow.
+
+## Final MegaMoE evaluation stopped under the user’s rule
+
+Read CODEX_PROJECT_final_megamoe.md and selected_explicit/REPORT.md under
+scratch/megamoe/pull_metadata_restore_20260914. Fixed misplaced explicit-combine
+keyword (checkpoint loader -> buffer allocation). Exact7153343 PASS264/5records;
+CPUadapter7153388 PASS3tests. Q3complete rows28/21: compact push faster in both
+repeats, means−0.677%/−0.390% vsselectedpull. CompleteQ35rows38 favorsselectedpull
+vscompact (−3.402%); precleanupdense slightly faster. No universalwinner.
+Applied explicit STOP/REPORT rule: cancelled7153461/7153462 at26:30/26:15;
+42records488rankexactchecks retained,3completecases12partialrecords. Original
+six-case matrix incomplete (Q3rows4,Q35rows28/22); no finalknobcleanup/sweep,
+recovery, promotion, staging orcommit. No taskjobs/collectors remain. All relevant
+code/evidence/handoff synced. Do not resume historicalplans withoutnewrequest.
+Earlier checkpoints below are historical.
+
+## Handoff prepared — work paused at latest user request
+
+Read [final MegaMoE handoff](CODEX_PROJECT_final_megamoe.md) for current source,
+results, risks and exact remaining commands. Explicit per-buffer combine CPU7153123
+PASS native+host in3:28. No running task jobs/collectors; new exact264 and five-config
+Q3/Q35 unprofiled comparison plans are prepared but UNSUBMITTED. No index/commit
+changes. Resume remaining validation/selection only when instructed; earlier ACTIVE
+entries below are historical checkpoints. Do not claim final version or best-config
+proof complete. Current state: pull_metadata_restore_20260914/selected_explicit/STATE.json.
+
+## Active: prove the best selected communication configuration
+
+Latest user requires early metadata push + payload pull + push-based combine,
+clean code and make it work; MUST establish best using tests. If another path is
+better, STOP and report rather than silently change architecture/search further.
+Initial cleanup/test complete: CPU+exact264 PASS; Q3/Q35 jobs7152479/7152485 both
+complete/audited24captures120phase720ordinary. Q3 fullpath−.037..+.152percent.
+Q35 rows22/28 candidate_repeat broadly slow (medians65.15/71.63us); pooled means
++5.127/+8.147percent vscontrol. Rows38+.595percent. Cause unresolved; no data
+filtered, no claim of universal nonregression. Full initial table/report saved in
+scratch/megamoe/pull_metadata_restore_20260914/REPORT.md and results.json.
+
+Follow-up code: combine is an explicit per-buffer protocol, passed to allocation,
+host validation and both FP8/FP4 launch paths. AFD selects inband_combine=True;
+standalone/reference callers retain legacy env/default0. CUDA math/core unchanged.
+Eight affected active files; previous rejected-payload deletion remains applied.
+Final source ffn_selected_explicit_20260914 is separate from initial frozen source.
+CPU7153123 building actual native/host; exact264 plan ready, unsubmitted. Prepared
+unprofiled best-config comparisons (2jobs max): original same3Q3EP8+3Q35EP16 cases,
+5configs (selected, precleanup dense, previous metadata/pull, compact push, dense/
+conventional combine), symmetric repeats, 2000calls, graphbatch100, slowest-rank
+CUDA-event means. Shared maintained smoke comparator avoids old reference-arena
+bug; exact combine checked outside every timed trial. NoNSys for winner decision.
+No new GPU submitted yet. Details selected_explicit/STATE.json and
+selected_explicit/config_comparison/plan.json. Await CPU/exact before timing.
+
+## Current request: restore selected pull, remove rejected paths, test decomposition
+
+User explicitly resumed work: select best validated metadata with pull payload,
+remove rejected optimization paths from active code, then test/report decomposition.
+Prior STOP applies only to old optimization plans; no new search for variants.
+Working-tree kernel/router already matched selected dense descriptors. Removed
+rejected Lamport inbox dispatch, native TMA sender, in-MegaMoE sender, push arena
+helpers, template options and environment forwarding from seven active files.
+Selected dense metadata, contiguous payload pull, combine and legacy correctness
+paths retained. Reserved metadata padding keeps validated buffer offsets stable.
+Backups/evidence remain in scratch; no index/commit/unrelated GDN changes.
+CPU7152139 PASS all5steps in2:56 (EP2/8 kernels, native/host, SASS); final native
+refresh7152230 PASS1:42. Remote source ffn_pull_metadata_clean_20260914.
+Fresh fixed seed3689699192022641276: Q3EP8 rows28/21/4, Q35EP16 rows38/28/22.
+Exact GPU7152282 PASS264 saved comparisons/5records, completed8:13.
+Fresh before/after cleanup ABBA Q3EP8 job7152479 and Q35EP16 job7152485
+submitted22:25UTC. Q3 completed12:03, collector PASS12captures60phase360ordinary;
+fullpath delta−.018..+.071us (−.037..+.152% latency). Q35 still running.
+Expected total24captures120phase720ordinary.
+All final source/workflow files synced before validation. Evidence/workflow:
+scratch/megamoe/pull_metadata_restore_20260914.
+
+## Previous campaign stopped after completing ongoing experiments
+
+7150076 Q3 and 7150075 Q35 COMPLETED0:0 in24:22/25:38; collectors EXIT0.
+All48captures240phase1440ordinary audited. Early-store REJECTED_AS_STANDALONE:
+0/6dispatch targets; fullpathvsdense Q3−0.62..+0.09%, Q35−0.60..−0.13% gains.
+Compute/consumer is largest compact phase: Q3 24.70–25.65us, Q35 37.18–37.60us;
+exposeddispatch5.47–5.92us. Q35compact saves1.15–1.33us exposeddispatch vsdense
+but producer finishes0.51–2.68us later and compute spans grow1.57–3.30us.
+No hardware-stall profile collected; rank0 timelines/phases only. No qualifying
+replacement, promotion or fresh serving alignment. Goal not achieved.
+Full report: [FINAL_STATUS.md](scratch/megamoe/dispatch_incremental_20260914/FINAL_STATUS.md).
+No running jobs/collectors remain for this work. STOP; do not launch or resume any
+historical experiment, profiling, validation, alignment, or optimization plan
+below without a new user request.
+
+## Optimization context: retain faster transfer while removing both overheads
+
+User corrections September14: optimize metadata/payload dispatch without moving
+cost into producer preparation or scattered consumer loads. Payload method/layout
+may change; preserve the measured transfer advantage, not a particular push design.
+Require >5% dispatch gain on fresh random3Q3EP8+3Q35EP16, faster matched ordinary
+producer→MegaMoE (including repeats/frozenhistory), and no measured producer/compute/
+combine regressions. Then normal-routing/slowest-rank validation and fresh model
+alignment; no phase-only promotion or claim of universally minimal latency.
+Goal not achieved; work stopped per user. Current source main/index preserved.
+
+Completed experiment context (September14):
+- Directbulk REJECTED:7148045/7148053 completed,48captures240phase1440ordinary
+  audited; fullpath6.78–18.35% slower thancompact,10.25–17.82% slower thandense.
+  Vector→bulk alone gives−0.08..2.34%; allsixdispatchgatesFAIL. ExactPASS352 retained;
+  no EP2 expansion/promotion. Rejection evidence direct_bulk_push/e2e_rejection.json.
+- fixed_pool_shared_targets REJECTED_AS_STANDALONE: exactPASS180; timing7148682/
+  7148922 bothcomplete48captures240phase1440ordinary. All6dispatchgatesPASS.
+  Sharedhandoff savesproducer0.78–1.25us vsfixedpool butstill+1.36–2.95us vsdense.
+  Contiguousconsumer helpsQ35compute2.21–3.58us vscompact; remainingproducer
+  costdisqualifiesstandalone. Preserve effectfor evidence-supportedcomposition.
+- fixed_pool_packed_frame REJECTED_AS_STANDALONE: exactPASS352 and CPUactual
+  native/hostPASS. Combined timing7149421/7149422 fullyaudited60captures300phase
+  1800ordinary across bothmethods. Expertpacked5/6dispatch gatesPASS; producer
+  remains+1.336..3.506us vsdense despite0.419..1.505us savingvsfixed. Q35rows13/34
+  fullpath−1.282/−4.427% vsdense. Standaloneplans remainSUPERSEDED_UNRUN.
+- packed_source_pull REJECTED_AS_STANDALONE: exact7149145 PASS496/12records,
+  targetH4096 stages unchanged; wideH32768 drops5→4. Same combinedaudit above:
+  0/6dispatchgatesPASS, fullpath0.216..1.256%slower vsdense whileproducer roughly
+  unchanged(−.081..+.105us). Packing source SF alone does not retain fastdispatch.
+  Evidence packed_source_pull/combined_rejection.json; collectors35996/92478 EXIT0.
+  Preserve direct output-stride mechanism for scheduling experiment below; no
+  standalonepromotion/EP2 expansion. Native stride validator prepared, UNRUN.
+- packed_source_early_store: one-header scheduling delta on packed_source_pull.
+  Start/commit local activation store immediately after frame completion, overlap
+  SF transpose/weight stores; one elected thread retains issue/commit/wait ownership.
+  Original final wait/release preserved. Native/layout/consumer unchanged; inherited
+  wide stage-depth loss unresolved. CPU7149735 PASS5steps3:46 actualnative/host, EP2/EP8/SASS. Explicit R41<48/
+  R23<40; compiledearlystore1810 beforeSFload1890, fullwait1a90 beforearrival1b30.
+  Exact7149885 PASS352/8records11:11, targetstage/smem andall6M verified.
+  Freshseed6974469513186867194 Q3rows9/28/10,Q35rows51/48/20; eight symmetric arms
+  compact/sourcepacked/dense/earlystore. Timing7150076Q3/7150075Q35 COMPLETED,
+  collectors90292/55335 EXIT0;48/240/1440 audited,0/6dispatch,REJECTED_AS_STANDALONE.
+- tiled_expert_push_design.md is design-only: contiguous physicalexpert tiles,
+  one consumerdirectory lookup, no finalprefixdependency. Allocation/publication,
+  generationreuse/padding/capacity costs unresolved; no source/build/GPUwork.
+
+Rejected and preserved:
+- Async lane gather7147418/7147425 complete36captures180phase1080ordinary;
+  all6dispatchgatesPASS, fullpath59–91%slower thancompact, producer nearlyunchanged.
+  Reject this TMA replacement. Allcaptured data/failedcollectorlogs retained;
+  localanalysisrecovery fixed phasehistoryargument, noGPUreruns.
+- Compact linear rejected forE2E: latestmatched6cases fail4/6 despite allphasegates.
+  Priorselectedsource sweeps stopped, incomplete350cases1750phase10500ordinary
+  retained; cancelled7145382/7145806 and stoppedrunners mustNOTresume. Bothmodel
+  alignments pass correctness only. Tokenstride/sharedroutes also rejected.
+- Previous early-PDL trials moved waiting into dispatch without E2E improvement.
+  Q35two-stream serving deliberately defersPDL forsharedexpertpriority.
+
+Corrected key-enabler attribution: metadata/payload separation predates the last
+compact-push change. Relevant delta is compact activation/SF/weight frames and
+local auxiliary reads; same-layout Q3 comparison gives11.7–16.5% dispatch gain.
+Bulk instruction alone is not sufficient; shared staging also reduces repeated
+producer loads. Compact pool footprint benefit is established, its causal latency
+contribution is not. Distinct-rank balancedroutes have no fanout dedup benefit.
+
+`audit_fullpath` now guards ordinary producercompletion/start and phasecompute/
+combine means/medians as well as fullpath/repeats/history; allrecords retained.
+Componentworst-repeat deltas reported separately; markers include stalls/overlap,
+not isolatedcompute/network efficiency. Gate checks saved component_guard*.json.
+Historical fullpath baseline frozen separately fromdispatch minima for464cases.
+
+Details and paths: [CODEX_PROJECT_dispatch_incremental.md](CODEX_PROJECT_dispatch_incremental.md),
+`scratch/megamoe/dispatch_incremental_20260914/{STATE.json,NEXT_IDEAS.md}`.
+Remote root `/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD`.
+Max2outstandingGPUjobs; CPUjobs separate. Plain ssh oci-hsg, monitor300s (nearfinish
+2–3min), act on terminalstates withoutholdingreadywork forcadence. No subagents,
+/tmp, py_check/hash checks, fallback, commits/staging or unrelatedmaincodechanges.
+Separate GDN work untouched. AGENTS.md absent; preference alreadyasked; supplied
+globalinstructions apply. Preserve staged history and all experiment evidence.
+
+Everything below is historical and does not override this active goal.
+
 # Project Memory
+
+Goal closure verified: live scheduler shows all17 gate/sweep/alignment jobs
+COMPLETED0:0 and no active jobs. Re-executed the complete464-case artifact audit,
+recomputed historical dispatch gains from saved samples, checked both repeats of
+all six sampled cases against each control and history (>5%), and compared all14
+integrated files with validated overlays. All PASS. Required direct-pool push was
+implemented/tested and slower; final compact metadata plus pull payload retained.
+Evidence: scratch/megamoe/dispatch_dense_descriptors_20260913/goal_closure_verification.json.
+Requested experiment sequence complete; no claim of globally minimal latency or
+substantial whole-pipeline improvement. No additional GPU runs or index changes.
+
+Continuation completion audit: prior turn classified as progress (validated integration
+and staging). Live Slurm confirms all 17 sampled/sweep/alignment jobs COMPLETED0:0
+and no active jobs. Re-audited all 464 case contracts and recomputed six sampled
+gates/full history-best gains from saved phase samples; all match reported results.
+All 14 integrated files still match validated overlays. Direct-final-pool push
+was implemented and tested but slower, satisfying the required experiment without
+promoting it. Evidence: scratch/megamoe/dispatch_dense_descriptors_20260913/
+completion_revalidation.json. No GPU reruns or index changes. AGENTS.md remains
+absent; supplied global instructions apply, pending optional documentation preference.
+
+## Completed dispatch optimization and attention-only cleanup — September 14
+
+Combine frozen at validated in-band1. Compact descriptors and attention-only cleanup
+are integrated locally. User subsequently requested git-add staging only: stage the
+completed dispatch/cleanup, validated attention/model dependencies and reusable tools
+(57files total), retaining the previous33-file scope. No commit. Separate GDN
+profiling script and its project note remain unstaged. Scope: scratch/megamoe/stage_20260914/stage_files.txt.
+All fifteen rejected timing trials retained/audited24captures/120phase/720ordinary
+samples each. Gains below compare fresh matched controls (negative=slower):
+
+| Trial | Six-case result | Evidence |
+| --- | --- | --- |
+| Parallel counts | REJECT: -26.4% to -11.9%; SASS disproved serial-load hypothesis | [results](scratch/megamoe/dispatch_count_parallel_20260913/README.md) |
+| Ordinary acquired counts | REJECT: -2.4% to +3.0%; all behind history | [results](scratch/megamoe/dispatch_count_cached_20260913/README.md) |
+| Count/TMEM-init overlap | REJECT: Q3 -5.0% to +2.3%, Q35 -4.0% to -0.2% | [results](scratch/megamoe/dispatch_count_overlap_20260913/README.md) |
+| Single-writer ready flags | REJECT: Q3 -4.8% to -3.7%, Q35 -8.1% to -6.8% | [results](scratch/megamoe/dispatch_rank_ready_flags_20260913/README.md) |
+| Ballot rank selection | REJECT: -1.1% to +3.0%; all six gates fail | [results](scratch/megamoe/dispatch_ballot_select_20260913/README.md) |
+| Grouped selector | REJECT: Q3 -0.55% to +1.84%, Q35 -5.24% to +1.28% | [results](scratch/megamoe/dispatch_grouped_selector_20260913/README.md) |
+| Copy/SF overlap | REJECT: Q3 -1.26/+0.91/-1.44%, Q35 +0.32/-0.66/0%; all behind history, kernel changes <0.5% | [results](scratch/megamoe/dispatch_copy_overlap_load_20260913/README.md) |
+| Local weights | REJECT: Q3 -1.89/-0.18/+0.17%, Q35 -1.15/-8.57/-3.28%; all six fail; all kernel means regress | [results](scratch/megamoe/dispatch_local_weights_20260913/README.md) |
+| Active-warp bound | REJECT: Q3 -1.69/-0.72/-1.62%, Q35 -1.64/-1.54/-4.17%; all six behind history | [results](scratch/megamoe/dispatch_active_warps_20260913/README.md) |
+| Warp-major ownership | REJECT: Q3 -1.28/-1.08/-0.19%; Q35 +18.90/-14.64/-0.84%; only rows1 passes | [results](scratch/megamoe/dispatch_warp_major_20260913/README.md) |
+| First-round shortcut | REJECT: Q3 -2.14/+1.08/+1.76%; Q35 0/+2.89/+2.12%; all six gates fail | [results](scratch/megamoe/dispatch_first_round_20260913/README.md) |
+| Expert-boundary ownership | REJECT: Q3 +2.82/-0.54/-1.42%; Q35 +16.23/+11.39/+1.00%; only rows1 passes | [results](scratch/megamoe/dispatch_expert_warp_padding_20260913/README.md) |
+| Packed input | REJECT: Q3 -5.36/-7.72/-6.82%; Q35 -7.53/-3.11/-7.72%; all six fail; full pipeline regresses | [results](scratch/megamoe/dispatch_packed_input_20260913/README.md) |
+| Forward rank mapping | REJECT: Q3 +16.70/+7.60/+2.91%; Q35 +17.51/+11.97/-4.85%; 2/6 pass, all kernel means improve0.43–1.55% | [results](scratch/megamoe/dispatch_forward_rank_map_20260913/README.md) |
+| Payload-only packed transfer | REJECT: Q3 +0.22/-0.75/-4.06%; Q35 -6.06/-4.06/-4.01%; all six fail; pipeline regresses0.23–1.44% | [results](scratch/megamoe/dispatch_packed_payload_only_20260913/README.md) |
+
+Checkpoint (final sweeps complete): all11groups/464cases/1566input aliases audited;
+2320phase and13920ordinary samples, including23EP64 exact-combine cases. Actual
+ordinary specializations confirm frozen in-band combine and both push flags off.
+Full mean per-case dispatch gains vs historical best: Q3 14.108% (141/164>5%,
+161improved,2regressed,1equal; worst -1.478%); Q35 23.108% (300/300>5%, min7.965%).
+Original six sampled gates and both initial alignments PASS. Final cleaned-source
+alignment Q3 7131066 PASS15:03:48prompts/816tokens, all top1/top10, complete ordered
+pinned continuations and finite chosen/candidate scores. Q35 7131070 PASS17:49:
+168prompts/2856tokens all top10,2853top1; three rank2 first tokens match prior
+references. Both jobs COMPLETED0:0. Monitored300s, at most2outstanding GPU jobs.
+Cleanup overlay passes33tests, native/GPU metadata/transport/cache-reuse checks.
+All14validated files integrated after both final alignments; staged patch unchanged
+and all5unchanged model/worker basis files preserved. No commit. User waived HTML
+inspection; both same-format HTML
+reports and full PNG/SVG/PDF plot generated; scientific PNG reviewed.
+Full rank-0 router→MegaMoE mean per-case gains: Q3 0.478%, Q35 0.583%; reduction of
+mean latency0.467%/0.130%. There are31/120 regressing cases; all records retained.
+User confirmed original dispatch acceptance target; combined latency reported
+separately without a net-latency gate. Producer shifts work into metadata creation:
+MegaMoE starts1.735/1.710us later on average. No substantial whole-pipeline claim.
+Current path pushes compact metadata and pulls payload; no new activation reshape
+or packing pass. It is not literally zero-copy: source→receiver shared→expert pool.
+Current dense metadata + payload-only push is UNTESTED; existing push flag changes
+metadata protocol too. Prior direct-pool push passed exact checks but was slower:
+Q3EP16 47.345 vs38.600us, Q35EP32 57.939 vs48.152us. Prefix removal helped, while
+address-reply bypass and bulk-transfer reuse did not explain most residual gap.
+Dense ordinal alone does not provide the padded expert-pool base. Preserve the
+open idea; user explicitly requested no push retries now.
+
+Retained experiment evidence (accepted compact descriptors integrated; combine unchanged):
+
+- [Forward rank mapping](scratch/megamoe/dispatch_forward_rank_map_20260913/README.md):
+  exact7120177 PASS five records/264saved comparisons; prepared SASS R42/R43<48.
+  Timing7120358/7120359 completed12:52/12:32; Q3rows2/21/15, Q35rows1/3/42.
+  Only Q3rows2 and Q35rows1 pass; all six ordinary kernel means improve0.43–1.55%.
+  Retain component evidence without promotion. All24/120/720 audited; monitor exited.
+- [Payload-only packed transfer](scratch/megamoe/dispatch_packed_payload_only_20260913/README.md):
+  exact7120548 PASS three records/180saved comparisons, SASS R39/R43<48.
+  Timing7120696/7120698 completed12:03/12:47: Q3rows1/4/14, Q35rows9/12/4.
+  REJECT0/6 gates; all24/120/720 audited, full pipeline regresses0.23–1.44%.
+  Monitor exited. Padding-cache-miss hypothesis remains unproven.
+- [Compact source descriptors](scratch/megamoe/dispatch_dense_descriptors_20260913/README.md):
+  producer atomics build dense lists; receiver skips count aggregation/inverse lookup.
+  Original unbanked draft had a cross-generation overwrite risk; existing metadata
+  slices now bank descriptors without allocation/ABI/barrier changes. Payload/combine fixed.
+  Corrected CPU/native builds PASS; exact7120850 PASS264saved comparisons, including legacy.
+  Timing7120939/7120940 PASS all6 gates,24captures/120phase/720ordinary samples:
+  Q3rows14/32/3 matched +25.57/+25.13/+20.99%, history +14.40/+23.91/+19.56%;
+  Q35rows6/16/20 matched +30.65/+28.90/+28.11%, history +21.59/+29.84/+23.01%.
+  All candidate repeats pass. Full-pipeline means Q3 +1.05/-0.14/+1.14%,
+  Q35 +0.56/+6.19/-0.18%; later MegaMoE starts offset much of the dispatch gain.
+  No >5% whole-pipeline claim across cases; retain all calls and unpaired-history caveat.
+  Initial Q3 alignment7121261 PASS17:58:48prompts/816tokens, all top1/top10,
+  complete pinned-prefix coverage and finite scores. Q35 alignment7121263 PASS21:14:
+  2856/2856top10,2853top1; all ordered continuations match pinned references. Three
+  first-token rank2 values match prior scores; finite chosen/candidate scores audited.
+  Monitor300s. Host seeding uses
+  actual Ray nodes before workers; first Q3 preflight helper-path failure consumed no GPU.
+- Held candidates: [normal pull-cache priority](scratch/megamoe/dispatch_load_cache_normal_20260913/README.md)
+  exact7118813 PASS, timing unrun (no cache-miss evidence);
+  [prefix lookup](scratch/megamoe/dispatch_expert_prefix_20260913/README.md)
+  exact7118573 PASS, timing unrun (earliest experts0–2 weaken the setup tradeoff);
+  [early packed store](scratch/megamoe/dispatch_packed_store_overlap_20260913/README.md)
+  CPU7119826 PASS, GPU unrun after packed-input rejection;
+  [first-round/ballot composition](scratch/megamoe/dispatch_first_round_ballot_20260913/README.md)
+  remains local/unvalidated. No implicit promotion or combination of these paths.
+
+Reusable `prepare_megamoe_sweep_abba.py` writes fresh plans without submitting,
+preserves actual control caches, derives source metadata from env, checks EP/sample
+policy and refuses existing plans. CPU-only compile parity7119325 matched all2808
+addressed SASS instructions for one recorded EP8 geometry; this is an example,
+not proof for other candidates. Packed-input legacy exact rebuilt its control host
+extension inside the GPU allocation: verify/seed established ABI-compatible host
+extensions before future launches. Detailed attempts/results stay in trial READMEs.
+
+[Startup diagnostics](scratch/megamoe/dispatch_startup_diagnostic_20260913/README.md):
+six captures/30samples; subsequent init1.09–1.28us, route wait0.99–2.10us,
+count loads0.42–0.61us, join0.064us, lookup/index1.01–1.82us, first copy/publication
+3.20–4.54us. First route waits9–127us retained. Required-publication→first-compute
+marker gaps0.77–1.25us are observational, not causal stalls. Preserve TMA.
+Cache lesson: device-header mtimes can rebuild a hard-linked host extension.
+Use --copy only with established ABI compatibility; ABI changes should use the
+existing CPU prebuild_deepgemm_extension.sbatch before GPU allocation.
+
+Integrated cleanup ([details](scratch/afd/validation/attn_only_cleanup_20260913/README.md)):
+per-in-flight pinned metadata fixes queued H2D corruption; incomplete real replies
+now fail before mutation. Removes unused attention turns/O-turn/direct-O/remote-GDN
+and prequantized-O helpers, consolidates final normalization/MegaMoE completion,
+and limits coordinator timing overhead. Active event ordering, model/shared/GDN
+turns, dummy/stale-request handling and initialization synchronization are retained.
+GPU7121520 reproduced baseline corruption and verified all three corrected replays
+([evidence](scratch/afd/validation/attn_only_cleanup_20260913/gpu_metadata/comparison.json)).
+CPU7121378 failed one obsolete device-turn test; corrected CPU7121488 passed29tests
+and native builds. Final draft CPU7121631 PASS33tests and native/router builds in alignment
+image25.10 (5:26). Retained transport GPU7121703 PASS1:32: Q3 FP8/Q35 gated BF16,
+two rank pairs, three rows and nine slot/counter reuses, QKV/shared-RMSNorm checks.
+
+Audited full sweeps (mean per-case reductions; unpaired histories):
+
+| Group / job | Cases | Dispatch | Cases >5% | Router→MegaMoE |
+| --- | ---: | ---: | ---: | ---: |
+| Q3EP2 /7121771 |86|8.856%|63|0.269%|
+| Q3EP4 /7123534 |42|19.659%|42|1.008%|
+| Q3EP8 /7124365 |20|16.222%|20|0.119%|
+| Q3EP16 /7125100 |8|19.738%|8|-1.043%|
+| Q3EP32 /7125159 |4|22.309%|4|0.654%|
+| Q3EP64 /7125257 |4|38.698%|4|4.060%|
+| Q35EP4 /7121770 |139|20.991%|139|-0.156%|
+| Q35EP8 /7123069 |83|23.740%|83|0.457%|
+| Q35EP16 /7124181 |39|24.557%|39|1.341%|
+| Q35EP32 /7124704 |20|24.990%|20|3.690%|
+| Q35EP64 /7124705 |19|30.877%|19|1.712%|
+
+Dispatch uses each case’s best of two historical full sweeps. Ordinary MegaMoE
+mean per-case gains5.122%/5.757% use those same selected histories (Q3/Q35).
+Router→MegaMoE uses the prior frozen-combine full sweep,30calls/case/variant;
+not cross-rank maximum or full-model latency. Full comparisons, all regressions,
+sample audits and actual timed flags are under the compact-descriptor sweeps root.
+
+Cleanup review covers kernels, graph scheduling, coordinator and reply ownership:
+12files/1821net lines removed. Integration applied14files after final model gates;
+all saved parents matched immediately before applying, and the staged patch is byte-
+identical afterward.33staged communication files/preexisting edits preserved; no commit.
+Final alignment topology dry runs and CPU7121801 native cache reuse PASS.
+Both final alignments passed using cleaned source and prebuilt native/DeepEP/DeepGEMM
+caches. Local source now matches those validated overlays. Evidence and requirement
+audit: [completion](scratch/megamoe/dispatch_dense_descriptors_20260913/completion_audit.json).
+
+## MegaMoE communication staging — September 13
+
+Remote staging checks PASS: six shell launchers, all464saved-case contracts and
+all11launch-group plans. Candidate code was synced before checks; no new GPU jobs.
+Explicit33-file staging scope: scratch/megamoe/stage_20260913/stage_files.txt.
+Remote workspace: FastAFD/artifacts/comm_stage_20260913/workspace; checks/summary.json
+and local remote_checks.log retain evidence. No AGENTS/skill changes are needed.
+
+
+User requested cleanup and git add only, no commit. The final validated communication
+source is integrated locally, along with the EP64 reference-harness correction and
+reusable launch/collection/report tools. Existing staged combine cleanup is retained;
+unrelated attention/GDN runtime/model work stays unstaged. No kernel algorithm
+changes during staging. Remote check evidence and explicit scope are under
+scratch/megamoe/stage_20260913; detailed memory and rejection reasoning:
+[CODEX_PROJECT_qwen35_push_comm.md](CODEX_PROJECT_qwen35_push_comm.md).
+
+Final selection: pull dispatch + opt-in push-based in-band combine. Both normal
+EP8/128K alignments PASS with complete pinned-reference coverage. Paired full-model
+step means Q3 25.3333868→25.3435156ms, Q35 22.612068267→22.601254333ms: no meaningful
+step gain. Most reduced ready-wait time already overlaps useful attention work.
+All464cases/1566aliases,1392IKET/13920ordinary samples and23EP64bitwise checks pass.
+Both same-format HTMLs and full plots complete; no task GPU jobs remain.
+Artifacts: scratch/megamoe/comm_final_20260912/{results.md,completion_summary.json},
+sweeps/{qwen3,qwen35}/*-megamoe-comparisons.html. Final pull remains faster than
+matched tested push variants; no universal optimality or push-impossibility claim.
+
+User's average E2E means MegaMoE invocation across shared historical/final sweeps:
+164Q3/299Q35 cases, excluding newQ35global640. Mean per-case latency gains2.97%/3.77%,
+exposed dispatch reduction-13.12%/-5.47% (increases), combine18.21%/21.01%.
+Reduction of absolute mean latency differs:1.54%/2.63%. Historical runs/sample
+policies differ; not paired causal A/B. sweep_reduction_report.md records both.
+
+Historical checkpoints below are superseded where their status conflicts.
+
+## Full communication optimization resumed — September 11
+
+User explicitly resumed push dispatch + general MegaMoE communication optimization,
+and final Qwen3EP16/Qwen3.5EP32 alignment/performance/decomposition sweeps, overriding
+prior stop instructions below. Work autonomously, primary agent only; running-job
+monitoring every3minutes. Current scheduler verified no active jobs; all seven latest
+combine correctness/performance jobs COMPLETED0:0. Previous cleanup turn was progress.
+Staged minimal pull/in-band combine remains intact; new experiments use frozen scratch
+sources. Direct-release candidate removes only unnecessary sender acquire/return on
+existing system arrival RMW, preserving consumer acquire/proxy/reuse. Exact7096621 COMPLETED0:0 in4:25; Q3/Q35 retained suites passed. CPU nvdisasm
+confirms REDG system release without immediate producer invalidation. Independent
+push-layout7096733 RUNNING4GPUs/15min, frozen payload/arrival/math unchanged;
+destinations send count/offset packets to sources, replacing sender remote fetches.
+Both new candidates passed all Q3/Q35 exact arms; compiled broad native sender
+region maxR45 (<48) for all three specializations per candidate. Four-arm target
+comparisons7096816 EP16/7096817 EP32 RUNNING16/32GPUs,40min limits,8primary trials
+and4phase/full captures each. All5phase/30ordinary samples required; no promotion.
+Plans/results: scratch/megamoe/comm_resume_20260911. Independent two-header metadata-
+generation candidate prepared to replace the final cross-rank cleanup wait with
+local completion, preserving local joins and using alternating metadata banks.
+Protocol/validation plan: scratch/megamoe/metadata_generations_20260911/README.md.
+It is LOCAL UNVALIDATED; no GPU job submitted while both target slots are active.
+[Protocol and next gates](scratch/megamoe/direct_release_20260911/README.md).
+
+
+## Code cleanup staged — September 11
+
+User requested cleanup and git add only; no commit. Ten combine/runtime/test and
+ABBA/profile/summarizer files staged. Cleanup changes comments/formatting only in
+CUDA and removes obsolete push-dispatch marker analysis from the profiler. Remote
+bash syntax checks passed; summarizer reproduced saved Q3EP8/Q35EP32 phase and
+full-kernel captures (5/30 samples per arm). Existing GPU correctness/performance
+validation remains applicable; no new GPU jobs. Cleaned files synced to local-mirror.
+Unrelated model/attention changes, project memory and scratch experiments unstaged.
+
+## Pull dispatch + minimal in-band combine: final measured state
+
+User requested git restore, concise implementation, experimental in-band push
+combine with pull dispatch, and BOTH Qwen3/Qwen3.5 exposed dispatch/combine plus
+ordinary full-kernel metrics. Eight communication files archived/restored; current
+LOCAL code is the validated fresh in-band parent (~60net production lines, ONE
+DG_MEGAMOE_LAMPORT_COMBINE boolean). Two receive generations, pending-slot vector
+polling, unchanged reduction order. No new counters/credits or model-specific tuning.
+Default0 preserves epoch/TMA;1 enables in-band with rank-ready/rank-gated ordered
+arena invocations. Unrelated model/attention changes preserved. No commits.
+
+Six-arm exact7095226 PASS: small/Q3/Q35, normal/perfect, negative/zero/padded/
+empty-source and repeated graphs. Fresh comparisons7095647/7095484/7095648 all
+COMPLETED0:0; all4primary output checks and5phase/30ordinary rank0 samples per arm
+retained. Same source, only combine flag differs. Epoch/TMA -> fresh in-band (us):
+
+| Case | Dispatch median | Combine median | Full kernel mean | Harness ABBA |
+|---|---:|---:|---:|---:|
+| Q3EP8,192global |8.576->8.992|7.328->5.056|43.4624->43.5605|52.7414->53.0002|
+| Q3EP16,192global |8.512->8.512|7.296->5.120|32.4256->32.0384|40.0890->39.7218|
+| Q35EP32,640global |9.600->9.920|7.104->5.952|38.1984->37.8421|49.2810->49.2001|
+
+Exposed combine improves1.152–2.272us; full-kernel improvement is NOT universal.
+Q3EP8 mean+0.0981us, harness+0.2588us (+0.4907%, control drift0.0347us), kernel
+median-0.048us. Tails grow0.544->2.912/0.832->3.136/0.640->1.632us respectively.
+Direct intervals and legacy clipped exposure metrics both retained by summarizer.
+Original7095338 failed closing-control exclusive-create reference, not kernel;
+all subsequent timing/profile arms compare immutable refs. Sources/captures preserved.
+
+One bounded structural follow-up moved the EXISTING epilogue grid join into dispatch
+cleanup warps after final CTA handoff; no added counter/layout/math/knob. Three-arm
+exact7095831 PASS. Performance7095905 Q3EP8 COMPLETED15:39 and7095906 Q35EP32
+COMPLETED17:50, six primary trials +5phase/30ordinary per arm. New vs fresh parent
+kernel mean43.8549->43.1979us (Q3EP8),38.6741->39.3707us (Q35EP32). REJECTED as
+generic replacement; LOCAL header restored to exact tested parent. Q35 combine
+6.016->4.736us but tail1.920->3.744us and kernel worsens. Q3 new/parent primary
+52.5696/53.0737us with stable parent; Q3 epoch refs drift6.8973%, Q35 parent controls
+drift1.7327%, so corresponding tiny/large ABBA gains are inconclusive. Q35 new
+49.5933us vs stable epoch49.1912us also regresses. No causal split from phase medians.
+
+No active task GPU jobs, no further variants/default promotion. Best retained
+minimal implementation remains opt-in because e2e improvement varies by workload.
+Raw rank0 .nsys-rep/CSV/decomposition triples local; no SQLite/all-rank bulk copied.
+[Fresh results](scratch/megamoe/inband_combine_fresh_20260911/results.md),
+[rejected follow-up](scratch/megamoe/inband_cleanup_join_20260911/results.md).
+
+## Active combine goal: pull dispatch fixed, dependency-mask candidate — September 11
+
+New user goal supersedes the blocked push-dispatch goal: pull dispatch + push combine,
+expecting roughly0.6–1us exposed-combine saving. Current generic default already selects
+that architecture; all new trial envs explicitly set three dispatch-push flags0.
+Historical raw audit7088104 matches remembered0.896us lower combine exposure, but
+combine code was IDENTICAL across those dispatch variants. Pull/early push combine
+6.976/6.080us; full kernel32.2965/33.0848us mean (all5phase/all30ordinary retained).
+This does not establish a transferable combine gain. Audit saved locally.
+
+Current LOCAL UNVALIDATED combine_rank_mask candidate replaces per-rank any-vote
+loops with one warp OR reduction in both combine geometries, EP<=32. Invalid lanes
+contribute0; duplicate producers collapse; EP>32 existing per-slot path unchanged.
+No payload/math/barrier/epoch/cleanup change, no tuning knob. Parent header and exact
+patch saved. Exact7094952 SUBMITTED4GPUs/15min: retained Q3/Q35 normal/perfect,
+empty/padding and repeated-graph suites with pull dispatch. EP16 ABBA+5phase/30kernel
+plan prepared UNSUBMITTED until correctness passes. No push-dispatch/full-model jobs.
+Async clarification asks whether user intended retained producer-epoch combine or
+revisiting archived in-band combine; after response window, proceeding with former
+as stated to user. No in-band rewrite begun. No performance or completion claim.
+[Protocol and raw audit](scratch/megamoe/combine_rank_mask_20260911/README.md).
+
+## Current direction: pull dispatch and existing push combine — September 11
+
+User explicitly chose to stop pursuing push dispatch and retain pull dispatch +
+producer-push combine. This supersedes the old push-dispatch optimization objective
+and all historical pending next steps below; do not resume them automatically.
+Cancelled sole active push-dispatch comparison7094758: Slurm CANCELLED in6:58;
+partial primary logs saved locally, no completed phase/full-kernel comparison.
+Current default dispatch flags are all0 (pull); AFD adapter enables rank-gated
+combine. Existing experimental code and separately accepted full-model snapshots
+are preserved; no kernel/config changes or new GPU submissions in this review.
+
+Combine already pushes BF16 contributions into known source-token/top-k slots,
+then performs local TMA reads/reduction after required producer epochs. Evidence:
+- Isolated rank-gated completion ABBA6597585:93.377 ->91.371us (-2.149%),
+  bitwise exact, fused routing held fixed; harness timing, not new IKET exposure.
+- Accepted top-k8 CTA local combine ABBA7014107:47.936 ->45.104us kernel wall
+  (-5.91%). Comparative IKET7014576/7014768 coarse exposed combine11.392 ->7.680us,
+  compute proxy essentially unchanged. Evidence in CODEX_PROJECT_qwen3_ffn_overheads.md.
+- These prove improvements within producer-push combine, not a pull-versus-push
+  combine transport A/B. Later in-band combine variants were rejected:7076249
+  +7.40%;7076436 original+2.91%,async-cleanup+1.47% against warmed harness controls.
+- Recent dispatch-only smaller exposed combine is not an independent combine gain.
+Future evaluation must retain exposed dispatch, exposed combine, and ordinary full
+MegaMoE kernel time (including completion tail); no new case-specific tuning.
+
+## Source-prefix validated; performance running — latest September 11
+
+Current LOCAL/frozen direct_source_prefix passed exact7094662 COMPLETED0:0 in4:40,
+both retained Q3/Q35 suites (sparse/empty sources, normal/perfect routes, graph reuse).
+Logs/summary/Q3+Q35 SASS local; max explicit R45 in reviewed ordinary region under48.
+Source inclusive prefixes replace dead raw send counts, use existing layout epoch,
+and support binary work lookup. No payload/math/combine/flag/allocation changes.
+Matched EP8 comparison7094758 RUNNING8GPUs/35min on nvl72086-T[02,08]; same-source
+pull, destination-layout parent and source-prefix candidate. Six primary trials and
+3 phase/full captures required. Only7094758 active; no commits or large EP jobs.
+
+Parent7094534 COMPLETED0:0 in17:07, all6primary/all3rank0 triples local. Pull/raw-
+direct/layout-ready net15.872/50.432/44.160us, full means44.1504/80.7019/75.6085us.
+Layout helps versus raw direct but loses BOTH to pull. All5phase/all30ordinary retained.
+Primary51.954880/85.501534/82.208752us, control drift2.80698% limits small-gain claims.
+Original7094394 complete16:41: pull/inbox/direct net16.352/20.736/48.384us, full
+44.0309/48.3403/79.4528us mean; all captures local. Goal remains unachieved.
+Potential later tests: release-only system arrival reduction (existing producer
+acq_rel emits CCTL.IVALL; PTX ordering rationale recorded), or contiguous SF transport
+with local transpose while X stays direct. Neither implemented; await current evidence.
+[source-prefix context](scratch/megamoe/direct_source_prefix_20260911/README.md),
+[completed layout comparison](scratch/megamoe/direct_layout_ready_20260911/qwen3_ep8/analysis.md).
+
+## Destination-owned layout candidate — latest September 11 continuation
+
+Current LOCAL source UNVALIDATED direct_layout_ready candidate. CTA0 metadata warp
+publishes padded expert offsets once into unused legacy receive-sum slots, releases
+a layout epoch in existing128B padding; senders read only their expert's offset/counts.
+Removes serial prefix metadata reads, retains direct-pool payload/tile-ready/compute/
+combine/reuse behavior. No allocation-size/API changes or case-specific tuning.
+Exact7094482 RUNNING4GPUs/15min on nvl72076-T16, latest1:13, after both headers
+synced into frozen source. Original7094394 RUNNING8GPUs, latest8:37: all6primary
+complete; means pull51.545988,inbox56.566696,direct85.352123us router+kernel.
+Direct loses33.806135us/+65.5844%; pull drift0.04106%. Profiles now underway.
+Balanced EP8 sends1536 activation rows in BOTH push designs; old metadata prefix
+averages8.5 sequential iterations(max16). Hypothesis, not stall attribution.
+Max2active jobs, no layout-candidate performance submission or commits. Details:
+[layout candidate](scratch/megamoe/direct_layout_ready_20260911/README.md).
+
+## Direct-pool correctness passed; matched EP8 comparison running — September 11
+
+Current LOCAL and frozen ffn_direct_pool_20260911 native push writes directly into
+final expert pools, replacing inbox gather. Exact7094309 COMPLETED0:0 in8:03:
+same-source pull and direct push BOTH pass Q3/Q35 retained exact suites, including
+normal/perfect routing, zero/padding/empty-source and repeated graph invocations.
+Logs/summary/SASS local. Q3 sender+cleanup highest explicit R43 within48-register
+allocation; compiled global proxy fences and system arrival atomic present.
+Short EP4 validation timings are slower than pull; no performance win claimed.
+Matched EP8 three-arm7094394 RUNNING8GPUs/35min on nvl72153-T[17-18], latest0:18.
+Arms: same-source pull, retained four-load/poll inbox, direct-pool. Six mirrored
+primary trials and3 phase/full-kernel captures; profile pull first to preserve a
+control if candidate instrumentation fails. All5phase/all30ordinary samples required.
+
+DNS recovered. Previous7093619 FAILED143:0 in13:32 during candidate IKET capture
+(CUDA715 illegal instruction); all8primary trials complete, candidate ordinary
+kernel47.8614us mean/47.888us median with all30samples retained locally. No phase
+capture or matched full-kernel control; no acceptance claim. Compiled marked kernel
+inspection did not establish the cause; do not assume a register-limit fix.
+Batch7093721 COMPLETED0:0 in7:00, both Q3/Q35 exact suites pass; terminal logs and
+summary local. Batch performance remains unsubmitted, architecture superseded.
+Only7094394 active; no larger EP/full-model jobs or commits. Goal unachieved.
+Code/current memory synced to local-mirror; frozen candidate unchanged during runs.
+Protocol, cost tradeoffs, parent source, patch and artifacts:
+[direct-pool prototype](scratch/megamoe/direct_pool_20260911/README.md).
+
+## Architectural retrospective — September 11, 2026
+
+User asks to reconsider the base instead of continuing marginal optimization.
+Review finds explicit-flag push still delivers to a source-indexed inbox and retains
+the receiver gather/compact-pool dependency. Latest complete matched comparison
+still loses BOTH exposed net and full kernel to pull. Stop further small variants
+and leave batch performance plan unsubmitted. Recommended next design is direct
+final expert-pool delivery with tile readiness; account for metadata/layout handshake
+and loss of same-destination activation deduplication before claiming a benefit.
+Keep numerical core, pull control and established correctness/reuse principles.
+Detailed evidence, rewrite boundary, combine caveat and decision experiment:
+[retrospective](scratch/megamoe/push_dispatch_retrospective_20260911.md).
+7093619 has all8primary locally (best55.676056 vs pull51.264824us router+kernel);
+phase/full captures uncollected. Last observed7093619/7093721 RUNNING13:18/4:02;
+current status UNKNOWN after normal+escalated SSH DNS failure. Local batch code
+remains UNVALIDATED. No new jobs, code edits or commits during review. Earlier
+queued/partial-trial descriptions below are historical. Goal remains unachieved.
+
+## Active general push-dispatch investigation — September 11, 2026
+
+Acceptance requires BOTH lower exposed dispatch/combine and lower full MegaMoE
+kernel duration. Exposed communication ends at CombineEnd; full kernel includes
+the later tail. Keep all5 phase samples and all30 ordinary Nsight samples. Net
+exposure is median of per-sample dispatch+combine. Q3EP8/EP16 and Q35EP32 are the
+targets; no new full-model runs, commits, subagents or shape-specific tuning.
+
+Current LOCAL source UNVALIDATED per-source batch-ready candidate; frozen
+ffn_signaled_batch_ready_20260911, exact7093721 queued4GPUs/15min. Last-sender GPU
+ticket gathers stores, system-release epoch per destination; explicit observers
+cover zero-row sources before reset/reuse. Existing128B padding holds local count,
+no allocation/layout-size change. Three-arm performance plan unsubmitted.
+7093441 complete23:02, all8primary/all4rank0 captures local. Pull/two-load/four-load/
+four-load+poll net16.416/21.216/19.552/19.680us, full kernel means
+44.5589/49.3728/48.3733/48.3349us. Four-load helps but still loses both to pull;
+polling has no useful benefit established. All5 phase/all30ordinary samples kept.
+7093619 eight-load/field-prefetch comparison RUNNING8GPUs; first timings give small
+gains, remaining trials/profiles pending. Parent eight-load exact7093597 passed
+both models5:16. Max2active; no larger EP/full-model jobs or commits. Goal active.
+Completed7093123 (21:32), all8primary/all4capture triples local. Pull/full-wait/
+early-ready/paired net15.680/24.672/21.984/20.416us, full kernel means
+43.7493/53.6160/51.0229/49.3589us. Paired improves both versus prior push but
+STILL loses both to pull. All5 phase and30 ordinary samples retained. Goal active.
+
+Completed receiver7092404: pull/three-TMA/four-TMA/four-vector exposed net
+16.352/22.112/25.440/26.272us; full kernel means43.7963/55.6832/55.9712/55.8997us.
+Completed async7092547: pull/sync/async net15.392/25.280/24.576us; full kernel
+means44.1226/57.0197/55.3621us. All traces and raw samples collected locally;
+no push win on either target. Earlier store/poll7092173 also no win, with weak-
+only phase capture explicitly missing due to fixed launcher env leakage.
+All immutable experimental paths, validations, failures, results and next actions:
+[CODEX_PROJECT_qwen35_push_comm.md](CODEX_PROJECT_qwen35_push_comm.md).
+Root AGENTS.md absence already raised; handover read and deleted as directed.
+
+Recent full-attention/GDN work and accepted model-level results are separate:
+[CODEX_PROJECT_qwen35_full_attention.md](CODEX_PROJECT_qwen35_full_attention.md).
+The A32:F32/EP32/B40 GDN stream experiment7083416 measured22.372317/22.636225ms,
+FFN execution streams92→2; both metric-selected trace pairs are local. Preserve
+unrelated dirty runtime/model changes. Older checkpoints below are historical.
+
+## Accepted Qwen3.5 full-attention placement — September 11, 2026
+
+Attention workers now run only full attention; FFN workers own GDN/linear layers.
+Accepted accumulated scheduling/stream-reuse/push-dispatch candidate confirms
+A3:F1/EP16/128K maximumB40: same-allocation28.432393->26.791300ms (-5.771913%),
+1119.766491TPS/GPU,15samples/0outliers, unchanged metric gates. Measured transport
+uses DG_MEGAMOE_LAMPORT_DISPATCH=1; generic default0 retains TMA for other workloads.
+Final normal-routing A3/EP8/B7 alignment passes2856/2856 top10 (2853 top1), exact
+ordered token coverage verified. Jobs7077121/7078525/7078816 all COMPLETED0:0;
+no task GPU jobs remain. Cleaned source/memory synced with R/local-mirror; no commit
+or push requested. Details, source snapshots, traces and rejected experiments:
+CODEX_PROJECT_qwen35_full_attention.md and CODEX_PROJECT_qwen35_push_comm.md.
 
 ## Completed cleanup — September 10, 2026
 

@@ -19,7 +19,6 @@ from .config import ModelConfig
 from .qwen35_moe import (
     Qwen3_5FullAttention,
     Qwen3_5LinearAttention,
-    Qwen3_5MoeMLP,
     Qwen3_5SharedExpert,
     qwen35_shared_output,
 )
@@ -195,117 +194,9 @@ class Qwen3_5AfdExpertStage(BaseOP):
         return self.model.run_experts(layer_id, dispatch_output)
 
 
-class _Qwen3_5AttnOnlyAttentionLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        if config.layer_types[layer_id] == "linear_attention":
-            self.linear_attn = Qwen3_5LinearAttention(config, layer_id)
-
-
-class _Qwen3_5AttnOnlyAttentionInner(BaseOP):
-    def __init__(self, config: ModelConfig):
-        self.layers = OPList(
-            [
-                _Qwen3_5AttnOnlyAttentionLayer(config, layer_id)
-                for layer_id in range(config.num_layers)
-            ]
-        )
-
-
-class Qwen3_5AttnOnlyAttentionStage(BaseOP):
-    """Linear-attention weights retained by Qwen3.5 attention workers."""
-
-    def __init__(self, config: ModelConfig):
-        self.model = _Qwen3_5AttnOnlyAttentionInner(config)
-
-    def forward_linear(
-        self,
-        layer_id: int,
-        hidden_states: torch.Tensor,
-        *,
-        output: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        layer = self.model.layers.op_list[layer_id]
-        if not hasattr(layer, "linear_attn"):
-            raise RuntimeError(f"Qwen3.5 layer {layer_id} is not linear attention")
-        return layer.linear_attn.forward(hidden_states, output=output)
-
-
-class Qwen3_5AttnOnlyModelLayer(BaseOP):
-    """FFN-side layer without linear-attention weights."""
-
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.layer_type = config.layer_types[layer_id]
-        if self.layer_type == "full_attention":
-            self.self_attn = Qwen3_5FullAttention(config, layer_id)
-        self.mlp = Qwen3_5MoeMLP(config, layer_id)
-        self.input_layernorm = RMSNormOffsetFused(
-            config.hidden_size, config.rms_norm_eps
-        )
-        self.post_attention_layernorm = RMSNormOffsetFused(
-            config.hidden_size, config.rms_norm_eps
-        )
-        self._layer_id = layer_id
-
-    def prepare_attention(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.input_layernorm.forward(
-            hidden_states, residual
-        )
-        if self.layer_type == "linear_attention":
-            return hidden_states, residual
-        return self.self_attn.prepare_qkv(hidden_states), residual
-
-
-class _Qwen3_5AttnOnlyModelInner(BaseOP):
-    def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
-        self.layers = OPList(
-            [
-                Qwen3_5AttnOnlyModelLayer(config, layer_id)
-                for layer_id in range(config.num_layers)
-            ]
-        )
-        self.norm = RMSNormOffsetFused(config.hidden_size, config.rms_norm_eps)
-
-
-class Qwen3_5AttnOnlyForCausalLM(BaseOP):
-    """Qwen3.5 model-side stage for attention-only AFD placement."""
-
-    def __init__(self, config: ModelConfig):
-        self.model = _Qwen3_5AttnOnlyModelInner(config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            tie_word_embeddings=config.tie_word_embeddings,
-            tied_embedding=(
-                self.model.embed_tokens if config.tie_word_embeddings else None
-            ),
-        )
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_tokens.forward(input_ids)
-
-    def finalize_hidden(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.model.norm.forward(hidden_states, residual)[0]
-
-    def forward_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head.forward(hidden_states)
-
-
 __all__ = [
     "Qwen3_5AfdAGLayer",
     "Qwen3_5AfdDenseRouterForCausalLM",
     "Qwen3_5AfdExpertStage",
     "Qwen3_5AfdTopK",
-    "Qwen3_5AttnOnlyAttentionStage",
-    "Qwen3_5AttnOnlyForCausalLM",
 ]

@@ -470,18 +470,15 @@ class AfdCoordinator:
     def _recv_worker_inbox(self) -> list[AfdReply]:
         if self._worker_inbox is None:
             raise RuntimeError("Worker reply queue is not initialized")
-        start_ns = time.perf_counter_ns()
-        replies = self._drain_queue(
-            self._worker_inbox,
-            "AFD_Coordinator_RecvWorkerReply",
-        )
-        done_ns = time.perf_counter_ns()
-        recv_wall_ns = time.time_ns()
-        self._log_worker_reply_receives(
-            replies,
-            drain_ms=(done_ns - start_ns) / 1_000_000.0,
-            recv_wall_ns=recv_wall_ns,
-        )
+        profile = self._control_profile_start_step > 0 or self._control_profile_stop_step > 0
+        start_ns = time.perf_counter_ns() if profile else 0
+        replies = self._drain_queue(self._worker_inbox, "AFD_Coordinator_RecvWorkerReply")
+        if profile:
+            self._log_worker_reply_receives(
+                replies,
+                drain_ms=(time.perf_counter_ns() - start_ns) / 1_000_000,
+                recv_wall_ns=time.time_ns(),
+            )
         return replies
 
     def _log_worker_reply_receives(
@@ -952,14 +949,14 @@ class AfdCoordinator:
         else:
             kind = type(cmd).__name__
             step_id = -1
-        serialize_start_ns = time.perf_counter_ns()
+        serialize_start_ns = time.perf_counter_ns() if self._log_plan_send_groups else 0
         raw = serialize_zmq_payload(cmd, AfdCommand.encoder, "pickle")
-        serialize_done_ns = time.perf_counter_ns()
+        serialize_done_ns = time.perf_counter_ns() if self._log_plan_send_groups else 0
         put_start_ns = serialize_done_ns
         for worker_rank in worker_ranks:
             self._cmd_to_workers[int(worker_rank)].put_raw(raw)
-        put_done_ns = time.perf_counter_ns()
         if self._log_plan_send_groups:
+            put_done_ns = time.perf_counter_ns()
             log_line(
                 self.log_path,
                 f"[afd-coordinator] plan_send_group kind={kind} step_id={step_id} "
@@ -1044,17 +1041,20 @@ class AfdCoordinator:
         next_tokens: list[int],
         forward_remain: _AfdForwardRemain,
     ) -> list[int]:
+        req_count = len(batch.reqs)
+        if len(gens) != req_count or len(next_tokens) != req_count:
+            raise RuntimeError(
+                "AFD completion must cover every real request: "
+                f"requests={req_count} generations={len(gens)} tokens={len(next_tokens)}"
+            )
         if forward_remain.empty():
-            req_count = len(batch.reqs)
-            if len(next_tokens) == req_count:
-                return next_tokens
-            return [int(next_tokens[i]) if i < len(next_tokens) else 0 for i in range(req_count)]
+            return next_tokens
         valid_reqs: list[Req] = []
         valid_tokens: list[int] = []
-        for i, (req, generation) in enumerate(zip(batch.reqs, gens)):
+        for req, generation, token in zip(batch.reqs, gens, next_tokens, strict=True):
             if forward_remain.generation(int(req.table_idx)) == int(generation):
                 valid_reqs.append(req)
-                valid_tokens.append(int(next_tokens[i]) if i < len(next_tokens) else 0)
+                valid_tokens.append(int(token))
         if len(valid_reqs) != len(batch.reqs):
             batch.reqs = valid_reqs
         return valid_tokens
@@ -1066,19 +1066,14 @@ class AfdCoordinator:
         global_phase: str,
     ) -> tuple[int, list[_AfdDpLaunchBatch], str, int] | None:
         profile = self._profile_control_step(step_id)
-        total_start_ns = time.perf_counter_ns()
-        schedule_ns = 0
-        bucket_ns = 0
-        dummy_ns = 0
+        total_start_ns = time.perf_counter_ns() if profile else 0
         real_results: list[tuple[int, AfdModelPlan, Batch]] = []
         results_by_dp: dict[int, tuple[AfdModelPlan, Batch]] = {}
         with nvtx_range(
             nvtx_label("AFD_Coordinator_ScheduleDps", step=step_id, phase=global_phase)
         ):
             for dp, sched in enumerate(scheds):
-                sched_start_ns = time.perf_counter_ns()
                 result = sched.schedule_step(step_id, phase=global_phase)
-                schedule_ns += time.perf_counter_ns() - sched_start_ns
                 if result is None:
                     continue
                 model_plan, batch = result
@@ -1088,18 +1083,15 @@ class AfdCoordinator:
             if profile:
                 log_line(
                     self.log_path,
-                    f"[afd-control] prepare step_id={step_id} phase={global_phase} "
-                    f"empty=1 schedule_ms={schedule_ns / 1_000_000.0:.3f} "
-                    f"total_ms={(time.perf_counter_ns() - total_start_ns) / 1_000_000.0:.3f}",
+                    f"[afd-control] prepare step_id={step_id} phase={global_phase} empty=1 "
+                    f"total_ms={(time.perf_counter_ns() - total_start_ns) / 1_000_000:.3f}",
                 )
             return None
 
         with nvtx_range(
             nvtx_label("AFD_Coordinator_BuildDpLaunches", step=step_id, phase=global_phase)
         ):
-            bucket_start_ns = time.perf_counter_ns()
             bucket = max(self._afd_dispatch_bucket(mp) for _, mp, _ in real_results)
-            bucket_ns += time.perf_counter_ns() - bucket_start_ns
             dummy_padded_size = (
                 int(bucket)
                 if global_phase == "decode"
@@ -1110,12 +1102,10 @@ class AfdCoordinator:
                 result = results_by_dp.get(dp)
                 is_dummy = result is None
                 if result is None:
-                    dummy_start_ns = time.perf_counter_ns()
                     result = sched.dummy_decode_step(
                         step_id,
                         padded_size=dummy_padded_size,
                     )
-                    dummy_ns += time.perf_counter_ns() - dummy_start_ns
                 dp_batches.append(
                     _AfdDpLaunchBatch(
                         dp_rank=dp,
@@ -1131,16 +1121,12 @@ class AfdCoordinator:
                 f"within one collective step, got {sorted(num_mbs)}"
             )
         if profile:
-            total_ns = time.perf_counter_ns() - total_start_ns
             log_line(
                 self.log_path,
                 f"[afd-control] prepare step_id={step_id} phase={global_phase} "
                 f"real_dps={len(real_results)} dummy_dps={len(dp_batches) - len(real_results)} "
-                f"bucket={int(bucket)} num_mb={next(iter(num_mbs))} "
-                f"schedule_ms={schedule_ns / 1_000_000.0:.3f} "
-                f"bucket_ms={bucket_ns / 1_000_000.0:.3f} "
-                f"dummy_ms={dummy_ns / 1_000_000.0:.3f} "
-                f"total_ms={total_ns / 1_000_000.0:.3f}",
+                f"bucket={bucket} num_mb={next(iter(num_mbs))} "
+                f"total_ms={(time.perf_counter_ns() - total_start_ns) / 1_000_000:.3f}",
             )
         return bucket, dp_batches, str(global_phase), next(iter(num_mbs))
 
@@ -1158,40 +1144,22 @@ class AfdCoordinator:
         num_mb: int,
     ) -> list[tuple[int, Batch, tuple[int, ...]]]:
         profile = self._profile_control_step(step_id)
-        total_start_ns = time.perf_counter_ns()
-        ag_build_ns = 0
-        ag_send_ns = 0
-        state_ns = 0
-        eg_build_ns = 0
-        eg_send_ns = 0
-        use_graph_ns = 0
-        gens_ns = 0
-        step_log_ns = 0
-        rank_ns = 0
-        append_ns = 0
-        ag_loop_ns = 0
-        eg_loop_ns = 0
+        total_start_ns = time.perf_counter_ns() if profile else 0
         state_updates: list[tuple[int, Batch]] = []
-        use_graph_start_ns = time.perf_counter_ns()
         use_decode_graph = all(
             self._afd_use_decode_graph(item.model_plan, bucket)
             for item in dp_batches
         )
-        use_graph_ns = time.perf_counter_ns() - use_graph_start_ns
         items: list[tuple[int, Batch, tuple[int, ...]]] = []
         model_source_plans: dict[int, list[AfdAGStepPlan]] = {}
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchAG", step=step_id, phase=phase)):
-            ag_loop_start_ns = time.perf_counter_ns()
             for item in dp_batches:
                 dp = int(item.dp_rank)
                 batch = item.batch
-                gens_start_ns = time.perf_counter_ns()
                 gens = tuple(
                     forward_remains[dp].generation(int(req.table_idx))
                     for req in batch.reqs
                 )
-                gens_ns += time.perf_counter_ns() - gens_start_ns
-                step_log_start_ns = time.perf_counter_ns()
                 self._log_afd_step(
                     step_id=step_id,
                     dp_rank=dp,
@@ -1199,8 +1167,6 @@ class AfdCoordinator:
                     batch=batch,
                     is_dummy=item.is_dummy,
                 )
-                step_log_ns += time.perf_counter_ns() - step_log_start_ns
-                ag_build_start_ns = time.perf_counter_ns()
                 ag_plan = build_afd_ag_plan(
                     step_id,
                     item.model_plan,
@@ -1210,23 +1176,15 @@ class AfdCoordinator:
                     free_table_indices=pending_free[dp],
                     use_decode_graph=use_decode_graph,
                 )
-                ag_build_ns += time.perf_counter_ns() - ag_build_start_ns
-                rank_start_ns = time.perf_counter_ns()
                 ranks = tuple(range(dp * attn_tp, (dp + 1) * attn_tp))
-                rank_ns += time.perf_counter_ns() - rank_start_ns
-                ag_send_start_ns = time.perf_counter_ns()
                 self._send_cmd_to_workers(ranks, AfdRunAGStepCmd(plan=ag_plan))
-                ag_send_ns += time.perf_counter_ns() - ag_send_start_ns
                 if self.server_args.afd_model_placement == "attn-only":
                     mlp_dp = self._layout.mlp_dp_for_attn_dp(dp)
                     model_source_plans.setdefault(mlp_dp, []).append(ag_plan)
                 pending_free[dp] = ()
                 if not item.is_dummy:
                     state_updates.append((dp, batch))
-                append_start_ns = time.perf_counter_ns()
                 items.append((dp, batch, gens))
-                append_ns += time.perf_counter_ns() - append_start_ns
-            ag_loop_ns = time.perf_counter_ns() - ag_loop_start_ns
 
         if self.server_args.afd_model_placement == "attn-only":
             model_dispatch_bucket = (
@@ -1246,7 +1204,6 @@ class AfdCoordinator:
                     self._layout.mlp_worker_rank(mlp_dp, tp_rank)
                     for tp_rank in range(self._layout.mlp_tp_size)
                 )
-                model_send_start_ns = time.perf_counter_ns()
                 self._send_cmd_to_workers(
                     model_ranks,
                     AfdRunModelStepCmd(
@@ -1256,12 +1213,9 @@ class AfdCoordinator:
                         )
                     ),
                 )
-                eg_send_ns += time.perf_counter_ns() - model_send_start_ns
 
         with nvtx_range(nvtx_label("AFD_Coordinator_LaunchEG", step=step_id, phase=phase)):
-            eg_loop_start_ns = time.perf_counter_ns()
             if self.server_args.afd_model_placement != "attn-only":
-                eg_build_start_ns = time.perf_counter_ns()
                 eg_plan = AfdEGStepPlan(
                     step_id=step_id,
                     phase=phase,  # type: ignore[arg-type]
@@ -1269,57 +1223,25 @@ class AfdCoordinator:
                     num_mb=num_mb,
                     use_decode_graph=use_decode_graph,
                 )
-                eg_build_ns = time.perf_counter_ns() - eg_build_start_ns
-                eg_send_start_ns = time.perf_counter_ns()
                 self._send_cmd_to_workers(
                     self._afd_expert_worker_ranks,
                     AfdRunEGStepCmd(plan=eg_plan),
                 )
-                eg_send_ns = time.perf_counter_ns() - eg_send_start_ns
-            eg_loop_ns = time.perf_counter_ns() - eg_loop_start_ns
         if state_updates:
             with nvtx_range(
                 nvtx_label("AFD_Coordinator_PostLaunchState", step=step_id, phase=phase)
             ):
-                state_start_ns = time.perf_counter_ns()
                 for dp, batch in state_updates:
                     for req in batch.reqs:
                         req.complete_one()
                     scheds[dp].decode_manager.filter_reqs(batch.reqs)
-                state_ns += time.perf_counter_ns() - state_start_ns
         if profile:
-            total_ns = time.perf_counter_ns() - total_start_ns
-            tracked_ns = (
-                use_graph_ns
-                + gens_ns
-                + step_log_ns
-                + ag_build_ns
-                + rank_ns
-                + ag_send_ns
-                + state_ns
-                + append_ns
-                + eg_build_ns
-                + eg_send_ns
-            )
             log_line(
                 self.log_path,
                 f"[afd-control] launch step_id={step_id} phase={phase} "
-                f"dps={len(dp_batches)} bucket={int(bucket)} num_mb={int(num_mb)} "
-                f"use_graph={int(bool(use_decode_graph))} "
-                f"use_graph_ms={use_graph_ns / 1_000_000.0:.3f} "
-                f"ag_loop_ms={ag_loop_ns / 1_000_000.0:.3f} "
-                f"gens_ms={gens_ns / 1_000_000.0:.3f} "
-                f"step_log_ms={step_log_ns / 1_000_000.0:.3f} "
-                f"ag_build_ms={ag_build_ns / 1_000_000.0:.3f} "
-                f"rank_ms={rank_ns / 1_000_000.0:.3f} "
-                f"ag_send_ms={ag_send_ns / 1_000_000.0:.3f} "
-                f"state_ms={state_ns / 1_000_000.0:.3f} "
-                f"append_ms={append_ns / 1_000_000.0:.3f} "
-                f"eg_loop_ms={eg_loop_ns / 1_000_000.0:.3f} "
-                f"eg_build_ms={eg_build_ns / 1_000_000.0:.3f} "
-                f"eg_send_ms={eg_send_ns / 1_000_000.0:.3f} "
-                f"untracked_ms={(total_ns - tracked_ns) / 1_000_000.0:.3f} "
-                f"total_ms={total_ns / 1_000_000.0:.3f}",
+                f"dps={len(dp_batches)} bucket={bucket} num_mb={num_mb} "
+                f"use_graph={int(use_decode_graph)} "
+                f"total_ms={(time.perf_counter_ns() - total_start_ns) / 1_000_000:.3f}",
             )
         return items
 
@@ -1573,23 +1495,13 @@ class AfdCoordinator:
     def _afd_complete_global(self, pending_item, scheds, forward_remains, attn_tp):
         step_id, items = pending_item
         profile = self._profile_control_step(int(step_id))
-        total_start_ns = time.perf_counter_ns()
-        collect_start_ns = total_start_ns
+        total_start_ns = time.perf_counter_ns() if profile else 0
         active_dps = [dp for dp, _, _ in items]
         with nvtx_range(nvtx_label("AFD_Coordinator_CompleteCollect", step=step_id)):
             toks_by_dp = self._afd_collect_global(step_id, active_dps, attn_tp)
-        collect_done_ns = time.perf_counter_ns()
+        collect_ns = time.perf_counter_ns() - total_start_ns if profile else 0
 
         freed_by_dp = {}
-        filter_ms_sum = 0.0
-        complete_ms_sum = 0.0
-        send_ms_sum = 0.0
-        forget_ms_sum = 0.0
-        dp_total_ms_sum = 0.0
-        total_valid_tokens = 0
-        total_replies = 0
-        total_freed = 0
-        slowest_dp: tuple[int, float, int, int, int, int] | None = None
         # Accumulate all DP replies and send them once. Per-DP sends are pure
         # coordinator overhead in decode and scale poorly with attention DP.
         all_replies: list[DetokenizeMsg] = []
@@ -1598,24 +1510,18 @@ class AfdCoordinator:
         all_reply_finished: list[bool] = []
 
         for (dp, batch, gens) in items:
-            dp_start_ns = time.perf_counter_ns()
             next_tokens = toks_by_dp.get(dp, [])
             fr = forward_remains[dp]
-            filter_start_ns = dp_start_ns
             valid_tokens = self._afd_filter_valid_completion_tokens(
                 batch,
                 gens,
                 next_tokens,
                 fr,
             )
-            filter_done_ns = time.perf_counter_ns()
-            complete_start_ns = filter_done_ns
             with nvtx_range(
                 nvtx_label("AFD_Coordinator_CompleteResults", step=step_id, dp=dp)
             ):
                 completion = scheds[dp].complete_results(batch, valid_tokens)
-            complete_done_ns = time.perf_counter_ns()
-            send_start_ns = complete_done_ns
             if completion.reply_uids is not None:
                 compact_tokens = completion.reply_next_tokens
                 compact_finished = completion.reply_finished
@@ -1635,87 +1541,35 @@ class AfdCoordinator:
                 replies = list(completion.replies)
                 reply_count = len(replies)
                 all_replies.extend(replies)
-            send_done_ns = time.perf_counter_ns()
-            forget_start_ns = send_done_ns
             freed = tuple(completion.freed_table_indices)
             if freed:
                 fr.forget_tables(freed)
-            forget_done_ns = time.perf_counter_ns()
 
-            filter_ms = (filter_done_ns - filter_start_ns) / 1_000_000.0
-            complete_ms = (complete_done_ns - complete_start_ns) / 1_000_000.0
-            send_ms = (send_done_ns - send_start_ns) / 1_000_000.0
-            forget_ms = (forget_done_ns - forget_start_ns) / 1_000_000.0
-            dp_total_ms = (forget_done_ns - dp_start_ns) / 1_000_000.0
-            filter_ms_sum += filter_ms
-            complete_ms_sum += complete_ms
-            send_ms_sum += send_ms
-            forget_ms_sum += forget_ms
-            dp_total_ms_sum += dp_total_ms
-            total_valid_tokens += len(valid_tokens)
-            total_replies += reply_count
-            total_freed += len(freed)
-            if slowest_dp is None or dp_total_ms > slowest_dp[1]:
-                slowest_dp = (
-                    int(dp),
-                    float(dp_total_ms),
-                    int(len(next_tokens)),
-                    int(len(valid_tokens)),
-                    int(reply_count),
-                    int(len(freed)),
-                )
             if profile:
                 log_line(
                     self.log_path,
-                    f"[afd-coordinator] control_complete_dp "
-                    f"step_id={int(step_id)} dp={int(dp)} "
-                    f"batch_real={int(batch.size)} padded={len(batch.padded_reqs)} "
+                    f"[afd-coordinator] control_complete_dp step_id={step_id} dp={dp} "
+                    f"batch_real={batch.size} padded={len(batch.padded_reqs)} "
                     f"next_tokens={len(next_tokens)} valid_tokens={len(valid_tokens)} "
-                    f"replies={reply_count} freed={len(freed)} "
-                    f"filter_ms={filter_ms:.3f} "
-                    f"complete_results_ms={complete_ms:.3f} "
-                    f"send_result_ms={send_ms:.3f} "
-                    f"forget_ms={forget_ms:.3f} "
-                    f"total_ms={dp_total_ms:.3f}",
+                    f"replies={reply_count} freed={len(freed)}",
                 )
             freed_by_dp[dp] = freed
 
-        send_start_ns = time.perf_counter_ns()
         self.send_result(all_replies)
         self.send_detokenize_batch(
             all_reply_uids,
             all_reply_next_tokens,
             all_reply_finished,
         )
-        send_done_ns = time.perf_counter_ns()
-        send_result_ms = (send_done_ns - send_start_ns) / 1_000_000.0
-        send_ms_sum += send_result_ms
-        total_done_ns = time.perf_counter_ns()
         if profile:
-            slowest_text = ""
-            if slowest_dp is not None:
-                slowest_text = (
-                    f" slowest_dp={slowest_dp[0]} "
-                    f"slowest_dp_ms={slowest_dp[1]:.3f} "
-                    f"slowest_next_tokens={slowest_dp[2]} "
-                    f"slowest_valid_tokens={slowest_dp[3]} "
-                    f"slowest_replies={slowest_dp[4]} "
-                    f"slowest_freed={slowest_dp[5]}"
-                )
             log_line(
                 self.log_path,
-                f"[afd-coordinator] control_complete_global "
-                f"step_id={int(step_id)} active_dps={len(items)} attn_tp={int(attn_tp)} "
-                f"collect_ms={(collect_done_ns - collect_start_ns) / 1_000_000.0:.3f} "
-                f"filter_sum_ms={filter_ms_sum:.3f} "
-                f"complete_results_sum_ms={complete_ms_sum:.3f} "
-                f"send_result_sum_ms={send_ms_sum:.3f} "
-                f"forget_sum_ms={forget_ms_sum:.3f} "
-                f"dp_total_sum_ms={dp_total_ms_sum:.3f} "
-                f"total_valid_tokens={total_valid_tokens} "
-                f"total_replies={total_replies} "
-                f"total_freed={total_freed} "
-                f"total_ms={(total_done_ns - total_start_ns) / 1_000_000.0:.3f}"
-                f"{slowest_text}",
+                f"[afd-coordinator] control_complete_global step_id={step_id} "
+                f"active_dps={len(items)} attn_tp={attn_tp} "
+                f"collect_ms={collect_ns / 1_000_000:.3f} "
+                f"total_valid_tokens={sum(len(batch.reqs) for _, batch, _ in items)} "
+                f"total_replies={len(all_reply_uids) + len(all_replies)} "
+                f"total_freed={sum(map(len, freed_by_dp.values()))} "
+                f"total_ms={(time.perf_counter_ns() - total_start_ns) / 1_000_000:.3f}",
             )
         return freed_by_dp

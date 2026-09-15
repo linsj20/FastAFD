@@ -6,10 +6,7 @@ import torch
 
 from minisgl.distributed.info import DistributedInfo
 from minisgl.models.config import ModelConfig, RotaryConfig
-from minisgl.models.qwen35_moe_afd import (
-    Qwen3_5AttnOnlyAttentionStage,
-    Qwen3_5AttnOnlyForCausalLM,
-)
+from minisgl.models.qwen35_moe import Qwen3_5MoeForConditionalGeneration
 from minisgl.utils import torch_dtype
 
 
@@ -46,7 +43,7 @@ def _config() -> ModelConfig:
 
 
 class Qwen35AttnOnlyStructureTest(unittest.TestCase):
-    def test_linear_attention_weights_exist_only_on_attention_stage(self) -> None:
+    def test_linear_attention_weights_are_owned_by_model_stage(self) -> None:
         with (
             patch(
                 "minisgl.distributed.info._TP_INFO",
@@ -70,26 +67,22 @@ class Qwen35AttnOnlyStructureTest(unittest.TestCase):
             torch.device("meta"),
             torch_dtype(torch.bfloat16),
         ):
-            attention_keys = Qwen3_5AttnOnlyAttentionStage(_config()).state_dict()
-            model_keys = Qwen3_5AttnOnlyForCausalLM(_config()).state_dict()
+            model_keys = Qwen3_5MoeForConditionalGeneration(_config()).state_dict()
 
-        self.assertTrue(any(".linear_attn." in key for key in attention_keys))
+        self.assertTrue(any(".linear_attn." in key for key in model_keys))
         self.assertTrue(
-            any(".linear_attn.in_proj_qkvz.weight" in key for key in attention_keys)
+            any(".linear_attn.in_proj_qkvz.weight" in key for key in model_keys)
         )
         self.assertTrue(
-            any(".linear_attn.in_proj_ba.weight" in key for key in attention_keys)
+            any(".linear_attn.in_proj_ba.weight" in key for key in model_keys)
         )
         for old_projection in ("qkv", "z", "b", "a"):
             self.assertFalse(
                 any(
                     f".linear_attn.in_proj_{old_projection}.weight" in key
-                    for key in attention_keys
+                    for key in model_keys
                 )
             )
-        self.assertFalse(any(".self_attn." in key for key in attention_keys))
-        self.assertFalse(any(".mlp." in key for key in attention_keys))
-        self.assertFalse(any(".linear_attn." in key for key in model_keys))
         self.assertTrue(any(".self_attn.qkv_proj." in key for key in model_keys))
         self.assertTrue(any(".self_attn.o_proj." in key for key in model_keys))
         self.assertTrue(any(".mlp.experts." in key for key in model_keys))

@@ -22,8 +22,6 @@ from minisgl.kernel.afd_fmha_transport import (
     publish_qkv,
     quantize_publish_o_fp8,
     release_turn,
-    signal_direct_o,
-    signal_direct_o_release_turn,
     wait_ready,
     wait_turn,
 )
@@ -35,7 +33,6 @@ from minisgl.kernel.fabric_memory import (
 from minisgl.kernel.fp8_quant import fp8_quant_shared_gate
 from minisgl.kernel.qwen35_qkv_transport import (
     ensure_qwen35_qkv_transport_built,
-    publish_qwen35_linear_input,
     publish_qwen35_qkv,
     qwen35_shared_add_rmsnorm,
 )
@@ -79,9 +76,6 @@ class _FabricRecord:
     o_ready_shape: tuple[int, ...] = ()
     o_ready_offset: int = 0
     o_ready_writers: tuple[int, ...] = ()
-    linear_o_handle: bytes | None = None
-    linear_o_shape: tuple[int, ...] = ()
-    linear_o_offset: int = 0
     hybrid_o_handle: bytes | None = None
     hybrid_o_shape: tuple[int, ...] = ()
     hybrid_o_offset: int = 0
@@ -112,7 +106,6 @@ class _FmhaDecodeGraph:
     batch: Any
     next_tokens: torch.Tensor | None
     valid_token_counts: tuple[torch.Tensor, ...]
-    valid_token_counts_host: tuple[torch.Tensor, ...]
     valid_token_iota_host: np.ndarray
     attention_done_events: tuple[torch.cuda.Event, ...] = ()
     bootstrap_compute_events: tuple[torch.cuda.Event, ...] = ()
@@ -162,13 +155,6 @@ class AfdFmhaRuntime:
                 raise RuntimeError(
                     "Qwen3.5 hidden size must be divisible by attention head dim"
                 )
-        self.linear_payload_heads = (
-            int(self.model_config.hidden_size) // self.head_dim
-            if self.is_hybrid_attention
-            else 0
-        )
-        self._direct_linear_o_slots: torch.Tensor | None = None
-        self._direct_linear_o_source_index: int | None = None
         if worker.attn_dp_size < worker.mlp_dp_size:
             raise RuntimeError(
                 "FMHA-only placement requires at least as many attention DP lanes "
@@ -193,7 +179,7 @@ class AfdFmhaRuntime:
                 f"got --afd-num-mb {self.num_mb}"
             )
         self.transport_rounds_per_step = (
-            int(self.model_config.num_layers) * self.num_mb
+            len(self.remote_attention_layers) * self.num_mb
         )
         self.num_lanes = min(2, self.num_mb)
         self.transport_slots = 2
@@ -293,7 +279,7 @@ class AfdFmhaRuntime:
         else:
             self.model = None
             self.sampler = None
-            self._load_attention_model()
+            self.attention_model = None
         self._graph_pool = None
         self._decode_graphs: dict[tuple[int, int], _FmhaDecodeGraph] = {}
         self._graph_output_free: torch.cuda.Event | None = None
@@ -450,7 +436,6 @@ class AfdFmhaRuntime:
                 raise RuntimeError("FMHA-only attention state is missing fabric-owned KV")
             self.o_owner = None
             self.o_scale_owner = None
-            self.linear_o_owner = None
             self.hybrid_o_owner = None
             attention_handle = self.q_owner.handle
             if not (
@@ -509,40 +494,16 @@ class AfdFmhaRuntime:
                 ),
             ]
             if self.is_hybrid_attention:
-                allocation_specs.extend(
-                    (
-                        (
-                            (
-                                self.transport_slots,
-                                self.max_rows,
-                                self.linear_payload_heads,
-                                self.head_dim,
-                            ),
-                            torch.bfloat16,
-                        ),
-                        (
-                            (
-                                self.transport_slots,
-                                self.max_rows,
-                                self.table.model_local_q_heads,
-                                self.head_dim,
-                            ),
-                            torch.bfloat16,
-                        ),
-                    )
+                allocation_specs.append(
+                    ((self.transport_slots, self.max_rows,
+                      self.table.model_local_q_heads, self.head_dim), torch.bfloat16)
                 )
             allocations = allocate_fabric_tensors(tuple(allocation_specs))
             self.o_owner, self.o_scale_owner, self.o_ready_owner = allocations[:3]
-            self.linear_o_owner = allocations[3] if self.is_hybrid_attention else None
-            self.hybrid_o_owner = allocations[4] if self.is_hybrid_attention else None
+            self.hybrid_o_owner = allocations[3] if self.is_hybrid_attention else None
             self.o_slots = self.o_owner.tensor
             self.o_scale_slots = self.o_scale_owner.tensor
             self.o_ready = self.o_ready_owner.tensor
-            self.linear_o_slots = (
-                self.linear_o_owner.tensor
-                if self.linear_o_owner is not None
-                else None
-            )
             self.hybrid_o_slots = (
                 self.hybrid_o_owner.tensor
                 if self.hybrid_o_owner is not None
@@ -557,10 +518,6 @@ class AfdFmhaRuntime:
             if not (
                 self.o_owner.allocation is self.o_scale_owner.allocation
                 and self.o_owner.allocation is self.o_ready_owner.allocation
-                and (
-                    self.linear_o_owner is None
-                    or self.o_owner.allocation is self.linear_o_owner.allocation
-                )
                 and (
                     self.hybrid_o_owner is None
                     or self.o_owner.allocation is self.hybrid_o_owner.allocation
@@ -583,19 +540,6 @@ class AfdFmhaRuntime:
                 o_ready_shape=tuple(int(x) for x in self.o_ready.shape),
                 o_ready_offset=int(self.o_ready_owner.byte_offset),
                 o_ready_writers=o_ready_writers,
-                linear_o_handle=(
-                    model_handle if self.linear_o_owner is not None else None
-                ),
-                linear_o_shape=(
-                    tuple(int(x) for x in self.linear_o_slots.shape)
-                    if self.linear_o_slots is not None
-                    else ()
-                ),
-                linear_o_offset=(
-                    int(self.linear_o_owner.byte_offset)
-                    if self.linear_o_owner is not None
-                    else 0
-                ),
                 hybrid_o_handle=(
                     model_handle if self.hybrid_o_owner is not None else None
                 ),
@@ -643,11 +587,6 @@ class AfdFmhaRuntime:
             flush=True,
         )
         self.timeout_record = torch.zeros((2,), dtype=torch.int64, device=self.device)
-        self._attention_turn = (
-            torch.zeros((1,), dtype=torch.int64, device=self.device)
-            if self.role == "attention" and self._decode_lane_streams
-            else None
-        )
         # Qwen3.5 model-side ping-pong uses device-visible ownership instead of
         # captured CUDA events. Events make CUDA Graph split each physical lane
         # into a new execution stream at every handoff.
@@ -672,6 +611,16 @@ class AfdFmhaRuntime:
             if self._shared_expert_turns
             else None
         )
+        self._gdn_projection_sync = ()
+        if self._shared_expert_turns:
+            from .models.qwen35_moe import GdnProjectionSync
+
+            self._gdn_projection_sync = tuple(
+                GdnProjectionSync(
+                    self.device, self.timeout_record, self.timeout_ms, self.head_dim
+                )
+                for _ in self._shared_expert_turns
+            )
         self._shared_expert_norm_counters = (
             tuple(
                 torch.zeros((1,), dtype=torch.int32, device=self.device)
@@ -680,8 +629,10 @@ class AfdFmhaRuntime:
             if self._shared_expert_turns
             else ()
         )
+        # Construction-stream initialization must finish before lane streams
+        # read the timeout record or model/shared/GDN ownership counters.
         if (
-            self._attention_turn is not None
+            (self.role == "attention" and self._decode_lane_streams)
             or self._model_compute_turn is not None
             or self._shared_expert_turns
         ):
@@ -745,7 +696,6 @@ class AfdFmhaRuntime:
         worker = self.worker
         if self.role == "mlp":
             q_rows: list[list[int]] = []
-            linear_q_rows: list[list[int]] = []
             kv_rows: list[list[int]] = []
             q_ready_rows: list[list[int]] = []
             for source_index, attn_dp_rank in enumerate(
@@ -757,24 +707,18 @@ class AfdFmhaRuntime:
                     source_index=source_index,
                     include_q_ready=source_index == 0,
                     q_rows=q_rows,
-                    linear_q_rows=linear_q_rows,
                     kv_rows=kv_rows,
                     q_ready_rows=q_ready_rows,
                 )
             self.q_descriptors = self._descriptor_tensor(q_rows, 7)
-            self.linear_q_descriptors = self._descriptor_tensor(
-                linear_q_rows, 7
-            )
             self.kv_descriptors = self._descriptor_tensor(kv_rows, 8)
             self.q_ready_descriptors = self._descriptor_tensor(q_ready_rows, 3)
             self.o_descriptors = self._descriptor_tensor([], 10)
-            self.linear_o_descriptors = self._descriptor_tensor([], 7)
             self.hybrid_o_descriptors = self._descriptor_tensor([], 7)
             self.o_ready_descriptors = self._descriptor_tensor([], 3)
             return
 
         o_rows: list[list[int]] = []
-        linear_o_rows: list[list[int]] = []
         hybrid_o_rows: list[list[int]] = []
         o_ready_rows: list[list[int]] = []
         mlp_dp_rank = self.worker._topology.mlp_dp_for_attn_dp(
@@ -814,21 +758,7 @@ class AfdFmhaRuntime:
             )
         if self.is_hybrid_attention:
             record = self._record(records, "mlp", mlp_dp_rank, 0)
-            linear_mapping = self._import("linear_o", record)
             hybrid_mapping = self._import("hybrid_o", record)
-            self._direct_linear_o_slots = linear_mapping.tensor
-            self._direct_linear_o_source_index = source_index
-            linear_o_rows.append(
-                [
-                    int(linear_mapping.tensor.data_ptr()),
-                    0,
-                    0,
-                    self.linear_payload_heads,
-                    self.linear_payload_heads,
-                    int(record.linear_o_shape[1]),
-                    source_index,
-                ]
-            )
             hybrid_o_rows.append(
                 [
                     int(hybrid_mapping.tensor.data_ptr()),
@@ -859,45 +789,11 @@ class AfdFmhaRuntime:
                 )
             )
         self.q_descriptors = self._descriptor_tensor([], 7)
-        self.linear_q_descriptors = self._descriptor_tensor([], 7)
         self.kv_descriptors = self._descriptor_tensor([], 8)
         self.q_ready_descriptors = self._descriptor_tensor([], 3)
         self.o_descriptors = self._descriptor_tensor(o_rows, 10)
-        self.linear_o_descriptors = self._descriptor_tensor(linear_o_rows, 7)
         self.hybrid_o_descriptors = self._descriptor_tensor(hybrid_o_rows, 7)
         self.o_ready_descriptors = self._descriptor_tensor(o_ready_rows, 3)
-
-    def _direct_linear_o_output(
-        self, batch: Any, *, epoch: int
-    ) -> torch.Tensor:
-        if not self.is_hybrid_attention or batch.phase != "decode":
-            raise RuntimeError(
-                "direct linear O output requires Qwen3.5 decode"
-            )
-        slots = self._direct_linear_o_slots
-        source_index = self._direct_linear_o_source_index
-        if slots is None or source_index is None:
-            raise RuntimeError("direct linear O symmetric mapping is missing")
-        rows = int(batch.positions.numel())
-        source_start = int(source_index) * rows
-        source_end = source_start + rows
-        if source_end > int(slots.shape[1]):
-            raise RuntimeError(
-                "direct linear O source partition exceeds symmetric capacity: "
-                f"source={source_index} rows={rows} capacity={slots.shape[1]}"
-            )
-        output = slots[
-            int(epoch) % self.transport_slots,
-            source_start:source_end,
-        ].reshape(rows, -1)
-        if not output.is_contiguous() or int(output.shape[1]) != int(
-            self.model_config.hidden_size
-        ):
-            raise RuntimeError(
-                "direct linear O destination must be contiguous hidden state: "
-                f"shape={tuple(output.shape)} stride={output.stride()}"
-            )
-        return output
 
     def _append_model_input_descriptors(
         self,
@@ -907,7 +803,6 @@ class AfdFmhaRuntime:
         source_index: int,
         include_q_ready: bool,
         q_rows: list[list[int]],
-        linear_q_rows: list[list[int]],
         kv_rows: list[list[int]],
         q_ready_rows: list[list[int]],
     ) -> None:
@@ -935,20 +830,6 @@ class AfdFmhaRuntime:
                 gate_descriptor[1] += self.table.model_local_q_heads
                 gate_descriptor[2] += self.table.attn_local_q_heads
                 q_rows.append(gate_descriptor)
-        if self.is_hybrid_attention:
-            record = self._record(records, "attention", int(attn_dp_rank), 0)
-            mapping = self._import("q", record)
-            linear_q_rows.append(
-                [
-                    int(mapping.tensor.data_ptr()),
-                    0,
-                    0,
-                    self.linear_payload_heads,
-                    self.table.attn_local_q_heads * self.q_transport_multiplier,
-                    int(record.q_shape[1]),
-                    int(source_index),
-                ]
-            )
         for head_slice in self.table.kv_slices:
             if head_slice.source_tp_rank != int(worker.tp_rank):
                 continue
@@ -996,13 +877,13 @@ class AfdFmhaRuntime:
     def _init_model_materializer_namespaces(self) -> None:
         runtime = self.worker.runtime
         total_table_slots = int(self.config.max_running_req) + 1
-        attn_dp_size = int(self.worker.attn_dp_size)
-        if total_table_slots % attn_dp_size:
+        fanin_capacity = int(self.fanin_capacity)
+        if total_table_slots % fanin_capacity:
             raise RuntimeError(
                 "FMHA-only model table capacity cannot be partitioned by attention DP: "
-                f"slots={total_table_slots} attn_dp={attn_dp_size}"
+                f"slots={total_table_slots} fanin_capacity={fanin_capacity}"
             )
-        self._table_namespace_stride = total_table_slots // attn_dp_size
+        self._table_namespace_stride = total_table_slots // fanin_capacity
         if self._table_namespace_stride < 2:
             raise RuntimeError(
                 "FMHA-only attention table namespace has no real request slot: "
@@ -1054,7 +935,7 @@ class AfdFmhaRuntime:
 
     def _namespace_model_plan(self, plan: Any, attn_dp_rank: int) -> Any:
         stride = int(self._table_namespace_stride)
-        base = int(attn_dp_rank) * stride
+        base = self._mapped_attn_dp_ranks.index(int(attn_dp_rank)) * stride
 
         def table_index(local_index: int) -> int:
             local_index = int(local_index)
@@ -1215,14 +1096,14 @@ class AfdFmhaRuntime:
         from minisgl.engine.sample import Sampler
         from minisgl.models import load_weight
         from minisgl.models.qwen3_moe import Qwen3MoeForCausalLM
-        from minisgl.models.qwen35_moe_afd import Qwen3_5AttnOnlyForCausalLM
+        from minisgl.models.qwen35_moe import Qwen3_5MoeForConditionalGeneration
         from minisgl.layers import set_rope_device
 
         architectures = tuple(getattr(self.model_config, "architectures", ()))
         if "Qwen3MoeForCausalLM" in architectures:
             model_type = Qwen3MoeForCausalLM
         elif "Qwen3_5MoeForConditionalGeneration" in architectures:
-            model_type = Qwen3_5AttnOnlyForCausalLM
+            model_type = Qwen3_5MoeForConditionalGeneration
         else:
             raise RuntimeError(
                 "attention-only placement supports Qwen3 and Qwen3.5 MoE, "
@@ -1260,23 +1141,6 @@ class AfdFmhaRuntime:
             experts.gate_up_proj_scale = None
             experts.down_proj = None
             experts.down_proj_scale = None
-
-    def _load_attention_model(self) -> None:
-        self.attention_model = None
-        if not self.is_hybrid_attention:
-            return
-        from minisgl.layers import set_rope_device
-        from minisgl.models import load_weight
-        from minisgl.models.qwen35_moe_afd import Qwen3_5AttnOnlyAttentionStage
-
-        set_rope_device(self.device)
-        with torch.device("meta"), torch_dtype(self.config.dtype):
-            model = Qwen3_5AttnOnlyAttentionStage(self.model_config)
-        weights = self._load_selected_weights(
-            model, load_weight, skip_expert_weights=True
-        )
-        model.load_state_dict(weights)
-        self.attention_model = model
 
     def _load_selected_weights(
         self,
@@ -1332,14 +1196,6 @@ class AfdFmhaRuntime:
         batch = self._build_capture_batch(per_mb_bs)
         ctx = self.state.ctx
         full_layer = self.remote_attention_layers[0]
-        linear_layer = next(
-            (
-                layer_id
-                for layer_id, layer_type in enumerate(self.model_config.layer_types)
-                if layer_type == "linear_attention"
-            ),
-            None,
-        )
         for mb, sub in enumerate(batch.afd_mb_subbatches):
             stream = (
                 self._decode_lane_streams[mb % self.num_lanes]
@@ -1364,19 +1220,6 @@ class AfdFmhaRuntime:
                     torch.cuda.stream(stream),
                     ctx.forward_batch(sub),
                 ):
-                    if linear_layer is not None:
-                        if self.attention_model is None:
-                            raise RuntimeError(
-                                "Qwen3.5 linear-attention stage is not loaded"
-                            )
-                        linear_input = torch.zeros(
-                            (per_mb_bs, int(self.model_config.hidden_size)),
-                            dtype=self.config.dtype,
-                            device=self.device,
-                        )
-                        self.attention_model.forward_linear(
-                            linear_layer, linear_input
-                        )
                     o = backend.forward_prepared(q, full_layer, sub)
                     if not self.is_hybrid_attention:
                         self._quantize_attention_o(o.view(per_mb_bs, -1))
@@ -1436,12 +1279,11 @@ class AfdFmhaRuntime:
                         representative_layers.append(self.remote_attention_layers[0])
                     for layer_id in dict.fromkeys(representative_layers):
                         layer = layers[layer_id]
-                        _payload, residual = layer.prepare_attention(
-                            embedded, None
-                        )
                         if self.model_config.layer_types[layer_id] == "linear_attention":
-                            hidden = torch.zeros_like(embedded)
+                            normalized, residual = layer.input_layernorm.forward(embedded, None)
+                            hidden = layer.linear_attn.forward(normalized)
                         else:
+                            _payload, residual = layer.prepare_attention(embedded, None)
                             o = torch.zeros(
                                 (
                                     merged_per_mb_bs,
@@ -1804,7 +1646,7 @@ class AfdFmhaRuntime:
                 "FMHA-only placement requires both attention and model decode graphs"
             )
         captured: list[int] = []
-        rounds_per_step = int(self.model_config.num_layers) * self.num_mb
+        rounds_per_step = len(self.remote_attention_layers) * self.num_mb
         slot_bases = tuple(
             sorted(
                 {
@@ -1942,7 +1784,7 @@ class AfdFmhaRuntime:
         attention_done_events = (
             tuple(
                 torch.cuda.Event(enable_timing=False, external=False)
-                for _ in range(int(self.model_config.num_layers) * self.num_mb)
+                for _ in range(len(self.remote_attention_layers) * self.num_mb)
             )
             if self.role == "attention" and self._decode_lane_streams
             else ()
@@ -2002,7 +1844,6 @@ class AfdFmhaRuntime:
             batch=batch,
             next_tokens=output[0],
             valid_token_counts=valid_token_counts,
-            valid_token_counts_host=valid_token_counts_host,
             valid_token_iota_host=np.arange(merged_rows, dtype=np.int64),
             bootstrap_compute_events=bootstrap_compute_events,
             compute_done_events=compute_done_events,
@@ -2019,7 +1860,7 @@ class AfdFmhaRuntime:
             f"captured total_bs={bs} per_mb_bs={int(per_mb_bs)} "
             f"num_mb={self.num_mb} slot_base={slot_base} "
             f"main_streams={len(self._decode_lane_streams)} "
-            f"attention_sync={'graph_edges' if attention_done_events else 'device_turn'} "
+            f"attention_sync={'graph_edges' if attention_done_events else 'none'} "
             f"model_sync={'device_turn' if self._model_compute_turn is not None else 'events'} "
             f"graph_root={'mb0' if self._decode_lane_streams else 'engine'} "
             f"schedule={schedule}",
@@ -2037,17 +1878,12 @@ class AfdFmhaRuntime:
         ctx = self.state.ctx
         subs = self._microbatches(batch)
         self._validate_lane_streams(lane_streams)
-        num_layers = int(self.model_config.num_layers)
+        num_layers = len(self.remote_attention_layers)
         total_rounds = num_layers * self.num_mb
-        if attention_done_events and (
-            not lane_streams or len(attention_done_events) != total_rounds
+        if bool(lane_streams) != bool(attention_done_events) or (
+            attention_done_events and len(attention_done_events) != total_rounds
         ):
             raise RuntimeError("attention event grid requires lanes and one event per attention round")
-        attention_turn = (
-            self._attention_turn if lane_streams and not attention_done_events else None
-        )
-        if lane_streams and not attention_done_events and attention_turn is None:
-            raise RuntimeError("FMHA-only pipelined attention is missing its device turn")
 
         # MB2 prearms both Q waits. More logical microbatches share the two
         # lanes and must wait inline to avoid blocking earlier work on a lane.
@@ -2058,12 +1894,10 @@ class AfdFmhaRuntime:
                     self._wait_attention_q(
                         sub,
                         epoch=int(slot_base) + mb,
-                        turn=attention_turn,
-                        expected_turn=mb if attention_turn is not None else None,
                     )
-        for layer in range(num_layers):
+        for remote_index, layer in enumerate(self.remote_attention_layers):
             for mb, sub in enumerate(subs):
-                index = layer * self.num_mb + mb
+                index = remote_index * self.num_mb + mb
                 epoch = int(slot_base) + index
                 lane = lane_streams[mb % len(lane_streams)] if lane_streams else None
                 with torch.cuda.stream(lane) if lane is not None else nullcontext():
@@ -2083,13 +1917,7 @@ class AfdFmhaRuntime:
                                 epoch=epoch,
                                 lane_stream=lane,
                                 q_wait_already_enqueued=prearm or bool(attention_done_events),
-                                enqueue_next_q_wait=prearm and layer + 1 < num_layers,
-                                attention_turn=attention_turn,
-                                expected_turn=index if attention_turn is not None else None,
-                                next_turn=(
-                                    (index + 1) % total_rounds
-                                    if attention_turn is not None else None
-                                ),
+                                enqueue_next_q_wait=prearm and remote_index + 1 < num_layers,
                                 attention_done_event=(
                                     attention_done_events[index] if attention_done_events else None
                                 ),
@@ -2128,6 +1956,73 @@ class AfdFmhaRuntime:
                 f"offsets={token_offsets} rows={int(batch.positions.numel())}"
             )
         return list(subs)
+
+    def _normalize_model_input(self, norm, hidden, residual, shared, shared_gate):
+        if shared is None:
+            return norm.forward(hidden, residual)
+        if residual is None:
+            raise RuntimeError("deferred shared output requires a residual")
+        qwen35_shared_add_rmsnorm(
+            hidden, shared, residual, norm.weight, norm.eps, shared_gate=shared_gate
+        )
+        return hidden, residual
+
+    def _finalize_model_hidden(self, hidden, residual, shared, shared_gate, *, stream=None):
+        if shared is None:
+            return self.model.finalize_hidden(hidden, residual)
+        if stream is not None:
+            shared.record_stream(stream)
+            if shared_gate is not None:
+                shared_gate.record_stream(stream)
+        hidden, _ = self._normalize_model_input(
+            self.model.model.norm, hidden, residual, shared, shared_gate
+        )
+        return hidden
+
+    def _finish_model_layer(
+        self, layer_id, layer, hidden, residual, *, lane, shared_stream=None
+    ):
+        hidden, residual = layer.post_attention_layernorm.forward(hidden, residual)
+        shared_input_fp8 = shared_gate_scale = ready_turn = done_turn = None
+        if shared_stream is not None:
+            ready_turn = self._shared_expert_turns[lane]
+            done_turn = self._shared_expert_final_turn
+            shared_input, shared_scale, shared_gate_scale = fp8_quant_shared_gate(
+                hidden, layer.mlp.shared_expert_gate.weight,
+                completion_counter=self._shared_expert_norm_counters[lane],
+                release_turn=ready_turn, next_turn=1,
+            )
+            shared_input_fp8 = (shared_input, shared_scale)
+        hidden, shared, shared_gate = self._run_model_moe(
+            layer_id, layer, hidden, lane=lane, shared_stream=shared_stream,
+            shared_ready_turn=ready_turn, shared_final_done_turn=done_turn,
+            shared_input_fp8=shared_input_fp8, shared_gate_scale=shared_gate_scale,
+        )
+        if done_turn is not None:
+            wait_turn(
+                done_turn, self.timeout_record, timeout_ms=self.timeout_ms,
+                expected_turn=1, next_turn=0, head_dim=self.head_dim,
+            )
+        return hidden, residual, shared, shared_gate
+
+    def _run_local_model_layers(
+        self, layers, start, stop, hidden, residual, shared, shared_gate, *, lane,
+        shared_stream=None
+    ):
+        """Execute the local interval between two remote full-attention calls."""
+        for layer_id in range(start, stop):
+            layer = layers[layer_id]
+            hidden, residual = self._normalize_model_input(
+                layer.input_layernorm, hidden, residual, shared, shared_gate
+            )
+            hidden = layer.linear_attn.forward(
+                hidden, projection_stream=shared_stream,
+                projection_sync=self._gdn_projection_sync[lane] if shared_stream is not None else None,
+            )
+            hidden, residual, shared, shared_gate = self._finish_model_layer(
+                layer_id, layer, hidden, residual, lane=lane, shared_stream=shared_stream
+            )
+        return hidden, residual, shared, shared_gate
 
     def _run_model_forward(
         self,
@@ -2224,49 +2119,27 @@ class AfdFmhaRuntime:
         pending_shared: list[torch.Tensor | None] = [None] * self.num_mb
         pending_shared_gate: list[torch.Tensor | None] = [None] * self.num_mb
 
-        def publish_layer_qkv(layer_id: int, mb: int) -> None:
+        def publish_layer_qkv(remote_index: int, mb: int) -> None:
+            layer_id = self.remote_attention_layers[remote_index]
             layer = layers[layer_id]
             sub = subs[mb]
+            start = self.remote_attention_layers[remote_index - 1] + 1 if remote_index else 0
             with self._tp_lane_context(mb), ctx.forward_batch(sub):
-                if (
-                    getattr(self, "is_hybrid_attention", False)
-                    and self.model_config.layer_types[layer_id]
-                    == "linear_attention"
-                ):
-                    residual[mb] = self.publish_qwen35_linear_attention_input(
-                        hidden[mb],
-                        residual[mb],
-                        sub,
-                        shared=pending_shared[mb],
-                        shared_gate=pending_shared_gate[mb],
-                        layer=layer_id,
-                        epoch=int(slot_base) + layer_id * self.num_mb + mb,
+                ctx.moe_num_token_non_padded = real_token_counts[mb]
+                ctx.moe_deepep_dispatch_max_tokens_per_rank = int(dispatch_bucket)
+                hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                    self._run_local_model_layers(
+                        layers, start, layer_id, hidden[mb], residual[mb],
+                        pending_shared[mb], pending_shared_gate[mb], lane=mb % self.num_lanes,
                     )
-                    pending_shared[mb] = None
-                    pending_shared_gate[mb] = None
-                    return
-                if pending_shared[mb] is not None:
-                    if residual[mb] is None:
-                        raise RuntimeError(
-                            "Qwen3.5 deferred shared output requires a residual"
-                        )
-                    norm = layer.input_layernorm
-                    qwen35_shared_add_rmsnorm(
-                        hidden[mb],
-                        pending_shared[mb],
-                        residual[mb],
-                        norm.weight,
-                        norm.eps,
-                        shared_gate=pending_shared_gate[mb],
-                    )
-                    pending_shared[mb] = None
-                    pending_shared_gate[mb] = None
-                    qkv = layer.self_attn.prepare_qkv(hidden[mb])
-                else:
-                    qkv, residual[mb] = layer.prepare_attention(
-                        hidden[mb], residual[mb]
-                    )
-                epoch = int(slot_base) + layer_id * self.num_mb + mb
+                )
+                hidden[mb], residual[mb] = self._normalize_model_input(
+                    layer.input_layernorm, hidden[mb], residual[mb],
+                    pending_shared[mb], pending_shared_gate[mb],
+                )
+                pending_shared[mb] = pending_shared_gate[mb] = None
+                qkv = layer.self_attn.prepare_qkv(hidden[mb])
+                epoch = int(slot_base) + remote_index * self.num_mb + mb
                 self.publish_model_qkv(qkv, sub, layer=layer_id, epoch=epoch)
 
         # Eager prefill shares the same two transport slots as decode. Keep at
@@ -2276,13 +2149,14 @@ class AfdFmhaRuntime:
         # logical microbatch counts roll over the same two slots without
         # overwriting an in-flight payload.
         window = min(2, self.num_mb)
-        total_rounds = len(layers) * self.num_mb
+        total_rounds = len(self.remote_attention_layers) * self.num_mb
         for round_index in range(min(window, total_rounds)):
             layer_id, mb = divmod(round_index, self.num_mb)
             publish_layer_qkv(layer_id, mb)
 
         for round_index in range(total_rounds):
-            layer_id, mb = divmod(round_index, self.num_mb)
+            remote_index, mb = divmod(round_index, self.num_mb)
+            layer_id = self.remote_attention_layers[remote_index]
             layer = layers[layer_id]
             sub = subs[mb]
             epoch = int(slot_base) + round_index
@@ -2300,23 +2174,18 @@ class AfdFmhaRuntime:
                     hidden[mb] = self._finish_model_attention(
                         layer_id, layer, output, output_scale
                     )
-                    hidden[mb], residual[mb] = (
-                        layer.post_attention_layernorm.forward(
-                            hidden[mb], residual[mb]
-                        )
-                    )
                     if getattr(self, "_mega_moe", None) is not None:
-                        (
-                            hidden[mb],
-                            pending_shared[mb],
-                            pending_shared_gate[mb],
-                        ) = self._run_model_moe(
-                            layer_id, layer, hidden[mb], lane=mb % self.num_lanes
+                        hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                            self._finish_model_layer(
+                                layer_id, layer, hidden[mb], residual[mb], lane=mb % self.num_lanes
+                            )
                         )
                     else:
+                        hidden[mb], residual[mb] = layer.post_attention_layernorm.forward(
+                            hidden[mb], residual[mb]
+                        )
                         hidden[mb] = layer.mlp.forward(hidden[mb])
-                        pending_shared[mb] = None
-                        pending_shared_gate[mb] = None
+                        pending_shared[mb] = pending_shared_gate[mb] = None
                 next_round = round_index + window
                 if next_round < total_rounds:
                     next_layer_id, next_mb = divmod(next_round, self.num_mb)
@@ -2327,25 +2196,17 @@ class AfdFmhaRuntime:
         finals = []
         for mb, sub in enumerate(subs):
             with self._tp_lane_context(mb), ctx.forward_batch(sub):
-                if pending_shared[mb] is not None:
-                    if residual[mb] is None:
-                        raise RuntimeError(
-                            "Qwen3.5 final deferred shared output requires a residual"
-                        )
-                    norm = self.model.model.norm
-                    qwen35_shared_add_rmsnorm(
-                        hidden[mb],
-                        pending_shared[mb],
-                        residual[mb],
-                        norm.weight,
-                        norm.eps,
-                        shared_gate=pending_shared_gate[mb],
+                ctx.moe_num_token_non_padded = real_token_counts[mb]
+                hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                    self._run_local_model_layers(
+                        layers, self.remote_attention_layers[-1] + 1, len(layers),
+                        hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb],
+                        lane=mb % self.num_lanes,
                     )
-                    finals.append(hidden[mb])
-                else:
-                    finals.append(
-                        self.model.finalize_hidden(hidden[mb], residual[mb])
-                    )
+                )
+                finals.append(self._finalize_model_hidden(
+                    hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb]
+                ))
         return finals[0] if self.num_mb == 1 else torch.cat(finals, dim=0)
 
     def _run_model_forward_ping_pong(
@@ -2362,7 +2223,7 @@ class AfdFmhaRuntime:
         bootstrap_compute_events: tuple[torch.cuda.Event, ...],
         compute_done_events: tuple[tuple[torch.cuda.Event, ...], ...],
     ) -> torch.Tensor:
-        '''Alternate exclusive FFN(L-1)+QKV/RoPE(L) compute units.'''
+        """Overlap each remote FMHA with the peer lane's local layer interval."""
         ctx = self.state.ctx
         num_lanes = len(lane_streams)
         moe_buffers = getattr(self, '_moe_buffers', ())
@@ -2385,21 +2246,6 @@ class AfdFmhaRuntime:
             if model_compute_turn is not None
             else ()
         )
-        shared_expert_final_turn = (
-            getattr(self, "_shared_expert_final_turn", None)
-            if shared_expert_turns
-            else None
-        )
-        shared_expert_norm_counters = (
-            getattr(self, "_shared_expert_norm_counters", ())
-            if shared_expert_turns
-            else ()
-        )
-        if shared_expert_turns and len(shared_expert_norm_counters) != num_lanes:
-            raise RuntimeError(
-                "Qwen3.5 shared-expert norm counters do not match FFN lanes"
-            )
-
         @contextmanager
         def lane_context(mb: int, lane: int):
             previous_buffer = getattr(ctx, 'mlp_deepep_buffer', None)
@@ -2421,7 +2267,8 @@ class AfdFmhaRuntime:
             round_index: int,
             handoff_event: torch.cuda.Event | None = None,
         ) -> None:
-            layer_id, mb = divmod(round_index, self.num_mb)
+            remote_index, mb = divmod(round_index, self.num_mb)
+            layer_id = self.remote_attention_layers[remote_index]
             lane = round_index % num_lanes
             layer = layers[layer_id]
             sub = subs[mb]
@@ -2430,7 +2277,7 @@ class AfdFmhaRuntime:
             publication_turn = model_compute_turn
             publication_next_turn = 1 - lane if model_compute_turn is not None else None
             with lane_context(mb, lane):
-                if layer_id == 0 and hidden[mb] is None:
+                if hidden[mb] is None:
                     hidden[mb] = self.model.embed_input_ids(
                         batch.input_ids[
                             token_offsets[mb] : token_offsets[mb + 1]
@@ -2440,48 +2287,20 @@ class AfdFmhaRuntime:
                     raise RuntimeError(
                         f'FMHA-only round {round_index} has no hidden state'
                     )
-                if (
-                    getattr(self, "is_hybrid_attention", False)
-                    and self.model_config.layer_types[layer_id]
-                    == "linear_attention"
-                ):
-                    if handoff_event is not None:
-                        handoff_event.record(lane_stream)
-                    residual[mb] = self.publish_qwen35_linear_attention_input(
-                        hidden[mb],
-                        residual[mb],
-                        sub,
-                        shared=pending_shared[mb],
-                        shared_gate=pending_shared_gate[mb],
-                        release_turn=publication_turn,
-                        next_turn=publication_next_turn,
-                        layer=layer_id,
-                        epoch=epoch,
+                start = self.remote_attention_layers[remote_index - 1] + 1 if remote_index else 0
+                hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                    self._run_local_model_layers(
+                        layers, start, layer_id, hidden[mb], residual[mb],
+                        pending_shared[mb], pending_shared_gate[mb], lane=lane,
+                        shared_stream=lane_streams[1 - lane] if shared_expert_turns else None,
                     )
-                    pending_shared[mb] = None
-                    pending_shared_gate[mb] = None
-                    return
-                if pending_shared[mb] is not None:
-                    if residual[mb] is None:
-                        raise RuntimeError(
-                            "Qwen3.5 deferred shared output requires a residual"
-                        )
-                    norm = layer.input_layernorm
-                    qwen35_shared_add_rmsnorm(
-                        hidden[mb],
-                        pending_shared[mb],
-                        residual[mb],
-                        norm.weight,
-                        norm.eps,
-                        shared_gate=pending_shared_gate[mb],
-                    )
-                    pending_shared[mb] = None
-                    pending_shared_gate[mb] = None
-                    qkv = layer.self_attn.prepare_qkv(hidden[mb])
-                else:
-                    qkv, residual[mb] = layer.prepare_attention(
-                        hidden[mb], residual[mb]
-                    )
+                )
+                hidden[mb], residual[mb] = self._normalize_model_input(
+                    layer.input_layernorm, hidden[mb], residual[mb],
+                    pending_shared[mb], pending_shared_gate[mb],
+                )
+                pending_shared[mb] = pending_shared_gate[mb] = None
+                qkv = layer.self_attn.prepare_qkv(hidden[mb])
                 if self.is_hybrid_attention:
                     if handoff_event is not None:
                         handoff_event.record(lane_stream)
@@ -2507,7 +2326,7 @@ class AfdFmhaRuntime:
                     epoch=epoch,
                 )
 
-        total_rounds = len(layers) * self.num_mb
+        total_rounds = len(self.remote_attention_layers) * self.num_mb
         window = min(num_lanes, total_rounds)
 
         # Bootstrap the two transport slots. Only QKV publication may overlap
@@ -2542,7 +2361,8 @@ class AfdFmhaRuntime:
             else None
         )
         for round_index in range(total_rounds):
-            layer_id, mb = divmod(round_index, self.num_mb)
+            remote_index, mb = divmod(round_index, self.num_mb)
+            layer_id = self.remote_attention_layers[remote_index]
             lane = round_index % num_lanes
             layer = layers[layer_id]
             sub = subs[mb]
@@ -2567,64 +2387,11 @@ class AfdFmhaRuntime:
                 hidden[mb] = self._finish_model_attention(
                     layer_id, layer, output, output_scale
                 )
-                shared_input_fp8 = None
-                shared_gate_scale = None
-                if shared_expert_turns:
-                    if residual[mb] is None:
-                        raise RuntimeError(
-                            "Qwen3.5 shared-input preparation requires an "
-                            "attention residual"
-                        )
-                    hidden[mb], residual[mb] = (
-                        layer.post_attention_layernorm.forward(
-                            hidden[mb], residual[mb]
-                        )
+                hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                    self._finish_model_layer(
+                        layer_id, layer, hidden[mb], residual[mb], lane=lane,
+                        shared_stream=lane_streams[1 - lane] if shared_expert_turns else None,
                     )
-                    (
-                        shared_input,
-                        shared_input_scale,
-                        shared_gate_scale,
-                    ) = fp8_quant_shared_gate(
-                        hidden[mb],
-                        layer.mlp.shared_expert_gate.weight,
-                        completion_counter=shared_expert_norm_counters[lane],
-                        release_turn=shared_expert_turns[lane],
-                        next_turn=1,
-                    )
-                    shared_input_fp8 = (shared_input, shared_input_scale)
-                else:
-                    hidden[mb], residual[mb] = (
-                        layer.post_attention_layernorm.forward(
-                            hidden[mb], residual[mb]
-                        )
-                    )
-                (
-                    hidden[mb],
-                    pending_shared[mb],
-                    pending_shared_gate[mb],
-                ) = self._run_model_moe(
-                    layer_id,
-                    layer,
-                    hidden[mb],
-                    lane=lane,
-                    shared_stream=(
-                        lane_streams[1 - lane]
-                        if shared_expert_turns
-                        else None
-                    ),
-                    shared_ready_turn=(
-                        shared_expert_turns[lane]
-                        if shared_expert_turns
-                        else None
-                    ),
-                    shared_final_done_turn=(
-                        shared_expert_final_turn
-                        if shared_expert_turns
-                        and round_index + 1 == total_rounds
-                        else None
-                    ),
-                    shared_input_fp8=shared_input_fp8,
-                    shared_gate_scale=shared_gate_scale,
                 )
 
             next_round = round_index + window
@@ -2635,6 +2402,14 @@ class AfdFmhaRuntime:
                     )
                 prepare_and_publish_qkv(next_round, compute_done_event)
             else:
+                with lane_context(mb, lane):
+                    hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb] = (
+                        self._run_local_model_layers(
+                            layers, layer_id + 1, len(layers), hidden[mb], residual[mb],
+                            pending_shared[mb], pending_shared_gate[mb], lane=lane,
+                            shared_stream=lane_streams[1 - lane] if shared_expert_turns else None,
+                        )
+                    )
                 if model_compute_turn is not None:
                     with torch.cuda.stream(lane_stream):
                         release_turn(
@@ -2653,44 +2428,16 @@ class AfdFmhaRuntime:
         final_stream = lane_streams[(total_rounds - 1) % num_lanes]
         finals = []
         with torch.cuda.stream(final_stream):
-            if shared_expert_final_turn is not None:
-                wait_turn(
-                    shared_expert_final_turn,
-                    self.timeout_record,
-                    timeout_ms=self.timeout_ms,
-                    expected_turn=1,
-                    next_turn=0,
-                    head_dim=self.head_dim,
-                )
             for mb in range(self.num_mb):
                 with self._tp_lane_context(mb), ctx.forward_batch(subs[mb]):
                     if hidden[mb] is None:
                         raise RuntimeError(
                             f'FMHA-only microbatch {mb} has no final hidden state'
                         )
-                    if pending_shared[mb] is not None:
-                        if residual[mb] is None:
-                            raise RuntimeError(
-                                "Qwen3.5 final deferred shared output requires "
-                                "a residual"
-                            )
-                        norm = self.model.model.norm
-                        pending_shared[mb].record_stream(final_stream)
-                        if pending_shared_gate[mb] is not None:
-                            pending_shared_gate[mb].record_stream(final_stream)
-                        qwen35_shared_add_rmsnorm(
-                            hidden[mb],
-                            pending_shared[mb],
-                            residual[mb],
-                            norm.weight,
-                            norm.eps,
-                            shared_gate=pending_shared_gate[mb],
-                        )
-                        finals.append(hidden[mb])
-                    else:
-                        finals.append(
-                            self.model.finalize_hidden(hidden[mb], residual[mb])
-                        )
+                    finals.append(self._finalize_model_hidden(
+                        hidden[mb], residual[mb], pending_shared[mb], pending_shared_gate[mb],
+                        stream=final_stream,
+                    ))
             result = finals[0] if self.num_mb == 1 else torch.cat(finals, dim=0)
         root_stream = lane_streams[0]
         if final_stream is not root_stream:
@@ -2780,12 +2527,16 @@ class AfdFmhaRuntime:
                 int(value) for value in plan.microbatch_token_offsets
             ),
         )
-        if not (
-            len(entry.valid_token_counts)
-            == len(entry.valid_token_counts_host)
-            == len(valid_counts)
-        ):
+        if len(entry.valid_token_counts) != len(valid_counts):
             raise RuntimeError("decode graph is missing per-microbatch token counts")
+        # A later CPU enqueue can precede an earlier pinned H2D copy. Each
+        # in-flight batch owns its immutable host bytes until its done event;
+        # the captured device addresses remain stable across replays.
+        host_counts = tuple(
+            torch.empty(count.shape, dtype=torch.int64, pin_memory=True)
+            for count in entry.valid_token_counts
+        )
+        batch.afd_fmha_valid_token_counts_host = host_counts
         capture_subs = self._microbatches(entry.batch)
         real_subs = self._microbatches(batch)
         for mb, (capture_sub, real_sub) in enumerate(
@@ -2813,7 +2564,7 @@ class AfdFmhaRuntime:
             # incorrectly masks real rows after the first source's padding.
             # Prepare row validity and compact route IDs on CPU, reusing the
             # existing graph-stable H2D copy. No source division on the GPU.
-            host_count = entry.valid_token_counts_host[mb]
+            host_count = host_counts[mb]
             device_count = entry.valid_token_counts[mb]
             source_count = len(plan.source_plans)
             expected_size = 1 if source_count == 1 else real_offsets[-1] + 1
@@ -2866,7 +2617,7 @@ class AfdFmhaRuntime:
             raise RuntimeError("FMHA-only captured sampling currently requires greedy decoding")
         bs = int(batch.positions.numel())
         slot_base = (
-            int(plan.step_id) * int(self.model_config.num_layers) * self.num_mb
+            int(plan.step_id) * len(self.remote_attention_layers) * self.num_mb
         ) % self.transport_slots
         entry = self._decode_graphs.get((bs, slot_base))
         if entry is None:
@@ -2895,34 +2646,6 @@ class AfdFmhaRuntime:
         layer: int,
         epoch: int,
     ) -> None:
-        if self.model_config.layer_types[layer] == "linear_attention":
-            if release_turn is not None or next_turn is not None:
-                raise RuntimeError(
-                    "generic linear-attention publication cannot release an FFN turn"
-                )
-            source_offsets = batch.afd_fmha_source_token_offsets_device
-            if source_offsets is None:
-                raise RuntimeError(
-                    "linear-attention publication requires source offsets"
-                )
-            slot = epoch % self.transport_slots
-            empty = qkv.new_empty((int(qkv.shape[0]), 0))
-            publish_qkv(
-                qkv,
-                empty,
-                empty,
-                batch.out_loc,
-                source_offsets,
-                self.linear_q_descriptors,
-                self.kv_descriptors[:0],
-                self.q_ready_descriptors,
-                self.q_publish_counters[slot : slot + 1],
-                layer=0,
-                slot=slot,
-                head_dim=self.head_dim,
-                ready_value=epoch + 1,
-            )
-            return
         if self.is_hybrid_attention:
             self.publish_qwen35_full_attention_qkv(
                 qkv,
@@ -2992,55 +2715,6 @@ class AfdFmhaRuntime:
             eps=attention.q_norm.eps,
         )
 
-    def publish_qwen35_linear_attention_input(
-        self,
-        hidden: torch.Tensor,
-        residual: torch.Tensor | None,
-        batch: Any,
-        *,
-        shared: torch.Tensor | None = None,
-        shared_gate: torch.Tensor | None = None,
-        release_turn: torch.Tensor | None = None,
-        next_turn: int | None = None,
-        layer: int,
-        epoch: int,
-    ) -> torch.Tensor:
-        if (
-            not self.is_hybrid_attention
-            or self.model_config.layer_types[layer] != "linear_attention"
-        ):
-            raise RuntimeError(
-                "fused Qwen3.5 linear-input publication requires a hybrid "
-                "linear-attention layer"
-            )
-        source_offsets_device = batch.afd_fmha_source_token_offsets_device
-        if source_offsets_device is None:
-            raise RuntimeError(
-                "Qwen3.5 linear-input publication requires capture-owned or "
-                "eager source offsets"
-            )
-        norm = self.model.model.layers.op_list[layer].input_layernorm
-        slot = epoch % self.transport_slots
-        publish_qwen35_linear_input(
-            hidden,
-            residual,
-            norm.weight,
-            source_offsets_device,
-            self.linear_q_descriptors,
-            self.q_ready_descriptors,
-            self.q_publish_counters[slot : slot + 1],
-            shared=shared,
-            shared_gate=shared_gate,
-            release_turn=release_turn,
-            next_turn=next_turn,
-            slot=slot,
-            ready_value=epoch + 1,
-            eps=norm.eps,
-        )
-        # The first layer's residual is the original hidden tensor. Later
-        # layers update their existing residual in place inside the publisher.
-        return hidden if residual is None else residual
-
     def prepare_model_qkv(
         self,
         qkv: torch.Tensor,
@@ -3100,8 +2774,6 @@ class AfdFmhaRuntime:
         batch: Any,
         *,
         epoch: int,
-        turn: torch.Tensor | None = None,
-        expected_turn: int | None = None,
     ) -> torch.Tensor:
         rows = int(batch.positions.numel())
         if rows > self.max_rows:
@@ -3114,8 +2786,6 @@ class AfdFmhaRuntime:
             timeout_ms=self.timeout_ms,
             head_dim=self.head_dim,
             expected_ready=epoch + 1,
-            turn=turn,
-            expected_turn=expected_turn,
         )
         return q_slot
 
@@ -3128,28 +2798,13 @@ class AfdFmhaRuntime:
         lane_stream: torch.cuda.Stream | None = None,
         q_wait_already_enqueued: bool = False,
         enqueue_next_q_wait: bool = False,
-        attention_turn: torch.Tensor | None = None,
-        expected_turn: int | None = None,
-        next_turn: int | None = None,
         attention_done_event: torch.cuda.Event | None = None,
     ) -> None:
-        ticketed = any(
-            value is not None
-            for value in (attention_turn, expected_turn, next_turn)
-        )
         event_handoff = attention_done_event is not None
-        if event_handoff and (lane_stream is None or ticketed):
-            raise RuntimeError("attention event handoff requires an owning lane without device turns")
-        if not event_handoff and (q_wait_already_enqueued or enqueue_next_q_wait or ticketed) and (
-            lane_stream is None
-            or attention_turn is None
-            or expected_turn is None
-            or next_turn is None
-        ):
-            raise RuntimeError(
-                "attention Q prewaits require one owning lane stream and a "
-                "complete device-turn handoff"
-            )
+        if (lane_stream is not None) != event_handoff:
+            raise RuntimeError("attention event handoff requires one owning lane stream")
+        if (q_wait_already_enqueued or enqueue_next_q_wait) and not event_handoff:
+            raise RuntimeError("attention Q prewaits require an event handoff")
         rows = int(batch.positions.numel())
         if rows > self.max_rows:
             raise RuntimeError(f"AFD Q rows {rows} exceed slot capacity {self.max_rows}")
@@ -3162,79 +2817,7 @@ class AfdFmhaRuntime:
             q_slot = self._wait_attention_q(
                 batch,
                 epoch=epoch,
-                turn=attention_turn,
-                expected_turn=expected_turn,
             )
-        if self.model_config.layer_types[layer] == "linear_attention":
-            if self.attention_model is None:
-                raise RuntimeError("Qwen3.5 linear-attention stage is not loaded")
-            linear_input = q_slot.view(rows, -1)[
-                :, : int(self.model_config.hidden_size)
-            ]
-            direct_output = (
-                self._direct_linear_o_output(batch, epoch=epoch)
-                if (attention_turn is not None or event_handoff) and batch.phase == "decode"
-                else None
-            )
-            o = self.attention_model.forward_linear(
-                layer,
-                linear_input,
-                output=direct_output,
-            )
-            if attention_done_event is not None:
-                attention_done_event.record(lane_stream)
-            if direct_output is not None:
-                if int(o.data_ptr()) != int(direct_output.data_ptr()):
-                    raise RuntimeError(
-                        "Qwen3.5 linear attention did not preserve its direct "
-                        "symmetric output"
-                    )
-                if event_handoff:
-                    # GDN writes the peer's symmetric O slot directly. The
-                    # graph event releases local compute; this signal still
-                    # orders remote visibility before the FFN consumes O.
-                    signal_direct_o(
-                        self.o_ready_descriptors,
-                        slot=slot,
-                        head_dim=self.head_dim,
-                        ready_value=epoch + 1,
-                    )
-                else:
-                    assert next_turn is not None
-                    signal_direct_o_release_turn(
-                        self.o_ready_descriptors,
-                        attention_turn,
-                        slot=slot,
-                        next_turn=next_turn,
-                        head_dim=self.head_dim,
-                        ready_value=epoch + 1,
-                    )
-            else:
-                if attention_turn is not None:
-                    release_turn(
-                        attention_turn,
-                        next_turn=next_turn,
-                        head_dim=self.head_dim,
-                    )
-                publish_o(
-                    o,
-                    self.linear_o_descriptors,
-                    self.o_ready_descriptors,
-                    self.o_publish_counters[slot : slot + 1],
-                    slot=slot,
-                    destination_source_stride=destination_source_stride,
-                    head_dim=self.head_dim,
-                    ready_value=epoch + 1,
-                )
-            if enqueue_next_q_wait:
-                assert event_handoff or expected_turn is not None
-                self._wait_attention_q(
-                    batch,
-                    epoch=epoch + self.num_mb,
-                    turn=attention_turn,
-                    expected_turn=(None if event_handoff else expected_turn + self.num_mb),
-                )
-            return
         if self.q_transport_multiplier == 2:
             q_slot, gate = q_slot.chunk(2, dim=1)
         else:
@@ -3244,10 +2827,6 @@ class AfdFmhaRuntime:
             attention_done_event.record(lane_stream)
         o = o.view(rows, -1).contiguous()
         gate = gate.view(rows, -1) if gate is not None else None
-        if attention_turn is not None:
-            # Release compute before publishing O; remote readiness still orders
-            # the model's consumption of the complete output.
-            release_turn(attention_turn, next_turn=next_turn, head_dim=self.head_dim)
         if self.is_hybrid_attention:
             publish_o(
                 o,
@@ -3276,12 +2855,9 @@ class AfdFmhaRuntime:
                 ready_value=epoch + 1,
             )
         if enqueue_next_q_wait:
-            assert event_handoff or expected_turn is not None
             self._wait_attention_q(
                 batch,
                 epoch=epoch + self.num_mb,
-                turn=attention_turn,
-                expected_turn=(None if event_handoff else expected_turn + self.num_mb),
             )
 
     def receive_attention_o(
@@ -3322,19 +2898,10 @@ class AfdFmhaRuntime:
             expected_turn=expected_turn,
         )
         if self.is_hybrid_attention:
-            if self.linear_o_slots is None or self.hybrid_o_slots is None:
+            slots = self.hybrid_o_slots
+            if slots is None:
                 raise RuntimeError("Qwen3.5 BF16 attention output arena is missing")
-            if layer is None:
-                raise RuntimeError("Qwen3.5 BF16 attention receive requires a layer")
-            linear_layer = (
-                self.model_config.layer_types[layer] == "linear_attention"
-            )
-            slots = self.linear_o_slots if linear_layer else self.hybrid_o_slots
-            payload_heads = (
-                self.linear_payload_heads
-                if linear_layer
-                else self.table.model_local_q_heads
-            )
+            payload_heads = self.table.model_local_q_heads
             if batch.phase == "decode":
                 return (
                     slots[slot, :rows].reshape(rows, -1),
@@ -3419,10 +2986,6 @@ class AfdFmhaRuntime:
         output: torch.Tensor,
         output_scale: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.model_config.layer_types[layer_id] == "linear_attention":
-            if output_scale is not None:
-                raise RuntimeError("linear-attention output must be BF16")
-            return output
         if output_scale is None:
             if not self.is_hybrid_attention:
                 raise RuntimeError("full-attention output is missing FP8 scales")
@@ -3651,6 +3214,7 @@ class AfdFmhaRuntime:
             sub.input_ids = batch.input_ids[start:end]
             sub.positions = batch.positions[start:end]
             sub.out_loc = batch.out_loc[start:end]
+            sub.state_indices = batch.state_indices[start:end]
 
         batch.afd_sampling_plan = plan.sampling
         self._attach_model_fanin_sampling(
@@ -3704,6 +3268,9 @@ class AfdFmhaRuntime:
             sub.out_loc = self._cat_tensors(
                 tuple(source_sub.out_loc for source_sub in source_subs)
             )
+            sub.state_indices = self._cat_tensors(
+                tuple(source_sub.state_indices for source_sub in source_subs)
+            )
             sub.afd_fmha_source_token_offsets = tuple(source_offsets)
             # Decode replay uses the immutable source-offset tensor owned by
             # the captured batch. Creating a fresh device tensor here forces a
@@ -3732,6 +3299,7 @@ class AfdFmhaRuntime:
         batch.input_ids = self._cat_tensors(tuple(sub.input_ids for sub in merged_subs))
         batch.positions = self._cat_tensors(tuple(sub.positions for sub in merged_subs))
         batch.out_loc = self._cat_tensors(tuple(sub.out_loc for sub in merged_subs))
+        batch.state_indices = self._cat_tensors(tuple(sub.state_indices for sub in merged_subs))
         batch.afd_microbatch_offsets = tuple(request_offsets)
         batch.afd_microbatch_token_offsets = tuple(token_offsets)
         batch.afd_mb_subbatches = merged_subs
@@ -3811,7 +3379,7 @@ class AfdFmhaRuntime:
         with torch.cuda.stream(self.state.stream):
             self._run_attention_body(
                 batch,
-                int(plan.step_id) * int(self.model_config.num_layers) * self.num_mb,
+                int(plan.step_id) * len(self.remote_attention_layers) * self.num_mb,
             )
 
     def _run_model_step(self, batch: Any, plan: Any) -> torch.Tensor:
@@ -3821,7 +3389,7 @@ class AfdFmhaRuntime:
                 batch,
                 slot_base=(
                     int(plan.step_id)
-                    * int(self.model_config.num_layers)
+                    * len(self.remote_attention_layers)
                     * self.num_mb
                 ),
                 real_token_counts=tuple(

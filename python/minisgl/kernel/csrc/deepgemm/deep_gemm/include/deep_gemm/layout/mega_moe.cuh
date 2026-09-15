@@ -39,9 +39,11 @@ struct TokenSrcMetadata {
 
 struct Workspace {
     void* base;
+    uint32_t metadata_slot = 0;
     uint32_t num_ranks, num_experts;
     uint32_t num_experts_per_rank;
     uint32_t num_max_tokens_per_rank;
+    uint32_t num_topk;
     uint32_t num_max_recv_tokens_per_expert;
 
     // Pool capacity: all local experts share a contiguous token pool
@@ -59,11 +61,45 @@ struct Workspace {
               const uint32_t& num_topk):
         base(base),
         num_ranks(num_ranks), num_experts(num_experts),
-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
+        num_max_tokens_per_rank(num_max_tokens_per_rank), num_topk(num_topk) {
         num_experts_per_rank = num_experts / num_ranks;
         num_max_recv_tokens_per_expert = num_ranks * num_max_tokens_per_rank;
         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
         num_max_pool_blocks = num_max_pool_tokens / kMinCandidateBlockM;
+#if defined(__CUDA_ARCH__)
+        metadata_slot = *reinterpret_cast<volatile uint32_t*>(get_nvl_barrier_counter_ptr()) & 1u;
+#endif
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_source_frame_bytes(uint32_t hidden) const {
+        return math::align<uint64_t>(static_cast<uint64_t>(hidden) + hidden / 32 +
+                                     static_cast<uint64_t>(num_topk) * sizeof(float), 128);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_compact_l1_num_tokens(uint32_t hidden) const {
+        const uint64_t bytes = 2ull * num_ranks * num_max_tokens_per_rank * get_source_frame_bytes(hidden);
+        const uint64_t source_rows = math::ceil_div<uint64_t>(bytes, hidden);
+        return source_rows > num_max_pool_tokens ? source_rows : num_max_pool_tokens;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_source_l1_row(uint32_t source_rank, uint32_t source_token) const {
+        return (static_cast<uint64_t>(metadata_slot) * num_ranks + source_rank) *
+               num_max_tokens_per_rank + source_token;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_source_l1_row(uint32_t linear_source_token) const {
+        return static_cast<uint64_t>(metadata_slot) * num_ranks *
+               num_max_tokens_per_rank + linear_source_token;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_compact_frame_base_ptr(uint32_t hidden, uint32_t topk) const {
+        return math::advance_ptr(get_end_ptr(), static_cast<uint64_t>(num_max_tokens_per_rank) *
+            (hidden + hidden / 32 + topk * (sizeof(int64_t) + sizeof(float))));
     }
 
     CUTLASS_HOST_DEVICE
@@ -78,6 +114,9 @@ struct Workspace {
 
         // Per-expert-rank combine readiness epoch
         num_bytes += num_ranks * sizeof(uint64_t);
+
+        // Reserved padding preserves the validated metadata and payload offsets.
+        num_bytes += num_ranks * 2 * sizeof(uint64_t);
 
         // Expert send/recv count
         num_bytes += num_experts * sizeof(uint64_t) * 2;
@@ -97,9 +136,12 @@ struct Workspace {
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
-        // Align to TMA descriptor requirements
-        num_bytes = math::align<uint64_t>(num_bytes, 16);
-        return num_bytes;
+        return math::align<uint64_t>(num_bytes + get_metadata_bank_bytes(), 128);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_metadata_bank_bytes() const {
+        return (1ull + 3ull * num_ranks + 2ull * num_experts + num_experts_per_rank) * sizeof(uint64_t);
     }
 
     CUTLASS_HOST_DEVICE
@@ -140,7 +182,8 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint64_t* get_route_ready_count_ptr() const {
-        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes);
+        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes +
+            metadata_slot * get_metadata_bank_bytes());
     }
 
     CUTLASS_DEVICE
@@ -150,7 +193,7 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
-        return get_combine_ready_epoch_ptr(num_ranks) + expert_idx;
+        return get_combine_ready_epoch_ptr(num_ranks) + num_ranks * 2 + expert_idx;
     }
 
     CUTLASS_DEVICE
@@ -166,8 +209,9 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
-        return reinterpret_cast<uint32_t*>(base) + pool_block_idx;
+        auto* counts = math::advance_ptr<uint32_t>(base,
+            kNumBarrierSignalBytes + 2 * get_metadata_bank_bytes());
+        return counts + pool_block_idx;
     }
 
     CUTLASS_DEVICE

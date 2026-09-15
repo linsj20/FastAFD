@@ -81,6 +81,17 @@ class AfdModelState:
         self.ctx = Context(config.page_size)
         self.ctx.server_args = config
         self.ctx.replica_id = int(getattr(config, "dp_rank", 0))
+        from minisgl.kvcache import create_hybrid_gdn_state_pool
+
+        self.ctx.gdn_state_pool = create_hybrid_gdn_state_pool(
+            config.model_config,
+            max_slots=config.max_running_req + 1,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if config.afd_perf_mode and self.ctx.gdn_state_pool is not None:
+            self.ctx.gdn_state_pool.conv_state.uniform_(-0.01, 0.01)
+            self.ctx.gdn_state_pool.recurrent_state.uniform_(-0.01, 0.01)
         set_global_ctx(self.ctx)
         # EG must mirror the AG page allocator exactly because it computes the
         # direct-write K/V locations.  The common capacity is only known after
@@ -498,10 +509,7 @@ class AfdExpertWorker(BaseAfdWorker):
                     start = int(handle.next_token_offsets[source_index])
                     end = int(handle.next_token_offsets[source_index + 1])
                     tokens = (
-                        [
-                            int(token)
-                            for token in handle.next_tokens_cpu[start:end].tolist()
-                        ]
+                        handle.next_tokens_cpu[start:end].tolist()
                         if self.tp_rank == 0
                         else []
                     )

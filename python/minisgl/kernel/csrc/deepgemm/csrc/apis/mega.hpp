@@ -20,7 +20,8 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
-    const bool& use_fp8_dispatch, const std::string& activation) {
+    const bool& use_fp8_dispatch, const std::string& activation,
+    const bool& inband_combine, const bool& compact_push) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
 
     // Workspace bytes
@@ -60,9 +61,12 @@ get_symm_buffer_size_for_mega_moe(
         );
     }
 
+    const auto l1_rows = compact_push ? workspace.get_compact_l1_num_tokens(hidden) : num_max_pool_tokens;
+    DG_HOST_ASSERT(l1_rows <= 0x7fffffffull);
+
     // L1 input buffer
     const auto l1_token_buffer = layout::Buffer(
-        fp8_token_layout, 1, num_max_pool_tokens,
+        fp8_token_layout, 1, static_cast<int>(l1_rows),
         input_topk_weights_buffer.get_end_ptr());
     const auto l1_sf_buffer = layout::Buffer(
         fp8_sf_layout, 1, num_max_padded_sf_pool_tokens,
@@ -81,7 +85,9 @@ get_symm_buffer_size_for_mega_moe(
 
     // Combine input buffer: BF16 tokens for cross-rank combine
     const auto combine_token_buffer = layout::Buffer(
-        bf16_token_layout, num_topk, num_max_tokens_per_rank,
+        bf16_token_layout,
+        num_topk * (inband_combine ? 2 : 1),
+        num_max_tokens_per_rank,
         l2_sf_buffer.get_end_ptr());
 
     // Check SF buffer requirements
@@ -109,7 +115,7 @@ get_symm_buffer_size_for_mega_moe(
             torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         auto l1_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_max_pool_tokens, hidden},
+            {static_cast<int64_t>(l1_rows), hidden},
             torch::TensorOptions().dtype(torch::kFloat8_e4m3fn).device(buffer.device()));
         auto l1_acts_sf = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_sf_buffer.base)),
@@ -148,6 +154,7 @@ static void fp8_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push,
     const bool& use_fp8_weights
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
@@ -194,6 +201,8 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
     DG_HOST_ASSERT(not route_ready_dispatch or routes_prepared);
     DG_HOST_ASSERT(not rank_ready_route_publish or route_ready_dispatch);
+    DG_HOST_ASSERT(not inband_combine or (rank_gated_combine and rank_ready_route_publish));
+    DG_HOST_ASSERT(not compact_push or (routes_prepared and rank_ready_route_publish));
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -222,7 +231,7 @@ static void fp8_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation);
+        true, activation, inband_combine, compact_push);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -248,7 +257,7 @@ static void fp8_mega_moe(
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
                                routes_prepared, rank_gated_combine,
-                               route_ready_dispatch, rank_ready_route_publish);
+                               route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -276,13 +285,15 @@ static void fp8_fp4_mega_moe(
     const bool& routes_prepared,
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
-    const bool& rank_ready_route_publish) {
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
                  recipe, activation, activation_clamp, fast_math, debug_timings,
                  routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
+                 inband_combine, compact_push,
                  /* use_fp8_weights */ false);
 }
 
@@ -303,13 +314,15 @@ static void fp8_fp8_mega_moe(
     const bool& routes_prepared,
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
-    const bool& rank_ready_route_publish) {
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& compact_push) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
                  recipe, activation, activation_clamp, fast_math, debug_timings,
                  routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
+                 inband_combine, compact_push,
                  /* use_fp8_weights */ true);
 }
 

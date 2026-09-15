@@ -17,11 +17,8 @@ def _jit_module(head_dim: int):
         cuda_wrappers=[
             (name, f"AfdFmhaTransportKernel<{args}>::{name}")
             for name in (
-                "publish_qkv", "publish_o", "publish_o_release_turn",
-                "publish_o_fp8", "publish_o_fp8_release_turn",
-                "quantize_publish_o_fp8", "quantize_publish_o_fp8_release_turn",
-                "wait_turn", "release_turn", "signal_direct_o",
-                "signal_direct_o_release_turn", "wait_ready", "wait_ready_turn",
+                "publish_qkv", "publish_o", "quantize_publish_o_fp8",
+                "wait_turn", "release_turn", "wait_ready", "wait_ready_turn",
             )
         ],
     )
@@ -104,107 +101,6 @@ def publish_o(
     )
 
 
-def publish_o_release_turn(
-    o: torch.Tensor,
-    descriptors: torch.Tensor,
-    ready_descriptors: torch.Tensor,
-    completion_counter: torch.Tensor,
-    turn: torch.Tensor,
-    *,
-    gate: torch.Tensor | None = None,
-    slot: int,
-    destination_source_stride: int,
-    next_turn: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    _validate_bf16_rows("o", o, head_dim)
-    gate_input = o if gate is None else gate
-    _validate_bf16_rows("gate", gate_input, head_dim)
-    if gate_input.shape != o.shape:
-        raise ValueError(
-            f"AFD O gate shape {tuple(gate_input.shape)} does not match "
-            f"payload shape {tuple(o.shape)}"
-        )
-    _validate_completion_counter(completion_counter)
-    _validate_turn(turn, next_turn)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).publish_o_release_turn(
-        o,
-        gate_input,
-        descriptors,
-        ready_descriptors,
-        completion_counter,
-        turn,
-        int(slot),
-        int(destination_source_stride),
-        int(next_turn),
-        int(ready_value),
-        int(gate is not None),
-    )
-
-
-def publish_o_fp8(
-    o: torch.Tensor,
-    scales: torch.Tensor,
-    descriptors: torch.Tensor,
-    ready_descriptors: torch.Tensor,
-    completion_counter: torch.Tensor,
-    *,
-    slot: int,
-    destination_source_stride: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    _validate_fp8_rows("o", o, head_dim)
-    _validate_packed_scales(scales, o.shape[0], o.shape[1], head_dim)
-    _validate_completion_counter(completion_counter)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).publish_o_fp8(
-        o,
-        scales,
-        descriptors,
-        ready_descriptors,
-        completion_counter,
-        int(slot),
-        int(destination_source_stride),
-        int(ready_value),
-    )
-
-
-def publish_o_fp8_release_turn(
-    o: torch.Tensor,
-    scales: torch.Tensor,
-    descriptors: torch.Tensor,
-    ready_descriptors: torch.Tensor,
-    completion_counter: torch.Tensor,
-    turn: torch.Tensor,
-    *,
-    slot: int,
-    destination_source_stride: int,
-    next_turn: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    _validate_fp8_rows("o", o, head_dim)
-    _validate_packed_scales(scales, o.shape[0], o.shape[1], head_dim)
-    _validate_completion_counter(completion_counter)
-    _validate_turn(turn, next_turn)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).publish_o_fp8_release_turn(
-        o,
-        scales,
-        descriptors,
-        ready_descriptors,
-        completion_counter,
-        turn,
-        int(slot),
-        int(destination_source_stride),
-        int(next_turn),
-        int(ready_value),
-    )
-
-
 def quantize_publish_o_fp8(
     o: torch.Tensor,
     staged_o: torch.Tensor,
@@ -233,46 +129,6 @@ def quantize_publish_o_fp8(
         completion_counter,
         int(slot),
         int(destination_source_stride),
-        int(ready_value),
-    )
-
-
-def quantize_publish_o_fp8_release_turn(
-    o: torch.Tensor,
-    staged_o: torch.Tensor,
-    staged_scales: torch.Tensor,
-    descriptors: torch.Tensor,
-    ready_descriptors: torch.Tensor,
-    completion_counter: torch.Tensor,
-    quantization_counter: torch.Tensor,
-    turn: torch.Tensor,
-    *,
-    slot: int,
-    destination_source_stride: int,
-    next_turn: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    """Fuse quantize/publish while releasing ownership after quantization."""
-    _validate_bf16_rows("o", o, head_dim)
-    _validate_fp8_o_quant_shape(o, head_dim)
-    _validate_fp8_staging(o, staged_o, staged_scales, head_dim)
-    _validate_completion_counter(completion_counter)
-    _validate_completion_counter(quantization_counter)
-    _validate_turn(turn, next_turn)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).quantize_publish_o_fp8_release_turn(
-        o,
-        staged_o,
-        staged_scales,
-        descriptors,
-        ready_descriptors,
-        completion_counter,
-        quantization_counter,
-        turn,
-        int(slot),
-        int(destination_source_stride),
-        int(next_turn),
         int(ready_value),
     )
 
@@ -342,43 +198,6 @@ def release_turn(
     _jit_module(int(head_dim)).release_turn(turn, int(next_turn))
 
 
-def signal_direct_o(
-    ready_descriptors: torch.Tensor,
-    *,
-    slot: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    """Publish readiness for symmetric O already written by its producer."""
-    _validate_ready_descriptors(ready_descriptors)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).signal_direct_o(
-        ready_descriptors, int(slot), int(ready_value)
-    )
-
-
-def signal_direct_o_release_turn(
-    ready_descriptors: torch.Tensor,
-    turn: torch.Tensor,
-    *,
-    slot: int,
-    next_turn: int,
-    head_dim: int,
-    ready_value: int,
-) -> None:
-    """Release the next lane and publish a directly produced symmetric O."""
-    _validate_ready_descriptors(ready_descriptors)
-    _validate_turn(turn, next_turn)
-    _validate_ready_value(ready_value)
-    _jit_module(int(head_dim)).signal_direct_o_release_turn(
-        ready_descriptors,
-        turn,
-        int(slot),
-        int(next_turn),
-        int(ready_value),
-    )
-
-
 def _validate_turn(turn: torch.Tensor | None, value: int | None) -> None:
     if (
         turn is None
@@ -404,22 +223,6 @@ def _validate_ready(name: str, ready: torch.Tensor) -> None:
         or ready.numel() < 1
     ):
         raise ValueError(f"{name} must be a nonempty contiguous CUDA int64 vector")
-
-
-def _validate_ready_descriptors(descriptors: torch.Tensor) -> None:
-    if (
-        descriptors.dtype != torch.int64
-        or not descriptors.is_cuda
-        or not descriptors.is_contiguous()
-        or descriptors.ndim != 2
-        or descriptors.shape[0] < 1
-        or descriptors.shape[1] != 3
-    ):
-        raise ValueError(
-            "AFD ready descriptors must be a nonempty contiguous CUDA int64 "
-            f"matrix with width 3, got shape={tuple(descriptors.shape)} "
-            f"dtype={descriptors.dtype} device={descriptors.device}"
-        )
 
 
 def _validate_ready_value(value: int) -> None:
@@ -464,29 +267,6 @@ def _validate_fp8_rows(name: str, tensor: torch.Tensor, head_dim: int) -> None:
             f"AFD {name} must be a rank-2 CUDA FP8 E4M3 head matrix with "
             f"head_dim={head_dim}, got shape={tuple(tensor.shape)} "
             f"dtype={tensor.dtype} device={tensor.device} stride={tensor.stride()}"
-        )
-
-
-def _validate_packed_scales(
-    scales: torch.Tensor, rows: int, width: int, head_dim: int
-) -> None:
-    groups = (int(width) + 127) // 128
-    packed_groups = (groups + 3) // 4
-    expected_stride = ((int(rows) + 3) // 4) * 4
-    if (
-        scales.dtype != torch.int32
-        or not scales.is_cuda
-        or scales.ndim != 2
-        or tuple(scales.shape) != (int(rows), packed_groups)
-        or scales.stride(0) != 1
-        or scales.stride(1) != expected_stride
-    ):
-        raise ValueError(
-            "AFD O scales must use DeepGEMM packed UE8M0 layout: "
-            f"shape={tuple(scales.shape)} stride={scales.stride()} "
-            f"expected_shape={(int(rows), packed_groups)} "
-            f"expected_stride={(1, expected_stride)} dtype={scales.dtype} "
-            f"device={scales.device}"
         )
 
 
@@ -543,15 +323,9 @@ def _validate_bf16_rows(name: str, tensor: torch.Tensor, head_dim: int) -> None:
 __all__ = [
     "ensure_afd_fmha_transport_built",
     "publish_o",
-    "publish_o_release_turn",
-    "publish_o_fp8",
-    "publish_o_fp8_release_turn",
     "quantize_publish_o_fp8",
-    "quantize_publish_o_fp8_release_turn",
     "publish_qkv",
     "release_turn",
-    "signal_direct_o",
-    "signal_direct_o_release_turn",
     "wait_ready",
     "wait_turn",
 ]
