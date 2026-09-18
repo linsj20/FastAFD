@@ -1,0 +1,70 @@
+{
+  "job": "7259728",
+  "state": "COMPLETED",
+  "elapsed": "00:14:30",
+  "nodes": "nvl72167-T07/T08/T09/T10",
+  "summary": [
+    {
+      "model": "Qwen3-235B-A22B",
+      "ep": 16,
+      "global_tokens": 192,
+      "rows_per_rank": 12,
+      "kernel_us": {
+        "helper": 23.9027,
+        "previous_best": 24.229750000000003,
+        "history_pull": 25.7731,
+        "delta_us": -0.3270500000000034,
+        "reduction_percent": 1.3497869354822223,
+        "versus_history_percent": -7.257178996705871
+      },
+      "order_delta_us": [
+        -0.35940000000000083,
+        -0.2947000000000024
+      ],
+      "full_chain_us": {
+        "helper": 42.33615955337882,
+        "previous_best": 42.759039886295795,
+        "history_pull": 9238.85986328125,
+        "delta_us": -0.422880332916975
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "ep": 16,
+      "global_tokens": 512,
+      "rows_per_rank": 32,
+      "kernel_us": {
+        "helper": 49.308800000000005,
+        "previous_best": 49.56815,
+        "history_pull": 48.9744,
+        "delta_us": -0.25934999999999775,
+        "reduction_percent": 0.5232190428732908,
+        "versus_history_percent": 0.6828057107386654
+      },
+      "order_delta_us": [
+        -0.2166999999999959,
+        -0.3019999999999996
+      ],
+      "full_chain_us": {
+        "helper": 70.14256089925766,
+        "previous_best": 70.125920958817,
+        "history_pull": 9484.893798828125,
+        "delta_us": 0.016639940440654755
+      }
+    }
+  ],
+  "checks": {
+    "reference_record": 32,
+    "exact_compare": 128,
+    "replay": 160,
+    "stderr": ""
+  },
+  "decision": "Helper benefit transfers to both tested EP16 cases without kernel tuning; preserve all controls. Q35 helper remains slower than historical pull. No general/default promotion.",
+  "scope": "Ordinary rank0 MegaMoE kernel durations:200 instances/optimized arm (100each ABBA pass),100history. Initialization/reset outside kernel timing. Fixed balanced routing andFP8xFP4. No new instrumented decomposition in this validation.",
+  "limitations": [
+    "Only one batch per model, not an exhaustive routing/batch sweep.",
+    "Q35EP16/global912 naturally selectsM64/128epilogue threads and is unsupported by current compact path; never launched/retiled.",
+    "Q35 full producer+kernel aggregate is essentially unchanged/slightly worse; do not equate kernel-only gain to full-chain gain.",
+    "Historical full-chain ~9ms outliers preserved; not comparable to kernel microseconds."
+  ]
+}

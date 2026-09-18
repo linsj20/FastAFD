@@ -1,0 +1,38 @@
+{
+  "exact": 32,
+  "replay": 32,
+  "phase_counts": [
+    {
+      "label": "helper2",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "best1536",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "best1536_repeat",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "helper2_repeat",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    }
+  ],
+  "ordinary_fullchain_us": {
+    "helper2": 56.4393600448966,
+    "best1536": 56.485760025680065,
+    "best1536_repeat": 56.22880008071661,
+    "helper2_repeat": 55.923199877142906
+  },
+  "stderr": "",
+  "plan_note": "Uninterrupted ordinary ABBA with100instances/pass; no profile phase."
+}

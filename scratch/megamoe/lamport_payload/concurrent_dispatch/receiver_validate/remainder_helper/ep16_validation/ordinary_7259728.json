@@ -1,0 +1,122 @@
+[
+  {
+    "model": "Qwen3-235B-A22B",
+    "label": "history32",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 25.7731,
+      "median": 25.776,
+      "min": 24.032,
+      "max": 27.424,
+      "stddev": 0.7347
+    }
+  },
+  {
+    "model": "Qwen3-235B-A22B",
+    "label": "helper2",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 23.9158,
+      "median": 23.92,
+      "min": 23.008,
+      "max": 25.696,
+      "stddev": 0.6424
+    }
+  },
+  {
+    "model": "Qwen3-235B-A22B",
+    "label": "best1536",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 24.2752,
+      "median": 24.384,
+      "min": 23.296,
+      "max": 25.984,
+      "stddev": 0.5498999999999999
+    }
+  },
+  {
+    "model": "Qwen3-235B-A22B",
+    "label": "best1536_repeat",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 24.1843,
+      "median": 24.16,
+      "min": 23.296,
+      "max": 26.432,
+      "stddev": 0.5245
+    }
+  },
+  {
+    "model": "Qwen3-235B-A22B",
+    "label": "helper2_repeat",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 23.889599999999998,
+      "median": 23.888,
+      "min": 22.944,
+      "max": 25.248,
+      "stddev": 0.5608
+    }
+  },
+  {
+    "model": "Qwen3.5-397B-A17B",
+    "label": "history32",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 48.9744,
+      "median": 48.944,
+      "min": 46.496,
+      "max": 52.0,
+      "stddev": 1.2895
+    }
+  },
+  {
+    "model": "Qwen3.5-397B-A17B",
+    "label": "helper2",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 49.323800000000006,
+      "median": 49.216,
+      "min": 47.232,
+      "max": 52.576,
+      "stddev": 1.1864000000000001
+    }
+  },
+  {
+    "model": "Qwen3.5-397B-A17B",
+    "label": "best1536",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 49.5405,
+      "median": 49.568,
+      "min": 46.88,
+      "max": 52.64,
+      "stddev": 1.2722
+    }
+  },
+  {
+    "model": "Qwen3.5-397B-A17B",
+    "label": "best1536_repeat",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 49.595800000000004,
+      "median": 49.472,
+      "min": 46.848,
+      "max": 52.704,
+      "stddev": 1.1654
+    }
+  },
+  {
+    "model": "Qwen3.5-397B-A17B",
+    "label": "helper2_repeat",
+    "instances": 100,
+    "kernel_us": {
+      "mean": 49.293800000000005,
+      "median": 49.28,
+      "min": 47.36,
+      "max": 52.992,
+      "stddev": 1.1364
+    }
+  }
+]

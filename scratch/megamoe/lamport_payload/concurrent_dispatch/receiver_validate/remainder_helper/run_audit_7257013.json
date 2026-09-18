@@ -1,0 +1,76 @@
+{
+  "exact": 112,
+  "replay": 112,
+  "phase_counts": [
+    {
+      "label": "helper2",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "helper2",
+      "phase": "profile",
+      "exact": 16,
+      "replay": 16
+    },
+    {
+      "label": "best1536",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "best1536_repeat",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "helper2_repeat",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "parallel1024",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "history32",
+      "phase": "normal",
+      "exact": 8,
+      "replay": 8
+    },
+    {
+      "label": "best1536",
+      "phase": "profile",
+      "exact": 16,
+      "replay": 16
+    },
+    {
+      "label": "parallel1024",
+      "phase": "profile",
+      "exact": 16,
+      "replay": 16
+    },
+    {
+      "label": "history32",
+      "phase": "profile",
+      "exact": 16,
+      "replay": 16
+    }
+  ],
+  "ordinary_fullchain_us": {
+    "helper2": 65.70560000836849,
+    "best1536": 63.88479955494404,
+    "best1536_repeat": 64.50239978730679,
+    "helper2_repeat": 66.42240099608898,
+    "parallel1024": 65.53280018270016,
+    "history32": 96584.80224609375
+  },
+  "stderr": "",
+  "plan_note": "Candidateprofile interleaves afterfirstordinarypass; ordinary ABBA order retained. Explicitplan validated, no assumption normalphasescontiguous."
+}

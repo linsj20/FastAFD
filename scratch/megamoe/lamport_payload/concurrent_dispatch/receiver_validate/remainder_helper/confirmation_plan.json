@@ -1,0 +1,30 @@
+[
+  {
+    "label": "helper2",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_BASELINE_ITERATIONS": "100"
+    }
+  },
+  {
+    "label": "best1536",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_BASELINE_ITERATIONS": "100"
+    }
+  },
+  {
+    "label": "best1536_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_BASELINE_ITERATIONS": "100"
+    }
+  },
+  {
+    "label": "helper2_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_BASELINE_ITERATIONS": "100"
+    }
+  }
+]

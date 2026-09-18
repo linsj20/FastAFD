@@ -1,0 +1,67 @@
+{
+  "purpose": "User-requested out-of-case validation of fixed helper against best1536 and historical pull; no tuning.",
+  "models": [
+    {
+      "name": "qwen3",
+      "tokens": 192,
+      "hidden": 4096,
+      "intermediate": 1536,
+      "experts": 128,
+      "topk": 8
+    },
+    {
+      "name": "qwen35",
+      "tokens": 512,
+      "hidden": 4096,
+      "intermediate": 1024,
+      "experts": 512,
+      "topk": 10
+    }
+  ],
+  "ep": 16,
+  "rows": [
+    12,
+    32
+  ],
+  "block_m": 32,
+  "compute_ctas": 150,
+  "senders": 8,
+  "iterations": 100,
+  "plan": "History records exact per-rank reference, then helper/best/best/helper compare all outputs and replay. Ordinary kernel from rank0 Nsight; full chain max-rank separate.",
+  "expected": {
+    "record": 32,
+    "compare": 128,
+    "replay": 160
+  },
+  "sources": "Reuse unchanged EP8-tested overlays/native caches; only model/EP/token parameters vary.",
+  "unsupported": {
+    "model": "qwen35",
+    "ep": 16,
+    "tokens": 912,
+    "reason": "Heuristic selects BLOCK_M64 and128epilogue threads; compact path requires BLOCK_M<=32 and256epilogue threads. Not silently retiled or launched.",
+    "source": "compact_main.cuh438 and1539; dispatch.cuh225"
+  },
+  "capacity": {
+    "qwen3": 268,
+    "qwen35": 1056,
+    "bucket": 3840
+  },
+  "initialization": "Steady reset/initialization outside kernel timing. No CPU builds on GPU.",
+  "cpu_job": {
+    "id": "7259660",
+    "status": "COMPLETED",
+    "elapsed": "00:01:31",
+    "device_builds": 6,
+    "registers": 128,
+    "stack_bytes": 24,
+    "spill_bytes": 0,
+    "register_gates": "PASS"
+  },
+  "gpu_job": {
+    "id": "7259728",
+    "status": "COMPLETED",
+    "nodes": "nvl72167-T07/T08/T09/T10",
+    "elapsed": "00:14:30"
+  },
+  "result": "comparison.json"
+}

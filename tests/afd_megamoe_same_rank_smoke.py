@@ -102,13 +102,84 @@ def _nonnegative_int_list(name: str, default: str) -> list[int]:
     return values
 
 
+def _signed_zero_input(like):
+    value = torch.zeros_like(like)
+    value[:, 3::4] = -0.0
+    return value
+
+
+def _dispatch_preparation(get_buffer, rows):
+    setting = os.environ.get("MEGAMOE_SMOKE_RESET_DISPATCH_PAYLOAD", "0")
+    if setting not in ("0", "1"):
+        raise ValueError("MEGAMOE_SMOKE_RESET_DISPATCH_PAYLOAD must be 0 or 1")
+    if setting == "0":
+        return None
+
+    def prepare():
+        buffer = get_buffer()
+        # Existing symmetric-memory GPU barrier; no extra NCCL communicator.
+        buffer.handle.barrier(channel=0)
+        buffer.reset_dispatch_payload(rows)
+        buffer.handle.barrier(channel=0)
+
+    return prepare
+
+
+def _time_prepared_graph(run_stage, prepare_stage, output, *, warmups, iterations):
+    """Separate preparation graph; kernel-only Nsight durations are primary."""
+    graph_batch = int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1"))
+    if graph_batch != 1:
+        raise ValueError("Prepared timing requires graph_batch=1")
+    prepare_stage()
+    run_stage()
+    torch.cuda.synchronize()
+    dist.barrier()
+    # Keep preparation and workload in separate graphs. IKET's tracker cannot
+    # instantiate the earlier NCCL/external-event graph; neither graph here has
+    # external event nodes. Event ranges still exclude every preparation replay.
+    preparation = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(preparation):
+        prepare_stage()
+    with torch.cuda.graph(graph):
+        run_stage()
+    for _ in range(warmups):
+        preparation.replay()
+        graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    profile = int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0"))
+    if profile:
+        torch.cuda.profiler.start()
+    pairs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+             for _ in range(iterations)]
+    for start, end in pairs:
+        preparation.replay()
+        start.record()
+        graph.replay()
+        end.record()
+    pairs[-1][1].synchronize()
+    total_ms = sum(start.elapsed_time(end) for start, end in pairs)
+    if profile:
+        torch.cuda.profiler.stop()
+    elapsed = torch.tensor([total_ms / iterations], dtype=torch.float64, device="cuda")
+    dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    if not torch.isfinite(output).all():
+        raise RuntimeError("prepared graph output is non-finite")
+    return float(elapsed[0]), float(output.abs().max())
+
+
 def _time_graph(
     run_stage,
     output: torch.Tensor,
     *,
     warmups: int,
     iterations: int,
+    prepare_stage=None,
 ) -> tuple[float, float]:
+    if prepare_stage is not None:
+        return _time_prepared_graph(run_stage, prepare_stage, output,
+                                    warmups=warmups, iterations=iterations)
     graph_batch = int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1"))
     if graph_batch < 1 or iterations % graph_batch:
         raise ValueError("graph batch must be positive and divide timing iterations")
@@ -676,6 +747,9 @@ def _exact_qwen_fixed_perfect_case(
     production_routes = int(
         os.environ.get("MEGAMOE_SMOKE_PRODUCTION_ROUTES", "0")
     )
+    timing_scope = os.environ.get("MEGAMOE_SMOKE_TIMING_SCOPE", "pipeline")
+    if timing_scope not in ("pipeline", "megamoe"):
+        raise RuntimeError("MEGAMOE_SMOKE_TIMING_SCOPE must be pipeline or megamoe")
     if warmups < 0 or iterations <= 0 or bucket < rows:
         raise RuntimeError("invalid fixed-perfect MegaMoE timing dimensions")
     if int(os.environ.get("MEGAMOE_SMOKE_DEBUG_TIMINGS", "0")) != 0:
@@ -710,6 +784,8 @@ def _exact_qwen_fixed_perfect_case(
         hidden=hidden,
         intermediate_hidden=intermediate,
     )
+    if timing_scope == "megamoe" and production_routes and not buffer.compact_push:
+        raise RuntimeError("kernel-only replay requires in-kernel dispatch")
     flat = torch.arange(rows * top_k, dtype=torch.int64, device="cuda")
     fixed_ids = ((flat + token_offset * top_k) % num_experts).view(rows, top_k)
     balance_ranks = int(os.environ.get("MEGAMOE_SMOKE_BALANCE_RANKS", "0"))
@@ -760,8 +836,7 @@ def _exact_qwen_fixed_perfect_case(
     deepgemm.set_num_sms(num_sms)
     rank_gated_combine = True
 
-    def run_megamoe() -> None:
-        prepare_input()
+    def run_kernel() -> None:
         megamoe_mega.fp8_fp8_mega_moe(
             output,
             transformed[0],
@@ -772,6 +847,14 @@ def _exact_qwen_fixed_perfect_case(
             route_ready_dispatch=bool(production_routes),
             rank_ready_route_publish=bool(production_routes),
         )
+
+    prepare_dispatch = _dispatch_preparation(lambda: buffer, rows)
+
+    def run_megamoe(*, reset=True) -> None:
+        if reset and prepare_dispatch is not None:
+            prepare_dispatch()
+        prepare_input()
+        run_kernel()
 
     dist.barrier()
     output.fill_(float("nan"))
@@ -821,9 +904,20 @@ def _exact_qwen_fixed_perfect_case(
         weights=weights, output=output,
     )
     max_active = _max_active_experts(fixed_ids, local_experts, world_size)
+    replay_reference = output.clone()
+    if timing_scope == "megamoe":
+        # Inputs are invariant across replays. Routing/quantization run once,
+        # outside capture; the kernel transfers metadata/payload every replay.
+        prepare_input()
+        torch.cuda.synchronize()
     elapsed, output_max = _time_graph(
-        run_megamoe, output, warmups=warmups, iterations=iterations
+        run_kernel if timing_scope == "megamoe" else lambda: run_megamoe(reset=False),
+        output, warmups=warmups, iterations=iterations,
+        prepare_stage=prepare_dispatch,
     )
+    if not torch.equal(output.view(torch.uint8), replay_reference.view(torch.uint8)):
+        raise RuntimeError(f"{timing_scope} graph replay differs from the validated router+kernel output")
+    print(f"MEGAMOE_REPLAY_EXACT_OK rank={rank} rows={rows} scope={timing_scope}", flush=True)
     return {
         f"bucket{bucket}_rows{rows}_sms{num_sms}": {
             "ep_size": world_size,
@@ -838,13 +932,14 @@ def _exact_qwen_fixed_perfect_case(
             "timing_iterations": iterations,
             "timing_graph_batch": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
             "timing_rank_reduction": "max",
+            "dispatch_reset_outside_timing": prepare_dispatch is not None,
             "timing_cuda_profiler_range": int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0")),
             "milliseconds": elapsed,
             "output_max": output_max,
             "max_active_experts": max_active,
             "timed_scope": (
                 "route_producer_and_megamoe"
-                if production_routes
+                if production_routes and timing_scope == "pipeline"
                 else "megamoe_kernel_only"
             ),
             "routing": (
@@ -1044,7 +1139,11 @@ def _exact_qwen_case(
                 perfect_balance=bool(perfect_routing),
             )
 
-        def run_stage() -> None:
+        prepare_dispatch = _dispatch_preparation(lambda: buffer, rows)
+
+        def run_stage(*, reset=True) -> None:
+            if reset and prepare_dispatch is not None:
+                prepare_dispatch()
             prepare_input()
             megamoe_mega.fp8_fp8_mega_moe(
                 output,
@@ -1145,7 +1244,7 @@ def _exact_qwen_case(
                 saved_perfect_routing = perfect_routing
                 perfect_routing = 0
                 for phase, hidden_view in enumerate(
-                    (*hidden_views, torch.zeros_like(hidden_views[0]))
+                    (*hidden_views, _signed_zero_input(hidden_views[0]))
                 ):
                     output.fill_(float("nan"))
                     run_stage()
@@ -1185,8 +1284,13 @@ def _exact_qwen_case(
                 hidden_view = hidden_views[0]
                 max_active = _max_active_experts(current[0], local_experts, world_size)
                 elapsed, output_max = _time_graph(
-                    run_stage, output, warmups=warmups, iterations=iterations
+                    lambda: run_stage(reset=False), output, warmups=warmups,
+                    iterations=iterations, prepare_stage=prepare_dispatch,
                 )
+                if not all(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+                           for actual, expected in zip((ids, weights, output), current)):
+                    raise RuntimeError("pipeline graph replay differs from the validated input/output")
+                print(f"MEGAMOE_REPLAY_EXACT_OK rank={rank} rows={rows} scope=pipeline", flush=True)
                 key = f"bucket{bucket}_rows{rows}_sms{num_sms}"
                 if len(specialization_modes) > 1:
                     key += (
@@ -1201,6 +1305,7 @@ def _exact_qwen_case(
                     "output_max": output_max,
                     "max_active_experts": max_active,
                     "timed_scope": "router_and_megamoe",
+                    "dispatch_reset_outside_timing": prepare_dispatch is not None,
                     "calls_per_graph": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
                 }
                 if debug_timings:

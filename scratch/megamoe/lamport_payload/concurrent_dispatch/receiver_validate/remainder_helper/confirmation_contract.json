@@ -1,0 +1,40 @@
+{
+  "purpose": "Resolve provisional 0.0912us ordinary kernel advantage from7257013 with uninterrupted ABBA,100timed instances/pass.",
+  "source": "Identical tested helper2/best1536 headers/native/JIT caches; only launch-plan/iteration count changes.",
+  "plan": [
+    {
+      "label": "helper2",
+      "phase": "normal",
+      "env": {
+        "MEGAMOE_BASELINE_ITERATIONS": "100"
+      }
+    },
+    {
+      "label": "best1536",
+      "phase": "normal",
+      "env": {
+        "MEGAMOE_BASELINE_ITERATIONS": "100"
+      }
+    },
+    {
+      "label": "best1536_repeat",
+      "phase": "normal",
+      "env": {
+        "MEGAMOE_BASELINE_ITERATIONS": "100"
+      }
+    },
+    {
+      "label": "helper2_repeat",
+      "phase": "normal",
+      "env": {
+        "MEGAMOE_BASELINE_ITERATIONS": "100"
+      }
+    }
+  ],
+  "parent_gpu": "7257013",
+  "parent_analysis": "7257014",
+  "expected_exact": 32,
+  "expected_replay": 32,
+  "expected_instances_per_pass": 100,
+  "scope": "Fixed EP8 rows32,H4096,I1536,E128,topk8; reset outside timing; no instrumented captures; no analysis allocation needed for compact existing CSVs."
+}

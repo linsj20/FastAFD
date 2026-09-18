@@ -1,0 +1,15 @@
+[
+  "sbatch",
+  "--parsable",
+  "--account=coreai_comparch_sysarch",
+  "--partition=cpu",
+  "--qos=cpu-normal",
+  "--nodes=1",
+  "--ntasks=1",
+  "--cpus-per-task=4",
+  "--time=00:20:00",
+  "--job-name=fastafd:lamport-payload",
+  "--output=/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/compile-%j.out",
+  "--error=/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/compile-%j.err",
+  "--wrap=srun --nodes=1 --ntasks=1 --container-image=/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel/FastAFD/../trtllm_qwen3_235b_megamoe/images/pytorch-26.05-py3-arm64-trtllm-fa778397186c09dd57bcaa5020e66270768b675b.sqsh --container-mount-home --container-mounts=/lustre:/lustre --no-container-remap-root python3 -c 'import json,subprocess,sys,os; from pathlib import Path; p=Path(sys.argv[1]).parent/'\"'\"'temp'\"'\"'; p.mkdir(exist_ok=True); os.environ['\"'\"'TMPDIR'\"'\"']=str(p); [subprocess.run(c,check=True) for c in json.load(open(sys.argv[1]))]' /lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/build_commands.json"
+]

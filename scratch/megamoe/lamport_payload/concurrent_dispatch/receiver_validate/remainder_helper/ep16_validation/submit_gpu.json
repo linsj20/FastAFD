@@ -1,0 +1,22 @@
+[
+  "sbatch",
+  "--parsable",
+  "--account=coreai_comparch_sysarch",
+  "--partition=batch",
+  "--qos=short",
+  "--nodes=4",
+  "--segment=4",
+  "--ntasks=16",
+  "--ntasks-per-node=4",
+  "--cpus-per-task=8",
+  "--gres=gpu:4",
+  "--exclusive",
+  "--no-requeue",
+  "--time=00:20:00",
+  "--job-name=fastafd:lamport-payload-ep8-0917",
+  "--output=/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/compare-%j.out",
+  "--error=/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/compare-%j.err",
+  "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/run.sbatch",
+  "--plan",
+  "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/capture_plan.json"
+]

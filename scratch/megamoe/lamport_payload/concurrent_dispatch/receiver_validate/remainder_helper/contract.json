@@ -1,0 +1,21 @@
+{
+  "status": "Completed: CPU7256953, GPU7257013/analysis7257014 and ordinary-only confirmation7257222 passed. Retained as experimental best; EP16 validation7259728 also complete. See decision.json and ep16_validation/RESULT.md.",
+  "parent": "remainder_batch combinedvote. Whole-dispatchnoinline7256840 rejectedordinary38.136vs37.4064, profilingfailedcallee-markerPC IndexError. No decomposition fromthatjob.",
+  "change": "Keepmega_moe_dispatch forceinline, isolateonly two-rowremainder inunmarked noinlinehelper. Callercontainsalltimingmarkers andpublication/barrier. Rawpointerarguments avoidWorkspaceaggregate materialization; same addresses/wordvalidity/ownership/retirement.",
+  "fixed_case": "EP8 rows32/rank,H4096,I1536,E128,topk8,FP4/FP8,8senders150compute,resetexcluded.",
+  "cpu_gate": "Ordinary/IKET compile androlebudget/spill gates. Verify12loads beforevalidity tests, noPMTRIGincallee, computecodegen versusparallelparent. NoGPUuntilterminal gates androuterwarmups.",
+  "runtime_gate": "Same6ordinaryABBA/4profiles,112exact+112replay expected. Requireordinarygain vsbest andrestoredcompute/earlierbroadMMA. No promotion onSASSalone.",
+  "execution_plan": "capture_plan.json runshelper2ordinary thenhelper2profile, thenremaining5ordinary (preservingABBAorder), then3controlprofiles.112checks; expectedphasecounts[8,16,8,8,8,8,8,16,16,16]. Profilinginterleavesafterfirstordinarypass; reportexecutionorderhonestly.",
+  "codegen": "Bothbuilds128regs24stack/no spills; helper0stack/noPMTRIG,12loads before48wordtests. IKETcompute counts matchparallelparent[424,260,331,1,304]; ordinary[384,260,325,1,299] slightlydifferent. No claimofordinaryinstructionidentity.",
+  "measurement_7257013": {
+    "state": "completed",
+    "exact": 112,
+    "replay": 112,
+    "ordinary_abba_helper_us": 37.2416,
+    "ordinary_abba_best_us": 37.3328,
+    "decision": "Small gain confirmed by ordinary-only7257222; retained fixed-case overlay.",
+    "detailed_evidence": "comparison_7257013.md"
+  },
+  "decision_file": "decision.json",
+  "confirmation_job": "7257222"
+}

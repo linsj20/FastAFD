@@ -72,14 +72,8 @@ struct Workspace {
     }
 
     CUTLASS_HOST_DEVICE
-    uint64_t get_source_frame_bytes(uint32_t hidden) const {
-        return math::align<uint64_t>(static_cast<uint64_t>(hidden) + hidden / 32 +
-                                     static_cast<uint64_t>(num_topk) * sizeof(float), 128);
-    }
-
-    CUTLASS_HOST_DEVICE
     uint64_t get_compact_l1_num_tokens(uint32_t hidden) const {
-        const uint64_t bytes = 2ull * num_ranks * num_max_tokens_per_rank * get_source_frame_bytes(hidden);
+        const uint64_t bytes = 2ull * num_ranks * num_max_tokens_per_rank * (hidden + hidden / 32);
         const uint64_t source_rows = math::ceil_div<uint64_t>(bytes, hidden);
         return source_rows > num_max_pool_tokens ? source_rows : num_max_pool_tokens;
     }
@@ -136,7 +130,58 @@ struct Workspace {
         // Combine push source indices
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
-        return math::align<uint64_t>(num_bytes + get_metadata_bank_bytes(), 128);
+        return math::align<uint64_t>(num_bytes + get_metadata_bank_bytes(), 128) + get_genphase_bytes();
+    }
+
+    // Double-buffer only cross-rank inboxes/counters. Local indices are consumed
+    // before the next local invocation, while a peer can already send its next plane.
+    CUTLASS_HOST_DEVICE
+    uint64_t get_genphase_bank_bytes() const {
+        return math::align<uint64_t>((num_ranks + static_cast<uint64_t>(NumGenphaseFlags)) * sizeof(uint32_t), 128) +
+            2ull * num_ranks * num_max_tokens_per_rank * num_topk * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_genphase_bytes() const {
+        return 2 * get_genphase_bank_bytes() +
+            math::align<uint64_t>(num_max_pool_tokens * sizeof(uint32_t), 128);
+    }
+
+    enum GenphaseFlag { CountsReady, SizesReady, IndicesReady, PayloadReady, DispatchDone, NumGenphaseFlags };
+
+    CUTLASS_DEVICE
+    uint32_t* get_genphase_flag_ptr(uint32_t index) const {
+        return math::advance_ptr<uint32_t>(base,
+            get_num_bytes() - get_genphase_bytes() + metadata_slot * get_genphase_bank_bytes()) + index;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_genphase_flag_ptr(GenphaseFlag flag) const {
+        return get_genphase_flag_ptr(num_ranks + static_cast<uint32_t>(flag));
+    }
+
+    CUTLASS_DEVICE
+    int32_t* get_topk_inbox_ptr(uint32_t rank = 0) const {
+        return math::advance_ptr<int32_t>(get_genphase_flag_ptr(0u),
+            math::align<uint64_t>((num_ranks + static_cast<uint64_t>(NumGenphaseFlags)) * sizeof(uint32_t), 128)) +
+            static_cast<uint64_t>(rank) * num_max_tokens_per_rank * num_topk;
+    }
+
+    CUTLASS_DEVICE
+    float* get_score_inbox_ptr(uint32_t rank = 0) const {
+        return reinterpret_cast<float*>(get_topk_inbox_ptr(num_ranks)) +
+            static_cast<uint64_t>(rank) * num_max_tokens_per_rank * num_topk;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_gather_index_ptr(uint32_t row = 0) const {
+        return math::advance_ptr<uint32_t>(base,
+            get_num_bytes() - get_genphase_bytes() + 2 * get_genphase_bank_bytes()) + row;
+    }
+
+    CUTLASS_HOST_DEVICE
+    static constexpr uint32_t genphase_pusher_ctas(uint32_t tokens) {
+        return math::constexpr_min(math::constexpr_ceil_div(tokens, 128u), 8u) + (tokens == 0);
     }
 
     CUTLASS_HOST_DEVICE

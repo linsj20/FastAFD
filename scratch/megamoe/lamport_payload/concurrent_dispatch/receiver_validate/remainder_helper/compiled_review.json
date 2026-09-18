@@ -1,0 +1,112 @@
+[
+  {
+    "name": "m32_helper_ordinary",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*47e0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 384,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*6030*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 260,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*6f10*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 325,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8270*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*82a0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 299,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "m32_helper_iket",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*5330*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 424,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*6e00*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 260,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*7ce0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 331,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*90a0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*90d0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 304,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  }
+]

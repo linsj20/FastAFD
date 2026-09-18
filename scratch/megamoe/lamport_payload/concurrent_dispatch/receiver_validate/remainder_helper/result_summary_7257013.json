@@ -1,0 +1,160 @@
+{
+  "helper2": [
+    {
+      "first_mma": 8.864,
+      "median_mma": 9.312,
+      "last_mma": 9.824,
+      "compute": 25.28,
+      "compute_end": 34.144,
+      "tail": 6.176,
+      "remainder_producer_median": 3.136,
+      "remainder_wait_median": 0.48,
+      "wait_start_median": 9.952,
+      "wait_ready_median": 10.432,
+      "wait_start_minus_own_mma": 0.608,
+      "publication_to_observation_median": 0.896
+    },
+    {
+      "first_mma": 9.088,
+      "median_mma": 9.376,
+      "last_mma": 10.048,
+      "compute": 25.28,
+      "compute_end": 34.368,
+      "tail": 5.152,
+      "remainder_producer_median": 3.472,
+      "remainder_wait_median": 0.768,
+      "wait_start_median": 10.016,
+      "wait_ready_median": 10.88,
+      "wait_start_minus_own_mma": 0.608,
+      "publication_to_observation_median": 0.928
+    },
+    {
+      "first_mma": 8.928,
+      "median_mma": 9.472,
+      "last_mma": 10.016,
+      "compute": 25.824,
+      "compute_end": 34.752,
+      "tail": 5.184,
+      "remainder_producer_median": 3.232,
+      "remainder_wait_median": 0.48,
+      "wait_start_median": 9.92,
+      "wait_ready_median": 10.528,
+      "wait_start_minus_own_mma": 0.608,
+      "publication_to_observation_median": 0.928
+    }
+  ],
+  "best1536": [
+    {
+      "first_mma": 9.088,
+      "median_mma": 9.728,
+      "last_mma": 10.08,
+      "compute": 25.12,
+      "compute_end": 34.208,
+      "tail": 5.856,
+      "remainder_producer_median": 1.888,
+      "remainder_wait_median": 0.224,
+      "wait_start_median": 11.072,
+      "wait_ready_median": 11.392,
+      "wait_start_minus_own_mma": 1.408,
+      "publication_to_observation_median": 1.12
+    },
+    {
+      "first_mma": 9.28,
+      "median_mma": 9.44,
+      "last_mma": 10.144,
+      "compute": 25.184,
+      "compute_end": 34.464,
+      "tail": 5.312,
+      "remainder_producer_median": 2.096,
+      "remainder_wait_median": 0.352,
+      "wait_start_median": 10.912,
+      "wait_ready_median": 11.168,
+      "wait_start_minus_own_mma": 1.408,
+      "publication_to_observation_median": 1.12
+    },
+    {
+      "first_mma": 8.992,
+      "median_mma": 9.504,
+      "last_mma": 9.984,
+      "compute": 25.152,
+      "compute_end": 34.144,
+      "tail": 6.432,
+      "remainder_producer_median": 1.888,
+      "remainder_wait_median": 0.32,
+      "wait_start_median": 10.944,
+      "wait_ready_median": 11.2,
+      "wait_start_minus_own_mma": 1.44,
+      "publication_to_observation_median": 1.152
+    }
+  ],
+  "parallel1024": [
+    {
+      "first_mma": 8.864,
+      "median_mma": 9.184,
+      "last_mma": 9.6,
+      "compute": 26.08,
+      "compute_end": 34.944,
+      "tail": 5.472,
+      "remainder_producer_median": 3.856,
+      "remainder_wait_median": 1.312,
+      "wait_start_median": 9.824,
+      "wait_ready_median": 11.072,
+      "wait_start_minus_own_mma": 0.608,
+      "publication_to_observation_median": 0.896
+    },
+    {
+      "first_mma": 9.024,
+      "median_mma": 9.312,
+      "last_mma": 9.728,
+      "compute": 26.432,
+      "compute_end": 35.456,
+      "tail": 4.448,
+      "remainder_producer_median": 4.384,
+      "remainder_wait_median": 1.472,
+      "wait_start_median": 9.952,
+      "wait_ready_median": 11.68,
+      "wait_start_minus_own_mma": 0.64,
+      "publication_to_observation_median": 0.992
+    },
+    {
+      "first_mma": 8.928,
+      "median_mma": 9.28,
+      "last_mma": 9.856,
+      "compute": 25.888,
+      "compute_end": 34.816,
+      "tail": 5.12,
+      "remainder_producer_median": 3.936,
+      "remainder_wait_median": 1.488,
+      "wait_start_median": 9.824,
+      "wait_ready_median": 11.296,
+      "wait_start_minus_own_mma": 0.544,
+      "publication_to_observation_median": 0.96
+    }
+  ],
+  "history32": [
+    {
+      "first_mma": 20.16,
+      "median_mma": 21.056,
+      "last_mma": 21.28,
+      "compute": 24.608,
+      "compute_end": 44.768,
+      "tail": 4.096
+    },
+    {
+      "first_mma": 10.112,
+      "median_mma": 10.496,
+      "last_mma": 11.232,
+      "compute": 25.024,
+      "compute_end": 35.136,
+      "tail": 4.8
+    },
+    {
+      "first_mma": 10.08,
+      "median_mma": 10.688,
+      "last_mma": 11.072,
+      "compute": 25.76,
+      "compute_end": 35.84,
+      "tail": 3.776
+    }
+  ]
+}

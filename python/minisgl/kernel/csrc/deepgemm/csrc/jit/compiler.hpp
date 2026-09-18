@@ -64,6 +64,10 @@ public:
             not iket_include.empty()) {
             DG_HOST_ASSERT(std::filesystem::exists(iket_include + "/iket/iket_device_apis.cuh"));
             flags += " -DIKET_BUILD_ENABLED=1 -I" + iket_include;
+            const auto critical = get_env<int>("DG_JIT_IKET_CRITICAL", 0);
+            DG_HOST_ASSERT(critical == 0 or critical == 1);
+            if (critical)
+                flags += " -DMEGAMOE_IKET_CRITICAL=1";
         }
     }
 

@@ -1,0 +1,182 @@
+[
+  {
+    "label": "history32",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "192",
+      "MEGAMOE_IKET_MODEL": "Qwen3-235B-A22B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1536",
+      "MEGAMOE_IKET_EXPERTS": "128",
+      "MEGAMOE_IKET_TOP_K": "8",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen3/history32",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen3",
+      "MEGAMOE_RESULT_MODE": "record",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "helper2",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "192",
+      "MEGAMOE_IKET_MODEL": "Qwen3-235B-A22B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1536",
+      "MEGAMOE_IKET_EXPERTS": "128",
+      "MEGAMOE_IKET_TOP_K": "8",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen3/helper2",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen3",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "best1536",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "192",
+      "MEGAMOE_IKET_MODEL": "Qwen3-235B-A22B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1536",
+      "MEGAMOE_IKET_EXPERTS": "128",
+      "MEGAMOE_IKET_TOP_K": "8",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen3/best1536",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen3",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "best1536_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "192",
+      "MEGAMOE_IKET_MODEL": "Qwen3-235B-A22B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1536",
+      "MEGAMOE_IKET_EXPERTS": "128",
+      "MEGAMOE_IKET_TOP_K": "8",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen3/best1536_repeat",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen3",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "helper2_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "192",
+      "MEGAMOE_IKET_MODEL": "Qwen3-235B-A22B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1536",
+      "MEGAMOE_IKET_EXPERTS": "128",
+      "MEGAMOE_IKET_TOP_K": "8",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen3/helper2_repeat",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen3",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "history32",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "512",
+      "MEGAMOE_IKET_MODEL": "Qwen3.5-397B-A17B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1024",
+      "MEGAMOE_IKET_EXPERTS": "512",
+      "MEGAMOE_IKET_TOP_K": "10",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen35/history32",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen35",
+      "MEGAMOE_RESULT_MODE": "record",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "helper2",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "512",
+      "MEGAMOE_IKET_MODEL": "Qwen3.5-397B-A17B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1024",
+      "MEGAMOE_IKET_EXPERTS": "512",
+      "MEGAMOE_IKET_TOP_K": "10",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen35/helper2",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen35",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "best1536",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "512",
+      "MEGAMOE_IKET_MODEL": "Qwen3.5-397B-A17B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1024",
+      "MEGAMOE_IKET_EXPERTS": "512",
+      "MEGAMOE_IKET_TOP_K": "10",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen35/best1536",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen35",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "best1536_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "512",
+      "MEGAMOE_IKET_MODEL": "Qwen3.5-397B-A17B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1024",
+      "MEGAMOE_IKET_EXPERTS": "512",
+      "MEGAMOE_IKET_TOP_K": "10",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen35/best1536_repeat",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen35",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  },
+  {
+    "label": "helper2_repeat",
+    "phase": "normal",
+    "env": {
+      "MEGAMOE_IKET_EP": "16",
+      "MEGAMOE_IKET_GLOBAL_TOKENS": "512",
+      "MEGAMOE_IKET_MODEL": "Qwen3.5-397B-A17B",
+      "MEGAMOE_IKET_HIDDEN": "4096",
+      "MEGAMOE_IKET_INTERMEDIATE": "1024",
+      "MEGAMOE_IKET_EXPERTS": "512",
+      "MEGAMOE_IKET_TOP_K": "10",
+      "MEGAMOE_BASELINE_ITERATIONS": "100",
+      "FASTAFD_IKET_ARTIFACT_ROOT": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/iket/qwen35/helper2_repeat",
+      "MEGAMOE_RESULT_REFERENCE_DIR": "/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD/artifacts/push_dispatch/lamport_payload/concurrent_dispatch/receiver_validate/remainder_helper/ep16_validation/reference/qwen35",
+      "MEGAMOE_RESULT_MODE": "compare",
+      "DG_PRINT_CONFIGS": "1"
+    }
+  }
+]

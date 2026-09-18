@@ -1,0 +1,332 @@
+[
+  {
+    "name": "qwen3_history32",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*1080*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 418,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*2830*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 255,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*36c0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 298,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4870*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*48a0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 299,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "qwen3_helper2",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*47f0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 385,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*6050*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 260,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*6f30*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 325,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8290*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*82c0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 299,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "qwen3_best1536",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4b70*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 367,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 41,
+        "highest_register_including_wide_memory_operands": 41,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*62b0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 255,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*7140*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 325,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*84d0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8500*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 296,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "qwen35_history32",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*1080*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 427,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*28c0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 259,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*3790*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 297,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4930*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4960*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 298,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 22,
+        "highest_register_including_wide_memory_operands": 22,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "qwen35_helper2",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4b20*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 387,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 39,
+        "highest_register_including_wide_memory_operands": 39,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*63a0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 264,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*72c0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 326,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8630*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8660*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 300,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  },
+  {
+    "name": "qwen35_best1536",
+    "register_regions": [
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*4e90*/                   USETMAXREG.DEALLOC.CTAPOOL 0x30 ;",
+        "budget": 48,
+        "instructions_checked": 366,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 41,
+        "highest_register_including_wide_memory_operands": 41,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*65c0*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 259,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*7490*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 325,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8820*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28;",
+        "budget": 40,
+        "instructions_checked": 1,
+        "unresolved_transfers": [],
+        "highest_explicit_register": -1,
+        "highest_register_including_wide_memory_operands": -1,
+        "local_memory_instructions": []
+      },
+      {
+        "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
+        "entry": "/*8850*/                   USETMAXREG.DEALLOC.CTAPOOL 0x28 ;",
+        "budget": 40,
+        "instructions_checked": 295,
+        "unresolved_transfers": [],
+        "highest_explicit_register": 18,
+        "highest_register_including_wide_memory_operands": 18,
+        "local_memory_instructions": []
+      }
+    ]
+  }
+]

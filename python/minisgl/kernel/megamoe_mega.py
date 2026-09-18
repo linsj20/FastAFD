@@ -20,10 +20,15 @@ def _ext():
 class MegaMoESymmBuffer:
     """Symmetric storage with communication protocols fixed at allocation.
 
-    ``payload_mode`` is ``"pull"`` (default) or ``"compact_push"``. Both use
-    pushed metadata with prepared rank-ready routes. The compact mode pushes
-    one FP8/scale/weight frame per source token and destination rank, then
-    gathers expert rows during compute. Pull materializes contiguous expert rows.
+    ``payload_mode`` is ``"pull"`` (default) or ``"compact_push"``. Compact mode
+    publishes routes from the router. MegaMoE pushes deduplicated FP8/SF rows
+    and constructs local gather indices. The experimental Lamport dispatch
+    headers require ``reset_dispatch_payload(rows)`` before every invocation, with
+    peer completion ordered before any sender starts; reset is off critical path.
+    FC1 gathers activation and SF rows. Each invocation requires fresh router
+    publication; kernel-only replay cannot reuse retired metadata flags.
+    Dispatch supports up to 1024 active rows per rank
+    and top-k <= 32. Pull materializes contiguous expert rows.
     An explicit mode overrides ``MINISGL_MEGAMOE_PAYLOAD_MODE``.
     """
 
@@ -125,6 +130,31 @@ class MegaMoESymmBuffer:
     @property
     def buffer_ptrs(self) -> list[int]:
         return list(self.handle.buffer_ptrs)
+
+    def reset_dispatch_payload(self, num_tokens_per_rank: int) -> None:
+        """Initialize both Lamport source banks, outside the measured kernel.
+
+        Call after all peers finish the previous invocation. The caller must
+        also ensure all peers complete their resets before the next dispatch
+        (e.g. stream-ordered collectives on both sides). Values remain intact since
+        several experts/N tiles can consume the same source row.
+        """
+        if not self.compact_push:
+            raise RuntimeError("Lamport payload reset requires compact_push storage")
+        if not 0 <= num_tokens_per_rank <= self.num_max_tokens_per_rank:
+            raise ValueError("Reset row count exceeds the source-bank capacity")
+        source_rows = 2 * self.num_ranks * self.num_max_tokens_per_rank
+        words = self.l1_acts.view(torch.int32).reshape(-1)
+        activation_words = source_rows * self.hidden // 4
+        sf_words = source_rows * self.hidden // 128
+        # Initialize every row this invocation can address, in both banks.
+        # Avoid sweeping unused capacity and evicting unrelated weights from L2.
+        words[:activation_words].view(
+            2, self.num_ranks, self.num_max_tokens_per_rank, self.hidden // 4
+        )[:, :, :num_tokens_per_rank].fill_(-(1 << 31))
+        words[activation_words:activation_words + sf_words].view(
+            2, self.num_ranks, self.num_max_tokens_per_rank, self.hidden // 128
+        )[:, :, :num_tokens_per_rank].fill_(-1)
 
     def route_prepare_args(
         self, *, rank_ready: bool,

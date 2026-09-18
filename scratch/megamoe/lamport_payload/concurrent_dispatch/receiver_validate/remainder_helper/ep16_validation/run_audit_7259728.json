@@ -1,0 +1,514 @@
+{
+  "job": "7259728",
+  "steps": [
+    {
+      "model": "Qwen3-235B-A22B",
+      "label": "history32",
+      "checks": {
+        "MEGAMOE_RESULT_RECORD_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "ep_size": 16,
+        "global_tokens": 192,
+        "max_active_experts": 8,
+        "milliseconds": 9.23885986328125,
+        "model_dimensions": {
+          "experts": 128,
+          "hidden": 4096,
+          "intermediate": 1536,
+          "top_k": 8
+        },
+        "output_max": 310.0,
+        "payload_mode": "pull",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 12,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12
+        ]
+      }
+    },
+    {
+      "model": "Qwen3-235B-A22B",
+      "label": "helper2",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 192,
+        "max_active_experts": 8,
+        "milliseconds": 0.042305919602513314,
+        "model_dimensions": {
+          "experts": 128,
+          "hidden": 4096,
+          "intermediate": 1536,
+          "top_k": 8
+        },
+        "output_max": 310.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 12,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12
+        ]
+      }
+    },
+    {
+      "model": "Qwen3-235B-A22B",
+      "label": "best1536",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 192,
+        "max_active_experts": 8,
+        "milliseconds": 0.04276351984590292,
+        "model_dimensions": {
+          "experts": 128,
+          "hidden": 4096,
+          "intermediate": 1536,
+          "top_k": 8
+        },
+        "output_max": 310.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 12,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12
+        ]
+      }
+    },
+    {
+      "model": "Qwen3-235B-A22B",
+      "label": "best1536_repeat",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 192,
+        "max_active_experts": 8,
+        "milliseconds": 0.04275455992668867,
+        "model_dimensions": {
+          "experts": 128,
+          "hidden": 4096,
+          "intermediate": 1536,
+          "top_k": 8
+        },
+        "output_max": 310.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 12,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12
+        ]
+      }
+    },
+    {
+      "model": "Qwen3-235B-A22B",
+      "label": "helper2_repeat",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 192,
+        "max_active_experts": 8,
+        "milliseconds": 0.042366399504244326,
+        "model_dimensions": {
+          "experts": 128,
+          "hidden": 4096,
+          "intermediate": 1536,
+          "top_k": 8
+        },
+        "output_max": 310.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 12,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12,
+          12
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "label": "history32",
+      "checks": {
+        "MEGAMOE_RESULT_RECORD_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "ep_size": 16,
+        "global_tokens": 512,
+        "max_active_experts": 32,
+        "milliseconds": 9.484893798828125,
+        "model_dimensions": {
+          "experts": 512,
+          "hidden": 4096,
+          "intermediate": 1024,
+          "top_k": 10
+        },
+        "output_max": 237.0,
+        "payload_mode": "pull",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 32,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "label": "helper2",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 512,
+        "max_active_experts": 32,
+        "milliseconds": 0.07026304081082344,
+        "model_dimensions": {
+          "experts": 512,
+          "hidden": 4096,
+          "intermediate": 1024,
+          "top_k": 10
+        },
+        "output_max": 237.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 32,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "label": "best1536",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 512,
+        "max_active_experts": 32,
+        "milliseconds": 0.07026784099638463,
+        "model_dimensions": {
+          "experts": 512,
+          "hidden": 4096,
+          "intermediate": 1024,
+          "top_k": 10
+        },
+        "output_max": 237.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 32,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "label": "best1536_repeat",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 512,
+        "max_active_experts": 32,
+        "milliseconds": 0.06998400092124939,
+        "model_dimensions": {
+          "experts": 512,
+          "hidden": 4096,
+          "intermediate": 1024,
+          "top_k": 10
+        },
+        "output_max": 237.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 32,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      }
+    },
+    {
+      "model": "Qwen3.5-397B-A17B",
+      "label": "helper2_repeat",
+      "checks": {
+        "MEGAMOE_RESULT_COMPARE_OK": 16,
+        "MEGAMOE_REPLAY_EXACT_OK": 16
+      },
+      "metrics": {
+        "combine_exact_checked": false,
+        "dispatch_reset_outside_timing": true,
+        "ep_size": 16,
+        "global_tokens": 512,
+        "max_active_experts": 32,
+        "milliseconds": 0.07002208098769187,
+        "model_dimensions": {
+          "experts": 512,
+          "hidden": 4096,
+          "intermediate": 1024,
+          "top_k": 10
+        },
+        "output_max": 237.0,
+        "payload_mode": "compact_push",
+        "routes_prepared": true,
+        "routing": "fixed_global_sequence_rank_interleaved_balance",
+        "rows_per_rank": 32,
+        "timed_scope": "route_producer_and_megamoe",
+        "timing_cuda_profiler_range": 1,
+        "timing_graph_batch": 1,
+        "timing_iterations": 100,
+        "timing_rank_reduction": "max",
+        "timing_warmups": 10,
+        "valid_rows_per_rank": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ]
+      }
+    }
+  ],
+  "stderr": ""
+}

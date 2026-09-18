@@ -1,0 +1,59 @@
+{
+  "status": "Read-only matched75-pair review; no further GPU candidate selected.",
+  "metrics_us": {
+    "helper2": [
+      {
+        "sf_pub_to_last_sf_observation": 1.152,
+        "a_pub_to_last_a_observation": 1.12,
+        "both_publications_to_mma": 1.6
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.216,
+        "a_pub_to_last_a_observation": 0.8,
+        "both_publications_to_mma": 1.344
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.184,
+        "a_pub_to_last_a_observation": 1.152,
+        "both_publications_to_mma": 1.6
+      }
+    ],
+    "best1536": [
+      {
+        "sf_pub_to_last_sf_observation": 1.056,
+        "a_pub_to_last_a_observation": 0.896,
+        "both_publications_to_mma": 1.376
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.024,
+        "a_pub_to_last_a_observation": 0.896,
+        "both_publications_to_mma": 1.312
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.248,
+        "a_pub_to_last_a_observation": 0.896,
+        "both_publications_to_mma": 1.344
+      }
+    ],
+    "parallel1024": [
+      {
+        "sf_pub_to_last_sf_observation": 1.088,
+        "a_pub_to_last_a_observation": 0.864,
+        "both_publications_to_mma": 1.376
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.024,
+        "a_pub_to_last_a_observation": 0.896,
+        "both_publications_to_mma": 1.44
+      },
+      {
+        "sf_pub_to_last_sf_observation": 1.184,
+        "a_pub_to_last_a_observation": 1.024,
+        "both_publications_to_mma": 1.504
+      }
+    ]
+  },
+  "interpretation": "Local publication-to-consumer path remains about1us; includes release issue-to-completion and consumer scheduling/polling. No isolated network or atomic contention claim.",
+  "next_idea": "MEGAMOE_COMM_EXPLORATION item4: independent completion/queue occupancy. Existing packed readiness layout review suggests a controlled relocated-contiguous versus128B-spaced flag experiment, only if confirmed best and same codegen/reuse proof. Do not infer contention solely from these intervals.",
+  "source": "comparison_7257013.json; CTA//24 expert map; SF CTA=e and prefix CTA=16+e."
+}

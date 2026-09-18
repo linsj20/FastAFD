@@ -1,0 +1,42 @@
+[
+  {
+    "label": "helper2",
+    "phase": "normal"
+  },
+  {
+    "label": "helper2",
+    "phase": "profile"
+  },
+  {
+    "label": "best1536",
+    "phase": "normal"
+  },
+  {
+    "label": "best1536_repeat",
+    "phase": "normal"
+  },
+  {
+    "label": "helper2_repeat",
+    "phase": "normal"
+  },
+  {
+    "label": "parallel1024",
+    "phase": "normal"
+  },
+  {
+    "label": "history32",
+    "phase": "normal"
+  },
+  {
+    "label": "best1536",
+    "phase": "profile"
+  },
+  {
+    "label": "parallel1024",
+    "phase": "profile"
+  },
+  {
+    "label": "history32",
+    "phase": "profile"
+  }
+]

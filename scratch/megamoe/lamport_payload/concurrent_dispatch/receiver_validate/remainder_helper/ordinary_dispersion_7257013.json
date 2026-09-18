@@ -1,0 +1,22 @@
+{
+  "helper2": {
+    "Instances": "10",
+    "Avg (ns)": "37276.8",
+    "StdDev (ns)": "319.1"
+  },
+  "best1536": {
+    "Instances": "10",
+    "Avg (ns)": "37331.2",
+    "StdDev (ns)": "285.5"
+  },
+  "best1536_repeat": {
+    "Instances": "10",
+    "Avg (ns)": "37334.4",
+    "StdDev (ns)": "245.6"
+  },
+  "helper2_repeat": {
+    "Instances": "10",
+    "Avg (ns)": "37206.4",
+    "StdDev (ns)": "176.6"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "status": "Six ordinary EP16 preflight specializations passed register/reachability gates. Static counts are not cycle estimates.",
+  "reachable_instruction_counts": {
+    "qwen3_history32": [
+      418,
+      255,
+      298,
+      1,
+      299
+    ],
+    "qwen3_helper2": [
+      385,
+      260,
+      325,
+      1,
+      299
+    ],
+    "qwen3_best1536": [
+      367,
+      255,
+      325,
+      1,
+      296
+    ],
+    "qwen35_history32": [
+      427,
+      259,
+      297,
+      1,
+      298
+    ],
+    "qwen35_helper2": [
+      387,
+      264,
+      326,
+      1,
+      300
+    ],
+    "qwen35_best1536": [
+      366,
+      259,
+      325,
+      1,
+      295
+    ]
+  }
+}

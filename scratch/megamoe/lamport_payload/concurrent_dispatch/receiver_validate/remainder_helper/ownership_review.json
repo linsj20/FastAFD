@@ -1,0 +1,148 @@
+{
+  "ownership_cases": [
+    {
+      "ready": 0,
+      "rows_covered_once": 0
+    },
+    {
+      "ready": 1,
+      "rows_covered_once": 1
+    },
+    {
+      "ready": 2,
+      "rows_covered_once": 2
+    },
+    {
+      "ready": 3,
+      "rows_covered_once": 3
+    },
+    {
+      "ready": 4,
+      "rows_covered_once": 4
+    },
+    {
+      "ready": 5,
+      "rows_covered_once": 5
+    },
+    {
+      "ready": 6,
+      "rows_covered_once": 6
+    },
+    {
+      "ready": 7,
+      "rows_covered_once": 7
+    },
+    {
+      "ready": 8,
+      "rows_covered_once": 8
+    },
+    {
+      "ready": 9,
+      "rows_covered_once": 9
+    },
+    {
+      "ready": 10,
+      "rows_covered_once": 10
+    },
+    {
+      "ready": 11,
+      "rows_covered_once": 11
+    },
+    {
+      "ready": 12,
+      "rows_covered_once": 12
+    },
+    {
+      "ready": 13,
+      "rows_covered_once": 13
+    },
+    {
+      "ready": 14,
+      "rows_covered_once": 14
+    },
+    {
+      "ready": 15,
+      "rows_covered_once": 15
+    },
+    {
+      "ready": 16,
+      "rows_covered_once": 16
+    },
+    {
+      "ready": 17,
+      "rows_covered_once": 17
+    },
+    {
+      "ready": 18,
+      "rows_covered_once": 18
+    },
+    {
+      "ready": 19,
+      "rows_covered_once": 19
+    },
+    {
+      "ready": 20,
+      "rows_covered_once": 20
+    },
+    {
+      "ready": 21,
+      "rows_covered_once": 21
+    },
+    {
+      "ready": 22,
+      "rows_covered_once": 22
+    },
+    {
+      "ready": 23,
+      "rows_covered_once": 23
+    },
+    {
+      "ready": 24,
+      "rows_covered_once": 24
+    },
+    {
+      "ready": 25,
+      "rows_covered_once": 25
+    },
+    {
+      "ready": 26,
+      "rows_covered_once": 26
+    },
+    {
+      "ready": 27,
+      "rows_covered_once": 27
+    },
+    {
+      "ready": 28,
+      "rows_covered_once": 28
+    },
+    {
+      "ready": 29,
+      "rows_covered_once": 29
+    },
+    {
+      "ready": 30,
+      "rows_covered_once": 30
+    },
+    {
+      "ready": 31,
+      "rows_covered_once": 31
+    },
+    {
+      "ready": 32,
+      "rows_covered_once": 32
+    }
+  ],
+  "per_row_bytes": 3072,
+  "prefix_bytes": 1024,
+  "protocol": "Same33rowownership cases and3072Bextent. Bothactive rowbatches load beforeanytest. Singlewarp vote combinesmissing flags fromeveryword inbothactiverows. Finalvalues remaininregisters and arematerialized aftersuccessfulvote. Inactiverow neverread/stored. Bothrows remainstableuntilretirement.",
+  "invariants_unchanged": [
+    "SF barrier4/128, prefix barrier3/256",
+    "remainder barrier5/128 and one bit4 publisher",
+    "DispatchDone, common retirement and lastCTA cleanup",
+    "steady reset outside timing, native descriptor compact8"
+  ],
+  "register_risk": "48 uint32 payload values/thread versus24, plus two address/descriptor states. Must pass reachable128 startup register gate and zero local spills.",
+  "helper_boundary": "Raw descriptor/inputgeneration/outputtile pointers, ready/owner/lane only; no Workspace aggregate spills. Inputbase usesws.get_source_l1_row(0,0), helperadds rank*kTokens+token. Outputbase materialized_base+offsets[e]+base, helperadds i. Exactlysame addresses acrossbothmetadata slots.",
+  "representative_input_address_cases_pass": 384
+}

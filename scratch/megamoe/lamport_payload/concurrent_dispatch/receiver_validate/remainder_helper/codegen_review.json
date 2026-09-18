@@ -1,0 +1,60 @@
+[
+  {
+    "name": "m32_helper_ordinary",
+    "compute_reachable_counts": [
+      384,
+      260,
+      325,
+      1,
+      299
+    ],
+    "helper_markers": 0,
+    "helper_local_memory": [],
+    "load_batch": [
+      "/*ed50*/              @!P2 LDG.E.128.STRONG.SYS R40, desc[UR16][R22.64+0x400] ;",
+      "/*ede0*/              @!P2 LDG.E.128.STRONG.SYS R44, desc[UR16][R22.64+0x600] ;",
+      "/*ee10*/              @!P2 LDG.E.128.STRONG.SYS R48, desc[UR24][R22.64+0x800] ;",
+      "/*ee40*/              @!P2 LDG.E.128.STRONG.SYS R52, desc[UR26][R22.64+0xa00] ;",
+      "/*ee70*/              @!P2 LDG.E.128.STRONG.SYS R56, desc[UR28][R22.64+0xc00] ;",
+      "/*eea0*/              @!P2 LDG.E.128.STRONG.SYS R60, desc[UR30][R22.64+0xe00] ;",
+      "/*eed0*/              @!P1 LDG.E.128.STRONG.SYS R64, desc[UR32][R20.64+0x400] ;",
+      "/*eee0*/              @!P1 LDG.E.128.STRONG.SYS R68, desc[UR34][R20.64+0x600] ;",
+      "/*ef00*/              @!P1 LDG.E.128.STRONG.SYS R72, desc[UR40][R20.64+0x800] ;",
+      "/*ef10*/              @!P1 LDG.E.128.STRONG.SYS R76, desc[UR42][R20.64+0xa00] ;",
+      "/*ef20*/              @!P1 LDG.E.128.STRONG.SYS R80, desc[UR44][R20.64+0xc00] ;",
+      "/*ef40*/              @!P1 LDG.E.128.STRONG.SYS R84, desc[UR46][R20.64+0xe00] ;"
+    ],
+    "sentinel_tests": 48,
+    "caller_marker_instructions": 0,
+    "helper_entry": "/*ea50*/                   ISETP.GE.U32.AND P1, PT, R97, R95, PT ;"
+  },
+  {
+    "name": "m32_helper_iket",
+    "compute_reachable_counts": [
+      424,
+      260,
+      331,
+      1,
+      304
+    ],
+    "helper_markers": 0,
+    "helper_local_memory": [],
+    "load_batch": [
+      "/*10050*/              @!P4 LDG.E.128.STRONG.SYS R40, desc[UR16][R22.64+0x400] ;",
+      "/*100e0*/              @!P4 LDG.E.128.STRONG.SYS R44, desc[UR16][R22.64+0x600] ;",
+      "/*10110*/              @!P4 LDG.E.128.STRONG.SYS R48, desc[UR26][R22.64+0x800] ;",
+      "/*10140*/              @!P4 LDG.E.128.STRONG.SYS R52, desc[UR28][R22.64+0xa00] ;",
+      "/*10170*/              @!P4 LDG.E.128.STRONG.SYS R56, desc[UR30][R22.64+0xc00] ;",
+      "/*101a0*/              @!P4 LDG.E.128.STRONG.SYS R60, desc[UR32][R22.64+0xe00] ;",
+      "/*101d0*/              @!P3 LDG.E.128.STRONG.SYS R64, desc[UR34][R20.64+0x400] ;",
+      "/*101e0*/              @!P3 LDG.E.128.STRONG.SYS R68, desc[UR40][R20.64+0x600] ;",
+      "/*10200*/              @!P3 LDG.E.128.STRONG.SYS R72, desc[UR42][R20.64+0x800] ;",
+      "/*10210*/              @!P3 LDG.E.128.STRONG.SYS R76, desc[UR44][R20.64+0xa00] ;",
+      "/*10220*/              @!P3 LDG.E.128.STRONG.SYS R80, desc[UR46][R20.64+0xc00] ;",
+      "/*10240*/              @!P3 LDG.E.128.STRONG.SYS R84, desc[UR48][R20.64+0xe00] ;"
+    ],
+    "sentinel_tests": 48,
+    "caller_marker_instructions": 155,
+    "helper_entry": "/*fd50*/                   ISETP.GE.U32.AND P1, PT, R99, R95, PT ;"
+  }
+]

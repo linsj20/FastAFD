@@ -1,0 +1,35 @@
+{
+  "decision": "Retain helper2 as best measured ordinary kernel path for fixed EP8 case; preserve best1536 control. No general/default promotion.",
+  "ordinary_confirmation": {
+    "job": "7257222",
+    "samples_per_arm": 200,
+    "helper_us": 37.16655,
+    "best1536_us": 37.244,
+    "delta_us": -0.07744999999999891,
+    "delta_percent": -0.20795295886585352,
+    "forward_delta_us": -0.08799999999999386,
+    "reverse_delta_us": -0.06690000000000396,
+    "exact": 32,
+    "replay": 32
+  },
+  "prior_match": {
+    "job": "7257013",
+    "helper_us": 37.2416,
+    "best1536_us": 37.3328,
+    "parallel_parent_us": 37.5168,
+    "history_pull_us": 37.8944,
+    "exact": 112,
+    "replay": 112
+  },
+  "producer_plus_kernel_confirmation": {
+    "helper_us": 56.181279961019754,
+    "best1536_us": 56.35728005319834,
+    "note": "Separate scope; earlier7257013 full chain regressed. Do not claim consistent full-chain improvement."
+  },
+  "limitations": [
+    "Instrumentation separate from ordinary kernel time; all captures/outliers preserved.",
+    "Compute recovery versus parallel parent, not uniform compute improvement versus best1536.",
+    "Prepared capacity guard and matching compact native descriptor required.",
+    "Experimental header overlay, not general/default integration."
+  ]
+}

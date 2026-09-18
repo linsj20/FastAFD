@@ -1,3 +1,49 @@
+## Checkpoint: MegaMoE all-push latency optimization — September 18
+
+User requested a progress commit. Default payload mode remains pull. The maintained
+compact-push kernel is the earlier split-gather prototype; the measured best is
+an explicit header/router/native-descriptor overlay, now retained with compact
+evidence under `scratch/megamoe/lamport_payload/`. See
+[dispatch memory](CODEX_PROJECT_push_dispatch.md) and the
+[checkpoint source map](scratch/megamoe/lamport_payload/CHECKPOINT.md).
+
+Confirmed Qwen3 EP8 (global256, rows32, H4096/I1536/E128/topk8): ordinary
+MegaMoE-only helper37.16655 vs previous-best37.24400us (-0.208%, pure ABBA).
+Across the two EP8 jobs,144 exact and144 replay checks passed. Three instrumented
+captures give independent medians, metadata start=0: exposed dispatch8.928us,
+first MMA→last accumulator25.280us, exposed combine4.960us, cleanup0.192us;
+metadata→combine-end39.712us and metadata→kernel-end39.936us. Independent
+medians need not sum. Compute is near historical pull25.024us.
+
+The 37.167us ordinary kernel duration excludes metadata before kernel entry;
+metadata-origin decomposition and producer+kernel timing include that work.
+All buffer initialization/reset is outside timing. Instrumented and ordinary
+measurements are separate scopes, not subtractable overhead estimates.
+
+Unchanged-code EP16 ABBA: Qwen3 global192/rows12 helper23.90270 vs24.22975us
+(-1.35%); Qwen3.5 global512/rows32 helper49.30880 vs49.56815us (-0.52%).
+Both orders improve, but Qwen3.5 remains0.68% slower than historical pull48.97440us.
+32 reference records,128 exact comparisons and160 replay checks passed. No EP16
+phase captures. Qwen3.5 global912/rows57 is unsupported (M64/128 epilogue threads);
+current overlay requires M<=32/256 epilogue threads, one expert wave, and prepared
+capacity. No consistent full-chain gain or general default promotion is claimed.
+
+CPU7256953/7259660 passed ordinary/instrumented builds and role register gates:
+128 registers,24 stack bytes,zero spills; the narrow helper has no local memory
+or profiling markers. GPU7257013/7257222/7259728 completed successfully. Preserve
+previous-best1536 and historical pull controls. All jobs are terminal. Detailed
+attempts, protocol proof, rejected paths and remaining ideas are in dispatch memory;
+communication ideas remain in [MEGAMOE_COMM_EXPLORATION.md](MEGAMOE_COMM_EXPLORATION.md).
+
+Checkpoint verification (September 18): synced the candidate tools/code and
+selected source/evidence assets to HSG `source/local-mirror`; remote `bash -n`
+passed for `profile_megamoe_iket.sbatch`. The current latency summarizer replayed
+all four saved EP8 arms (three captures each) with ordinary-pass validation and
+produced `remainder_helper/checkpoint_comparison.{json,md}` on HSG. No GPU rerun
+was needed: kernel sources were unchanged from the passing jobs above. Git
+whitespace review passed after documentation cleanup. No global instruction or
+skill change is needed; workflow lessons are recorded in project memory.
+
 ## Checkpoint: script consolidation and accumulated progress — September 15
 
 User requested cleaning `codex_scripts` and committing all our progress.

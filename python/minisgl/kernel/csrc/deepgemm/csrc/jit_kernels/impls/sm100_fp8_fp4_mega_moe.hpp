@@ -167,13 +167,18 @@ static void sm100_fp8_mega_moe_impl(
 
     // Make tensormap
     constexpr int kGranK = 32;
-    const auto frame_workspace = layout::Workspace(nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk);
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, compact_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
                                                      config.block_k, compact_push ? 1 : config.load_block_m,
-                                                     compact_push ? static_cast<int>(frame_workspace.get_source_frame_bytes(hidden)) : static_cast<int>(l1_acts.stride(-2)),
+                                                     static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
-    const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
+    // Genphase stores all SF atoms of a pool block together, so refinement can
+    // bulk-store contiguous atom runs instead of striding across the full pool.
+    const auto tensor_map_l1_acts_sf = compact_push ? make_tma_2d_desc(l1_acts_sf,
+                                                        config.sf_block_m,
+                                                        config.num_padded_sf_pool_tokens / config.sf_block_m * (hidden / 128),
+                                                        config.sf_block_m, 1, config.sf_block_m, 0) :
+                                                    make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
                                                         config.num_padded_sf_pool_tokens, hidden,
                                                         config.sf_block_m, kGranK,
                                                         1, 0);
@@ -262,6 +267,19 @@ static void sm100_fp8_mega_moe_impl(
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build(
         use_fp8_weights ? "sm100_fp8_fp8_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
+    if (compact_push) {
+        DG_HOST_ASSERT(num_tokens <= 1024);
+        DG_HOST_ASSERT(num_topk > 0 && num_topk <= 32);
+        DG_HOST_ASSERT(hidden % 512 == 0);  // Bulk SF rows must be 16-byte aligned.
+        const int pushers = layout::Workspace::genphase_pusher_ctas(num_max_tokens_per_rank);
+        const int refine_smem = math::align(16 + 4 * num_experts_per_rank, 128) +
+            2 * config.block_m * sizeof(uint32_t);
+        const int smem = std::max({refine_smem, 128 + 16 * (hidden + hidden / 32),
+                                   8 * math::align(num_tokens * num_topk, 4) + 4 * num_experts_per_rank,
+                                   4 * (2 * num_experts_per_rank + 4)});
+        DG_HOST_ASSERT(smem <= config.smem_size);
+        DG_HOST_ASSERT(num_sms >= num_ranks + 1 + pushers);
+    }
     // Only the route-ready producer has an independent release/acquire epoch
     // that lets MegaMoE consume data without waiting for the whole selector
     // grid. Other callers retain ordinary stream ordering.
