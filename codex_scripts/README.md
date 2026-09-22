@@ -117,6 +117,29 @@ only an explicitly agreed allowance; final all-push used4 across1,632 tokens.
 The legacy scoring wrapper still has a zero-miss exit gate. Preserve shards before
 that gate; Qwen3.5 reference plans need `--language-model-only` in VLLM_EXTRA_ARGS.
 
+Selected Qwen3 A3:F1 EP8 batch4 configuration:
+
+```bash
+export MINISGL_MEGAMOE_PAYLOAD_MODE=all_push
+export MINISGL_MEGAMOE_RECYCLE_EARLY_PDL=1
+export MINISGL_MEGAMOE_RECYCLE_AHEAD=1
+export MINISGL_MEGAMOE_RECYCLE_CTAS=8
+export MINISGL_MEGAMOE_RECYCLE_TMA=0
+export MINISGL_MEGAMOE_NORM_PRELOAD_WEIGHT=1
+```
+
+Use matched preload0/pull controls to attribute gains. Performance uses128K perf
+mode (synthetic KV/perfect routing); correctness uses actual8K real prefill/routing,
+NSYS0 and prepared prompt/kernel caches. Run analysis and scoring after GPU release.
+
+`MINISGL_MEGAMOE_RECYCLE_TMA=1` opts into TMA clearing for ahead reset; default0
+retains vector clearing. Prepare both router variants and fresh native/device caches
+before a paired model run; source changes can invalidate cached build timestamps.
+
+Prepared all-push router modules use `MEGAMOE_ROUTER_WRAPPER=GateTopkAllPushKernel`
+with `MEGAMOE_ROUTER_MODULE`. The smoke wrapper then retains the ordinary router
+for pull calls, allowing both paths in the same adapter correctness comparison.
+
 Adapter correctness lives in `tests/afd_megamoe_adapter_smoke.py`; optional chain
 benchmark uses `MEGAMOE_ADAPTER_BENCH_ITERATIONS` and rows (default6). Model-matched
 Q3 B4 uses `MEGAMOE_SMOKE_BUCKET=1548` for pull; all-push remains1152. Keep reset and

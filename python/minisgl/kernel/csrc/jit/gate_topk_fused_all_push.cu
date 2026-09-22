@@ -381,7 +381,8 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
     const int route_bucket, const int route_num_sms,
     const int num_tokens, const bool defer_route_dependent_launch,
     const uint8_t* __restrict__ source_sf, const int hidden_size,
-    const int reset_rows, uint64_t* reset_timings) {
+    const int reset_rows, uint64_t* reset_timings,
+    void* ahead_workspace, const int64_t* ahead_peers) {
   static_assert(kExperts <= kMaxExperts && kExperts % kWarpSize == 0);
   static_assert(kTopK > 0 && kTopK <= kWarpSize);
   const int token = static_cast<int>(blockIdx.x);
@@ -392,12 +393,25 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
       // need no current logits/SF and may overlap that GEMM's tail.
       const auto workspace = make_route_workspace(route_layout,
           route_workspace, route_num_ranks, kExperts, route_bucket, kTopK);
+#ifdef MEGAMOE_RECYCLE_AHEAD
+      const auto ahead = make_route_workspace(route_layout,
+          ahead_workspace, route_num_ranks, kExperts, route_bucket, kTopK);
+      if (reset_timings)
+        deep_gemm::mega_moe_recycle_ahead_worker<true>(workspace, route_buffer_ptrs,
+            ahead, ahead_peers, hidden_size, reset_rows, token - num_tokens,
+            reset_timings, num_tokens, route_num_sms);
+      else
+        deep_gemm::mega_moe_recycle_ahead_worker<false>(workspace, route_buffer_ptrs,
+            ahead, ahead_peers, hidden_size, reset_rows, token - num_tokens,
+            nullptr, num_tokens, route_num_sms);
+#else
       if (reset_timings)
         deep_gemm::mega_moe_recycle_worker<true>(workspace, route_buffer_ptrs, hidden_size, reset_rows,
             token - num_tokens, reset_timings, num_tokens, route_num_sms);
       else
         deep_gemm::mega_moe_recycle_worker<false>(workspace, route_buffer_ptrs, hidden_size, reset_rows,
             token - num_tokens, nullptr, num_tokens, route_num_sms);
+#endif
       return;
     }
   }
@@ -733,7 +747,9 @@ struct GateTopkAllPushKernel {
       bool perfect_balance,
       bool defer_route_dependent_launch,
       bool all_push, int reset_rows,
-      tvm::ffi::Optional<tvm::ffi::TensorView> reset_timings) {
+      tvm::ffi::Optional<tvm::ffi::TensorView> reset_timings,
+      tvm::ffi::Optional<tvm::ffi::TensorView> ahead_workspace,
+      tvm::ffi::Optional<tvm::ffi::TensorView> ahead_peers) {
     using namespace host;
     auto num_tokens = SymbolicSize{"M"};
     auto topk = SymbolicSize{"K"};
@@ -794,6 +810,19 @@ struct GateTopkAllPushKernel {
 
     const bool prepare_routes = route_workspace.has_value();
     RouteLayout route_layout{}; // unused when route preparation is disabled
+#ifdef MEGAMOE_RECYCLE_AHEAD
+    RuntimeCheck(ahead_workspace.has_value() && ahead_peers.has_value() && route_workspace.has_value(),
+                 "ahead recycling requires a distinct equal-layout arena");
+    TensorMatcher({route_workspace.value().size(0)}).with_device<kDLCUDA>(device_ref)
+        .with_dtype<int8_t>().verify(ahead_workspace.value());
+    TensorMatcher({route_num_ranks}).with_device<kDLCUDA>(device_ref)
+        .with_dtype<int64_t>().verify(ahead_peers.value());
+    RuntimeCheck(ahead_workspace.value().data_ptr() != route_workspace.value().data_ptr(),
+                 "ahead recycling must use a different arena");
+#else
+    RuntimeCheck(!ahead_workspace.has_value() && !ahead_peers.has_value(),
+                 "ahead arena requires ahead recycling module");
+#endif
 #ifdef MEGAMOE_RECYCLE
     RuntimeCheck(all_push && reset_rows >= rows && reset_rows <= route_bucket,
                  "recycling requires an all-push reset prefix covering every row");
@@ -928,14 +957,17 @@ struct GateTopkAllPushKernel {
             constexpr int kTopK = decltype(topk_tag)::value;
             const auto kernel = gate_topk_select_cta_kernel<
                 kExperts, kTopK, IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect, kAllPush>;
-            LaunchKernel(rows + (kAllPush && reset_rows ? 8 : 0), kTPB, stream).with_attr(true)(kernel,
+            LaunchKernel(rows + (kAllPush && reset_rows ? deep_gemm::kMegaMoERecycleCTAs : 0),
+                         kTPB, stream).with_attr(true)(kernel,
                 static_cast<const float*>(partials.data_ptr()),
                 static_cast<float*>(topk_weights.data_ptr()),
                 static_cast<IndexT*>(topk_indices.data_ptr()),
                 map_ptr, count_ptr, count_size, w_stage_ptr,
                 route_workspace_ptr, route_layout, route_buffer_ptrs_ptr,
                 route_rank, route_num_ranks, route_bucket, route_num_sms,
-                rows, defer_route_dependent_launch, x_sf_ptr, hsize, reset_rows, reset_timings_ptr);
+                rows, defer_route_dependent_launch, x_sf_ptr, hsize, reset_rows, reset_timings_ptr,
+                ahead_workspace.has_value() ? ahead_workspace.value().data_ptr() : nullptr,
+                ahead_peers.has_value() ? static_cast<const int64_t*>(ahead_peers.value().data_ptr()) : nullptr);
           };
           if (experts == 128 && topk_value == 8) {
             launch_cta(std::integral_constant<int, 128>{}, std::integral_constant<int, 8>{});

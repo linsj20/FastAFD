@@ -16,8 +16,6 @@ PYTHON_DIR = Path(__file__).resolve().parents[2] / "python"
 if str(PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(PYTHON_DIR))
 
-from minisgl.hf_support import load_tokenizer
-
 
 @dataclass
 class MiniSGLSample:
@@ -725,6 +723,7 @@ def sample_bundle_from_json(path: Path) -> dict[str, Any]:
 def run_sample(args: argparse.Namespace) -> int:
     prompts = load_prompts(args.prompt, args.prompt_file, args.prompt_repeat)
     minisgl_model = get_first_served_model(args.minisgl_url, args.timeout)
+    print(f"Submitting {len(prompts)} prompts for sampling", flush=True)
     samples = sample_prompts_with_minisgl(
         prompts=prompts,
         base_url=args.minisgl_url,
@@ -768,6 +767,8 @@ def run_vllm_sample(args: argparse.Namespace) -> int:
 
 
 def run_score(args: argparse.Namespace) -> int:
+    from minisgl.hf_support import load_tokenizer
+
     bundle = sample_bundle_from_json(args.sample_json)
     tokenizer_model = args.model or bundle.get("tokenizer_model")
     if not tokenizer_model:
@@ -828,6 +829,8 @@ def run_score(args: argparse.Namespace) -> int:
 
 
 def run_compare(args: argparse.Namespace) -> int:
+    from minisgl.hf_support import load_tokenizer
+
     prompts = load_prompts(args.prompt, args.prompt_file, args.prompt_repeat)
     minisgl_model = get_first_served_model(args.minisgl_url, args.timeout)
     vllm_model = get_first_served_model(args.vllm_url, args.timeout)

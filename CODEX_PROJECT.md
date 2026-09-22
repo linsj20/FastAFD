@@ -5,32 +5,39 @@ DeepGEMM kernels. The user-supplied global instructions apply. Root AGENTS.md is
 absent; its creation/location has been asked about. Do not create it without the
 user's answer. Read the relevant memory and `codex_scripts/README.md` before work.
 
-## Current MegaMoE state — September 21, 2026
+## Current MegaMoE state — September22, 2026
 
-[The consolidated MegaMoE optimization memory](CODEX_PROJECT_megamoe_optimization.md)
-is authoritative for kernel design, measured results, rejected approaches, sweeps,
-measurement limits and future ideas. The completed selection is u32 normalization
-plus peer-mask all-push dispatch and the original scheduler. Pull remains default.
-Latest kernel gates passed; later dispatch gains do not establish a new model gain.
+Selected target: **Qwen3 A3:F1 EP8 batch4, early PDL + ahead8 vector reset +
+normalization weight preload**. Pull remains default; reproduction settings and
+invariants are in [MegaMoE optimization](CODEX_PROJECT_megamoe_optimization.md).
 
-The last model-tested RNE peer-ready source improves Qwen3 128K decode graph latency
-by0.121037ms (0.668%); its 8K alignment has1/1632 top10 misses, accepted under the
-explicit maximum-four-miss criterion. Current joined-graph decomposition covers
-164 Qwen3 +300 Qwen3.5 cases; all13,920 rank0 ordinary calls and1,392 profiles pass.
-The deep cleanup is complete. Qwen3/Qwen3.5 EP8/EP16 exactness, replay and kernel
-decomposition pass (GPU 7338830/7338944, CPU 7339425/7339424): 192,000 ordinary
-rank samples and 576 profiles, all retained. Pooled ordinary latency changes range
-from -0.039% to +0.084%; performance is effectively maintained. Main-kernel machine
-code changes only in a timeout assertion's source-line immediate. See the optimization
-memory for the four-case tables and validation limits. The September 21 progress
-commit checkpoints the optimization, integration, reusable workflows and cleanup;
-the separate AGA bring-up note remains outside its scope.
+- Latest matched run7356961/analysis7356986: pull18.144077ms, preload-off17.891785ms,
+  preload-on17.842612ms. Preload saves0.049172ms in both orders; total0.301464ms
+  (1.6615%). All90 ordinary perf-mode samples retained,128K synthetic KV/perfect routing.
+- Earlier allocation7346203: preload-off saves0.358198ms (1.973%), meeting its
+  corresponding ordinary-main projection0.352590ms. Do not add cross-allocation gains.
+  Pull's main improved more between allocations than selected (1.304 vs0.787us),
+  narrowing the advantage; hardware cause and exact critical-path attribution unproven.
+- Combined actual8K/real-routing alignment passes1/1632 top10 misses, within the
+  agreed maximum4, with exact full-prompt/continuation cached-score coverage.
+- Current attention/FFN trace pair, metrics and manifest:
+  `scratch/afd/cases/qwen3/isl_131072/ep_8/a3-f1/batch_4/megamoe-reset-pdl-preload-20260922-j7356961/`.
+  Evidence: `scratch/megamoe/reset_overlap_20260921/combined_selected_result.json`.
+- Optional TMA reset is validated/default0, but its0.002159ms model increment is
+  not material; vector remains selected. Rejected placements and sync variants
+  are recorded in the topic memory, with isolated source and raw evidence retained.
 
-Twelve optimization notes and the kernel-only history from the mixed Qwen3 FFN
-memory are consolidated; 27 obsolete scripts and the two new dispatch-overlap/
-profiling-fidelity reports are removed (15 removals were untracked). The existing
-all-push report remains. Original dirty/untracked contents are archived under
-`scratch/megamoe/deep_cleanup_20260921/`; the manifest records scope and checks.
+User requested a cleanup/progress commit. Python readability and documentation
+cleanup preserve measured CUDA paths. Remote CPU7357776 passed1m02s:5 protocol
+tests,96 diagnostic records,90-sample comparison and full1,632-token alignment
+re-audit (same1 top10 miss). The AGA note and EP-scaling plot edit are unrelated
+and remain untouched.
+No new global skill/AGENTS guidance is needed.
+
+Previous September21 checkpoint consolidated kernel history/workflows and passed
+Qwen3/Qwen3.5 EP8/EP16 exactness, replay and decomposition. Current sweep coverage
+is164 Qwen3 +300 Qwen3.5 cases. The optimization memory is authoritative for those
+results, historical model checkpoints and measurement limits.
 
 ## Topic index
 
@@ -57,9 +64,9 @@ Full-model alignment and fixed-input kernel correctness remain separate gates.
 - Local checkout is authoritative. Use plain `ssh oci-hsg` for HSG execution.
   Root R is `/lustre/fsw/portfolios/coreai/users/shengjiel/FastAFD`; frozen sources
   belong under `source/`, plans/logs/results under `artifacts/<campaign>/`.
-- Final kernel snapshot: `R/source/dispatch_overlap_u32_final`. Last model-tested
-  snapshot: `R/source/all_push_peer_ready_rne_20260920`. Do not confuse them with
-  earlier prototypes or edit source/cache while a job consumes it.
+- Current model-tested source: `R/source/local-mirror`. Historical frozen sources
+  include `dispatch_overlap_u32_final` and `all_push_peer_ready_rne_20260920`.
+  Preserve archived controls; do not edit source/cache while a job consumes it.
 - Prepare/analyze on CPU allocations; GPUs perform complete workloads. A complete
   kernel or producer-consumer benchmark qualifies, with model E2E for promising
   candidates. No tiny GPU debugging jobs, manual waiting, padding or auto-retries.

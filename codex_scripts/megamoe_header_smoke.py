@@ -3,8 +3,9 @@
 
 import functools
 import os
-from pathlib import Path
 import runpy
+import sys
+from pathlib import Path
 
 
 def configure():
@@ -41,9 +42,13 @@ def configure():
         module = load_module(str(path))
         if not callable(module.launch):
             raise ValueError("Prepared router must export launch")
+        original_router = moe_topk._jit_gate_topk_fused_module
+        all_push_only = os.environ.get("MEGAMOE_ROUTER_WRAPPER") == "GateTopkAllPushKernel"
 
         @functools.cache
-        def prepared_router(*_args, **_kwargs):
+        def prepared_router(all_push=False, recycle=False, ahead=False):
+            if all_push_only and not all_push:
+                return original_router(all_push=all_push, recycle=recycle, ahead=ahead)
             return module
 
         moe_topk._jit_gate_topk_fused_module = prepared_router
@@ -85,4 +90,6 @@ if __name__ == "__main__":
         if os.environ.get("MEGAMOE_SMOKE_PRODUCTION_ROUTES") != "1":
             raise RuntimeError("Producer dispatch requires the production route producer")
     configure()
-    runpy.run_path(os.environ["MEGAMOE_TEST_ENTRY"], run_name="__main__")
+    entry = Path(os.environ["MEGAMOE_TEST_ENTRY"]).resolve(strict=True)
+    sys.path.insert(0, str(entry.parent))
+    runpy.run_path(str(entry), run_name="__main__")

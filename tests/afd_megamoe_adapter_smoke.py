@@ -292,6 +292,9 @@ def main():
     check(expected, "diagnostic_replay")
     stamps = {f"{lane}:{step}": {"norm_rows": rows, "hidden": hidden, "stamps": values[21:-16].tolist(), "reset_worker_stamps": values[-16:].tolist()}
               for (lane, step), values in trace_buffers.items()}
+    if candidate.recycle_ahead:
+        for (lane, step), values in trace_buffers.items():
+            stamps[f"{lane}:{step}"]["reset_ahead"] = values[:21].tolist()
     timing_root = Path(os.environ["OUTPUT_ROOT"]) / "reset_timings"
     timing_root.mkdir(exist_ok=True)
     timing_path = timing_root / f"rank-{rank}.json"

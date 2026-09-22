@@ -15,10 +15,19 @@ from minisgl.server.supervisor_ray import _build_ray_runtime_env
 
 
 class MegaMoEAfdProtocolTest(unittest.TestCase):
-    def test_model_trace_path_reaches_ray_workers(self):
-        with patch.dict(os.environ, {"MINISGL_MEGAMOE_TRACE_ROOT": "/model-trace"}):
+    def test_optimization_settings_reach_ray_workers(self):
+        settings = {
+            "MINISGL_MEGAMOE_TRACE_ROOT": "/model-trace",
+            "MINISGL_MEGAMOE_RECYCLE_EARLY_PDL": "1",
+            "MINISGL_MEGAMOE_RECYCLE_CTAS": "1",
+            "MINISGL_MEGAMOE_RECYCLE_AHEAD": "1",
+            "MINISGL_MEGAMOE_RECYCLE_TMA": "1",
+            "MINISGL_MEGAMOE_NORM_PRELOAD_WEIGHT": "1",
+        }
+        with patch.dict(os.environ, settings):
             for env in (_build_ray_runtime_env(), runtime_env()):
-                self.assertEqual(env["env_vars"]["MINISGL_MEGAMOE_TRACE_ROOT"], "/model-trace")
+                for key, value in settings.items():
+                    self.assertEqual(env["env_vars"][key], value)
 
     def test_payload_selection_reaches_ray_workers(self):
         for mode in ("pull", "all_push"):
@@ -100,6 +109,7 @@ class MegaMoEAfdProtocolTest(unittest.TestCase):
         adapter.top_k, adapter.expert_map = 2, None
         adapter.gate_renormalize = True
         adapter.perfect_routing = adapter.defer_route_dependent_launch = False
+        adapter.recycle_ahead = False
         adapter.weights = {0: (object(), object())}
         adapter._run_mega_moe = Mock()
         buffer = SimpleNamespace(

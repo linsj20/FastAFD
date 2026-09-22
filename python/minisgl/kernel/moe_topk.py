@@ -48,21 +48,44 @@ def _jit_moe_topk_softmax_module() -> Module:
 
 
 @functools.cache
-def _jit_gate_topk_fused_module(all_push: bool = False, recycle: bool = False) -> Module:
+def _jit_gate_topk_fused_module(
+    all_push: bool = False, recycle: bool = False, ahead: bool = False
+) -> Module:
     from .utils import KERNEL_PATH, load_jit
 
     name = "gate_topk_fused_all_push" if all_push else "gate_topk_fused"
     wrapper = "GateTopkAllPushKernel" if all_push else "GateTopkFusedKernel"
     iket_include = os.environ.get("DG_JIT_IKET_INCLUDE") if all_push else None
+    early_recycle = os.environ.get("MINISGL_MEGAMOE_RECYCLE_EARLY_PDL", "0")
+    if early_recycle not in ("0", "1"):
+        raise ValueError("MINISGL_MEGAMOE_RECYCLE_EARLY_PDL must be 0 or 1")
+    early_recycle = recycle and early_recycle == "1"
+    reset_ctas = os.environ.get("MINISGL_MEGAMOE_RECYCLE_CTAS", "8")
+    if reset_ctas not in ("1", "4", "8"):
+        raise ValueError("MINISGL_MEGAMOE_RECYCLE_CTAS must be 1, 4 or 8")
+    tma_reset = os.environ.get("MINISGL_MEGAMOE_RECYCLE_TMA", "0")
+    if tma_reset not in ("0", "1"):
+        raise ValueError("MINISGL_MEGAMOE_RECYCLE_TMA must be 0 or 1")
+    if tma_reset == "1" and recycle and not ahead:
+        raise ValueError("TMA recycling requires ahead recycling")
+    tma_reset = tma_reset == "1" and ahead
     return load_jit(
-        name + ("_recycle" if recycle else ""),
+        name
+        + ("_recycle" + reset_ctas if recycle else "")
+        + ("_early" if early_recycle else "")
+        + ("_ahead" if ahead else "")
+        + ("_tma" if tma_reset else ""),
         cuda_files=[name + ".cu"],
         cuda_wrappers=[("launch", wrapper + "::run")],
         extra_include_paths=[
             str(KERNEL_PATH / "deepgemm" / "deep_gemm" / "include")
         ] + ([iket_include] if iket_include else []),
         extra_cuda_cflags=(["-DIKET_BUILD_ENABLED=1"] if iket_include else [])
-        + (["-DMEGAMOE_RECYCLE=1"] if recycle else []),
+        + (["-DMEGAMOE_RECYCLE=1"] if recycle else [])
+        + ([f"-DMEGAMOE_RECYCLE_CTAS={reset_ctas}"] if recycle else [])
+        + (["-DMEGAMOE_RECYCLE_EARLY_PDL=1"] if early_recycle else [])
+        + (["-DMEGAMOE_RECYCLE_AHEAD=1"] if ahead else [])
+        + (["-DMEGAMOE_RECYCLE_TMA=1"] if tma_reset else []),
     )
 
 
@@ -125,6 +148,7 @@ def gate_topk(
     recycle_payload: bool = False,
     recycle_rows: int = 0,
     recycle_timings: torch.Tensor | None = None,
+    recycle_ahead: tuple[torch.Tensor, torch.Tensor] | None = None,
     defer_route_dependent_launch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
@@ -268,7 +292,11 @@ def gate_topk(
         raise ValueError("payload recycling requires all-push and a prefix covering every row")
     if not recycle_payload and (recycle_rows or recycle_timings is not None):
         raise ValueError("reset rows/timings require payload recycling")
-    module = _jit_gate_topk_fused_module(all_push=bool(all_push), recycle=recycle_payload)
+    if recycle_ahead is not None and not recycle_payload:
+        raise ValueError("ahead maintenance requires payload recycling")
+    module = _jit_gate_topk_fused_module(
+        all_push=bool(all_push), recycle=recycle_payload, ahead=recycle_ahead is not None
+    )
     module.launch(
         weights, ids,
         hidden.contiguous(), gate_weight.contiguous(),
@@ -283,7 +311,14 @@ def gate_topk(
         bool(perfect_balance),
         bool(defer_route_dependent_launch),
         bool(all_push),
-        *([int(recycle_rows), recycle_timings] if all_push else []),
+        *(
+            [
+                int(recycle_rows),
+                recycle_timings,
+                *(recycle_ahead if recycle_ahead is not None else (None, None)),
+            ]
+            if all_push else []
+        ),
     )
     return ids, weights
 

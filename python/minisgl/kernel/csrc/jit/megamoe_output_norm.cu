@@ -39,6 +39,14 @@ __global__ void megamoe_output_add_rmsnorm(T* __restrict__ input, T* __restrict_
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   extern __shared__ float smem[];
   float* smem_x = smem + ceil_div(num_warps, 4) * 4;
+#ifdef MEGAMOE_NORM_PRELOAD_WEIGHT
+  // Weights are independent of the producer. Keep the first vector in
+  // registers across the dependency wait and the unchanged reduction.
+  vec_t<T, VEC_SIZE> first_weight;
+  first_weight.fill(0.f);
+  if (thread_id * VEC_SIZE < d)
+    first_weight.load(weight + thread_id * VEC_SIZE);
+#endif
 
   float sum_sq = 0.f;
 
@@ -123,7 +131,11 @@ __global__ void megamoe_output_add_rmsnorm(T* __restrict__ input, T* __restrict_
     weight_vec.fill(0.f);
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+#ifdef MEGAMOE_NORM_PRELOAD_WEIGHT
+      if (i == 0) weight_vec = first_weight;
+      else
+#endif
+        weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       x_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll

@@ -137,6 +137,10 @@ class MegaMoEAfdAdapter:
         self.buffers: list[_mega.MegaMoESymmBuffer] = []
         self.alternate_buffers: list[_mega.MegaMoESymmBuffer] = []
         self._output_buffers: dict[int, _mega.MegaMoESymmBuffer] = {}
+        ahead = os.environ.get("MINISGL_MEGAMOE_RECYCLE_AHEAD", "0")
+        if ahead not in ("0", "1"):
+            raise ValueError("MINISGL_MEGAMOE_RECYCLE_AHEAD must be 0 or 1")
+        self.recycle_ahead = ahead == "1"
         self.trace_root = os.environ.get("MINISGL_MEGAMOE_TRACE_ROOT")
         self._trace_timings = {}
         self._trace_output = {}
@@ -216,6 +220,12 @@ class MegaMoEAfdAdapter:
             for pair in zip(self.buffers, self.alternate_buffers):
                 for buffer in pair:
                     buffer.reset_dispatch_payload(self.all_push_capacity)
+                    if self.recycle_ahead:
+                        # Both banks were cleared above. A monotonic ready word
+                        # certifies generations 0 and 1 before any rank publishes.
+                        # Offset matches Workspace::get_payload_ready_ptr().
+                        offset = 32 + (1 + buffer.num_ranks) * 8
+                        buffer.buffer[offset:offset + 4].view(torch.int32).fill_(1)
                     buffer.handle.barrier(channel=0)
                     self._output_buffers[buffer.y.data_ptr()] = buffer
             torch.cuda.synchronize()
@@ -295,6 +305,13 @@ class MegaMoEAfdAdapter:
             recycle_payload=buffer.all_push,
             recycle_rows=self.all_push_reset_rows if buffer.all_push else 0,
             recycle_timings=debug_timings if buffer.all_push else None,
+            recycle_ahead=(
+                (
+                    (self.buffers[lane] if bank else self.alternate_buffers[lane]).buffer,
+                    (self.buffers[lane] if bank else self.alternate_buffers[lane]).buffer_ptrs_device,
+                )
+                if buffer.all_push and self.recycle_ahead else None
+            ),
             defer_route_dependent_launch=self.defer_route_dependent_launch,
         )
         y = buffer.y[:num_tokens]
@@ -347,6 +364,7 @@ class MegaMoEAfdAdapter:
                 "stamps": raw[21:reset_offset],
                 "cycle_timings": raw[:21],
                 "reset_worker_stamps": raw[reset_offset:reset_offset + 16],
+                **({"reset_ahead": raw[:21]} if self.recycle_ahead else {}),
             }
         (root / f"rank-{self.rank}.json").write_text(
             json.dumps({"rank": self.rank, "calls": calls}) + "\n"

@@ -2,9 +2,204 @@
 
 Consolidated September 21, 2026. This is the current kernel optimization memory:
 implementation, accepted measurements, rejected experiments, measurement contracts,
-and remaining ideas. Campaigns below are complete; historical queued/running
+and remaining ideas. Current work is tracked first; historical queued/running
 checkpoints do not authorize new work. The completed cleanup validation below covers
 the requested source, documentation and workflow scope.
+
+## Combined normalization preload — selected September22
+
+User requested normalization preload on and local Nsight traces. GPU7356961 passed
+18m42s; CPU7356986 passed40s after GPU release. Six mirrored perf-mode captures,
+90 ordinary samples at Qwen3 A3:F1 EP8 batch4/128K, synthetic KV/perfect routing.
+Combined = earlyPDL1/ahead1/8workers/vector reset(TMA0)/norm preload1. Selected
+control differs only in preload0. Existing compiled modules reused, source unchanged.
+
+| Mode | Pooled ms | Saving vs pull |
+|---|---:|---:|
+| Pull |18.144076833|—|
+| Selected, preload0 |17.891784667|0.252292167ms (1.3905%)|
+| Combined, preload1 |17.842612433|0.301464400ms (1.6615%)|
+
+Preload adds0.049172233ms (0.27483%), forward/reverse0.061229267/0.037115200ms.
+Retain preload1 as **new selected best**: it improves both matched orders. Total
+1.6615% does NOT exceed historical1.973% from another allocation; preload-off was
+already slower relative to pull here. Cause unestablished; do not add cross-allocation
+savings. Evidence `preload_model_analysis/` and `combined_selected_result.json`
+under `scratch/megamoe/reset_overlap_20260921`.
+
+Fresh actual8192/A3:F1/EP8/B4 real-input alignment passes:96x17 full prompts and
+continuations match cached-score inputs;1398 top1/1631 top10,1/1632 top10 misses,
+within agreed max4 (same prompt92/position11/rank17). Perf mode0/NSYS0, no GPU-held
+scoring/manual waits; all jobs terminal. Only the combined forward arm's exact
+metric-selected attention rank1/FFN rank25 pair copied (2,497,262bytes), both nonempty
+and remote/local sizes matching, with unchanged metric/result and provenance:
+`scratch/afd/cases/qwen3/isl_131072/ep_8/a3-f1/batch_4/megamoe-reset-pdl-preload-20260922-j7356961/`.
+Other raw captures remain remote. Alignment summary in the matching `isl_8192` path.
+
+Cross-allocation ordinary main-kernel follow-up (rank25, all15 measured graphs per
+order,188calls/graph): old pull37.999569us → new36.695467us; old selected preload0
+36.233277us → new35.446559us. Both kernels improved, pull by1.304102us versus
+selected0.786718us. Pull remains slower; selected advantage narrows1.766293→
+1.248908us. Shrink0.517385us x188 =0.097268ms, close to observed model-advantage
+loss0.105906ms. This supports reduced relative kernel gain, not exact critical-path
+attribution or a proven hardware cause. New preload1 main35.368325us and output
+norm3.855517us versus preload0 norm4.178173us. Evidence:
+`preload_model_analysis/cross_allocation_kernel_comparison.json`.
+
+## Selected reset/PDL implementation and invariants
+
+Target Qwen3 A3:F1 EP8 batch4 has six physical rows per FFN lane. Campaign root
+is `scratch/megamoe/reset_overlap_20260921` locally and `R/artifacts/reset_overlap_20260921`
+remotely; tested serving source is `R/source/local-mirror`. Plans, commands, exact
+source patches and job records remain in each experiment directory.
+
+Selected settings (opt-in; pull and legacy defaults remain available):
+`MINISGL_MEGAMOE_PAYLOAD_MODE=all_push`, `MINISGL_MEGAMOE_RECYCLE_EARLY_PDL=1`,
+`MINISGL_MEGAMOE_RECYCLE_AHEAD=1`, `MINISGL_MEGAMOE_RECYCLE_CTAS=8`,
+`MINISGL_MEGAMOE_RECYCLE_TMA=0`, `MINISGL_MEGAMOE_NORM_PRELOAD_WEIGHT=1`.
+Both Ray environment lists forward all settings. Invalid values fail explicitly.
+
+- Gate-entry PDL admits independent reset workers while token selectors still
+  acquire complete logits/SF from the gate. Main acquires the existing CountsReady
+  aggregate (physical rows+8), then the async proxy fence. No added launch/grid join.
+- Two equal-layout arenas per lane alternate by layer parity, each with two
+  activation banks. Initially cleared banks certify generations0 and1. Workers
+  latch epoch and monotonic local/assigned-peer readiness before current admission.
+  They maintain the current next bank only if needed, then the other arena's next
+  bank. Current upkeep is required for repeated layers and0,1,0 graph replay's0,0
+  boundary; unconditional cross-arena swapping is incorrect.
+- Clear stores precede CTA join, worker-completion acqrel ticket and system-release
+  payload readiness. Metadata retirement stays necessary; per-arena counters cannot
+  overlap selector calls. Peer-outer contiguous clearing changes no arithmetic.
+  Worker counts1/4/8 contribute8/count to CountsReady;1 omits completion aggregation.
+- Independent norm preload keeps the first weight vector across the existing
+  hardware producer wait and unchanged reduction. Qwen3 H4096/512threads/vec8
+  covers all weights; larger dimensions load later rounds normally. SASS confirmed
+  first weight load before dependency acquire and no local spills in either mode.
+- Optional/default0 TMA reset retains a4KiB shared source tile, per-thread async
+  shared fence and CTA join, bulk copies, commit and **full** `wait_group 0` before
+  existing completion/publication. Never substitute `.read`. References and ordering
+  contract: `reset_tma/contract.json`. Model increment0.002159ms is not a material
+  improvement; vector stays selected. No software-gate/main-warp prototype is live.
+- Diagnostics distinguish actual clears from already-ready observations; skipped
+  clear statistics are null. Worker coverage, publication/acquisition and owning
+  kernel intervals remain audited. Instrumentation does not establish ordinary
+  latency, useful instruction overlap or a memory-bandwidth bottleneck.
+
+## Reset/PDL model milestones and alignment
+
+All cohorts use128K perf mode, synthetic KV/perfect routing, A3:F1 EP8 batch4 and
+2microbatches. Norm preload is off in these earlier cohorts. All measured samples
+are retained; the primary metric uses the maximum complete graph span across
+attention rank1 and model/FFN rank25. Kernel averages use188calls/graph (94layers x2),
+15 measured graphs x2 orders =5,640 calls per variant on FFN0, not across EP ranks.
+
+| Cohort | Pull ms | Current all-push ms | Early PDL/ahead8 ms | Total saving |
+|---|---:|---:|---:|---:|
+|7341284, CPU recovery7341819|18.205295|17.965749|17.881714|0.323581ms /1.777%|
+|7346203, CPU7346230|18.150747|17.892048|17.792549|0.358198ms /1.973%|
+
+First cohort:90 samples; extra reset/PDL0.084035ms. Ordinary main pull37.116470us,
+current35.263322us, selected35.756654us. Pull→current main projection0.348392ms;
+measured total leaves0.024811ms gap. Main entry advances0.937300us while main duration
+grows0.493332us; producer→main-end improvement0.443968us x188 =0.083466ms, matching
+the additional model saving. Do not cherry-pick the smaller0.255645ms selected-main
+projection as proof of full realization. Evidence `model_analysis_recovered/`.
+Separate22,560-call model diagnostics: all clear the other arena, no current clears;
+FFN0 clock-offset width1.344us,2727/2820 clears definitely before main. No guaranteed
+reset-worker overlap with gate/main; not proof of zero instruction overlap.
+
+Second cohort:120 samples including optional TMA8,23m00s GPU and54s CPU. Selected
+extra reset/PDL0.099499ms; total0.358198ms meets corresponding ordinary-main projection
+`(37.999569-36.124091)us*188 =0.352590ms`. TMA graph17.790391ms, extra0.002159ms
+(forward0.000136/reverse0.004181). This meets the expected saving on this allocation,
+not a theoretical optimum or proof other gains are impossible. Evidence
+`tma_model_analysis/`; source `tma_model_source.patch` and file list. Combined preload
+cohort and cross-allocation interpretation are at the top of this document.
+
+Alignment uses actual8192 context, real routing/prefill,96prompts x17tokens and the
+agreed maximum4 top10 misses. All successful generations below exactly match full
+prompt/continuation cached scoring inputs;1398 top1,1631 top10 of1632, same sole
+prompt92/position11/token6149/rank17 miss. This passes the agreed gate, not strict
+zero-miss alignment. No fresh reference scoring is required with identical inputs.
+
+| Version | GPU generation | CPU audit | Evidence |
+|---|---|---|---|
+|Recovered early PDL/ahead8|7341912,6m29s|7341917,43s|`generation_recovered/`, `generation_audit_recovered/`|
+|Selected vector checkpoint|7343632,5m51s|7343648,28s|`final_alignment/`, `final_alignment_audit/`|
+|Optional TMA8|7347084,5m43s|7347098,29s|`tma_alignment/`, `tma_alignment_audit/`|
+|Selected vector + norm preload|7356961,18m42s including perf|7356986,40s|`preload_model/`, `preload_model_analysis/`|
+
+Local current trace pair is linked above. The earlier four-mode cohort has16 metric-
+selected reports (18,930,677bytes) in the standard case hierarchy, labels
+`megamoe-reset-pdl-<arm>-20260922-j7346203`; `local_nsys_traces.json` inventories them.
+All pairs are nonempty, match remote sizes and retain original metrics/results.
+
+## Reset experiments: accepted and rejected evidence
+
+Ordinary adapter gains below are complete-chain maximum-rank means, forward/reverse;
+positive means faster. Instrumented clear spans alone never select a candidate.
+All artifacts below are under the campaign root; prototypes remain isolated.
+
+| Experiment / artifact | GPU / CPU analysis | Exact checks | Result and decision |
+|---|---|---:|---|
+|Early gate PDL, `adapter/`|7340099 /7340103|10,176|+0.120570/+0.160810us; retain.192 diagnostics. CPU7340052/7340095 prepared kernels/model cache.|
+|Reset workers, `workers/`|7340275 /7340498|9,384|4 workers lose0.035640/0.021380us;1 loses0.107950/0.190440us. Retain8;288 diagnostics.7340278 analysis used stale repeat inputs, fixed without GPU rerun.|
+|Unused DispatchDone removal, `retirement_complete/`|7340552 /7340565|6,256|+0.019260/-0.056060us mixed; not promoted. Removed41 EP8 updates in prototype only. Earlier7340412 stopped on missing diagnostic specialization; CPU7340544 completed cache.|
+|Ahead reset, `ahead/`|7340736 /7340756|9,384|Ahead8 +0.126829/+0.121650us; ahead1 slower.288 diagnostics;16 current/32 ahead clears per48-call replay. CPU7340718 prepared ABI/caches. Abstract16,380 ordered sequences also passed, not device proof.|
+|Norm preload, `preload/`|7341131 /7341147|6,256|+0.253960/+0.300141us; preserve independently, now model-selected.192 diagnostics. CPU7341103 prepared4norm variants/tests/SASS.|
+|Addressing/sole publisher, `reset_followup/`|7341954 /7341958|12,512|Addressing-only loses0.007430/0.057549us; sole clearer loses0.082480us then gains0.018570us. Retain ahead8.384 diagnostics; CPU7341570 prepares isolated variants.|
+|Norm-embedded reset, `norm_reset/`|7342779 /7343068|12,512|Regresses1.85–4.11us despite overlap. Rejected and source restored; archived `norm_reset_rejected_source.tar.gz`. CPU7342790 output-name collision recovered from saved traces.|
+|Local readiness certificate, `certificate_compare/`|7343232 /7343236|6,256|Regresses0.208820/0.261340us;192 diagnostics. Reject peer-load skipping.|
+|Gate-embedded reset / barrier-only, `gate_reset_compare/`|7343977 /7343980|9,384|Gate reset loses1.65–1.79us despite1.282us measured overlap; main entry~2us later. Barrier-only mixed. Neither promoted.|
+|Software gate publication, `gate_signal_compare/`|7344400 /7344408|9,384|Gate-only loses1.771/1.748us; gate reset2.636/2.005us.192 ordering audits; reject separate returned ticket/software signal.|
+|Packed CountsReady gate phase, `gate_packed_compare/`|7345160 /7345162|9,384|High16 gate-CTA count/low16 rows+8; non-returning release, token acquire, main one aggregate. Gate-only loses0.784–3.056us; gate reset1.536–1.989us.288 diagnostics/192 ordering audits; reject.|
+|TMA1/8 and async completion, `reset_tma_compare/`|7345298 /7345300|15,640|TMA8 +0.036890/+0.164071us; TMA1 and vector/TMA non-returning worker0 aggregation mixed.480 diagnostics. Retain only TMA8 for confirmation.|
+|Main-warp reset / TMA8 confirmation, `main_reset_compare/`|7345638 /7345654|9,384|Main warp1 loses4.034/3.862us; main grows~4us with entry unchanged. Reject. TMA8 +0.074910/+0.264430us confirms adapter gain.288 diagnostics.|
+
+Main-warp prototype borrowed warp1 of the first8 main CTAs before its scheduler
+walk; warp0 remained activation TMA issuer. No extra launch/barrier was added, but
+startup became slower. Deferred reset behind a stable payload-tail-ready flag and
+reduced per-warp acquire duplication remain untested ideas; no approval, promised
+gain or pending experiment follows from recording them. Failed placements do not
+prove an unattainable model saving.
+
+## Resource and preparation lessons
+
+- GPU7341284 was cancelled by146504 after performance capture, during alignment;
+  user reports idle-GPU detection. API became ready, then sample log stayed empty
+  before cancellation. No assistant gate existed; exact cause unproven. Avoidable
+  work included prompt-cache miss, alignment Nsight and eager tokenizer import.
+  Sampling now imports tokenizer only for scoring/comparison and flushes its
+  request marker. Prebuild caches/prompts, use NSYS0 for alignment and score on CPU
+  after release. The later complete sequences have no manual idle gate.
+- Native/router ABI and device cache preparation must precede GPU use. Header
+  timestamps can trigger host rebuild even after restoring identical contents.
+  CPU7345858 built native/four routers and passed5 protocol tests, then failed on
+  a nonexistent extra device donor. CPU7346155 reused those builds, completed
+  device cache/17-module TVM union from proven `ahead_cpu/jit/cache` in1m54s.
+- Prepared all-push router overrides retain ordinary pull routing in the same
+  adapter test; never apply changed all-push ABI to pull. Source/cache freeze applies
+  to every live consumer. Node/rank cache seeding and fail-fast missing-cache checks
+  remain enabled; no automatic fallback or padded GPU work.
+- Reuse numeric comparisons and reject incomplete/filtered contracts. Named-arm
+  comparison preserves legacy RNE results. Saved diagnostic support includes
+  norm/gate/reset ownership and gate acquires without a singular publisher stamp;
+  do not fabricate a publication time for packed gate readiness.
+
+## September22 progress staging
+
+User requested cleanup, alignment verification and a commit. Scope excludes the
+separate `CODEX_PROJECT_aga_bringup.md` and `codex_scripts/plot_megamoe_ep_scaling.py`
+changes. Pre-cleanup19-file snapshot/patch is in `stage_progress/`; detailed earlier
+working notes remain in that archive. Cleaned Python formatting/comments and
+consolidated this chronology; measured CUDA source and runtime behavior unchanged.
+CPU7357776 passed1m02s against the cleaned remote mirror:5 protocol tests,
+stdlib-only sampling CLI startup,48 ahead-reset +48 packed-gate diagnostic records,
+all90 matched performance samples (same numeric gains), and full1,632-token8K
+alignment re-audit (same1 top10 miss under agreed max4). No new GPU rerun needed
+for formatting/comment-only cleanup. Existing workspace/cluster instructions cover the lessons;
+no global skill or AGENTS changes proposed.
 
 ## Deep cleanup and regression validation — complete September 21
 
@@ -76,7 +271,7 @@ remote touched-file backups are under `source_before_sync`. No model E2E or new
 alignment claim is made for this kernel cleanup. Root AGENTS.md question remains
 unanswered; the user-provided instructions governed the work.
 
-## Current selection and evidence
+## Base kernel selection and September21 evidence
 
 - Maintained all-push: u32 normalization producer, peer-mask activation dispatch,
   original scheduler. Remote frozen source: `source/dispatch_overlap_u32_final`.
@@ -84,8 +279,8 @@ unanswered; the user-provided instructions governed the work.
   `payload_mode="all_push"` to `MegaMoESymmBuffer`.
 - Latest kernel gate: September21 cleanup passes all four matched Qwen3/Qwen3.5
   EP8/EP16 cases above. Earlier u32/peer-mask gains remain the selected algorithm.
-  These kernel changes have no additional model E2E claim.
-- Last model-tested snapshot: `source/all_push_peer_ready_rne_20260920`.
+  The later reset/PDL and preload model results are recorded above.
+- Historical model-tested snapshot: `source/all_push_peer_ready_rne_20260920`.
   Qwen3 A3:F1, EP8, B4, 128K decode graph improves 0.121037 ms (0.668%) against
   matched pull. Its 8K alignment has one top-10 miss in 1,632 tokens, accepted
   under the user's maximum-four-miss criterion; it is not strict zero-miss agreement.
@@ -217,6 +412,17 @@ in 3,754 calls (16.640%). Minimum clear/readiness margins before norm end are
 all 2,820 FFN0 calls (offset width 1,359 ns); this is not token-CTA concurrency proof.
 Profiler tags are union rank + 1: tag25 is FFN0/global rank24.
 
+September21 retrospective: the recorded model case is A3:F1, not A3:F3.
+From `rne_validation_analysis/evidence_summary.json`, ordinary forward FFN0 main
+saves 1.746382270 µs/call. At 94 layers × 2 microbatches = 188 calls/step,
+the additive main-only projection is 0.328319867 ms (1.812% of pooled pull).
+Producer-start→main-end saves 1.518990780 µs/call, projecting 0.285570267 ms.
+Neither projection is an E2E measurement or includes a separately established PDL
+critical-path saving; do not add overlapping kernel envelopes. Actual pooled
+graph gain is 0.121037433 ms, 36.866% of the main-only projection. EP8 ranks
+execute concurrently, so do not multiply the projection by eight. Earlier
+pre-RNE model gain was 0.197694467 ms; final corrected-source evidence supersedes it.
+
 Final nominal-8K generation has 96 prompts × 17 tokens = 1,632. Fresh reference
 7298334 scored all prompts after the performance allocation released. Coverage,
 prompt/token/position identity and finite logprobs pass. Top10: 1,631/1,632
@@ -292,6 +498,23 @@ Final reports, relative to campaign:
 
 - `qwen3/results/qwen3-final-all-push-megamoe-comparisons.html`
 - `qwen35/results/qwen35-final-all-push-megamoe-comparisons.html`
+
+September22 fixed-token scaling report: `plots/ep-scaling-fixed-tokens.html`, same
+format as September12 pull report, 15 curves/62 points using unfiltered rank0
+30-call ordinary medians. Reusable `plot_megamoe_ep_scaling.py` now accepts
+`--report-subdir results`, `--label`, `--baseline-roots` and optional `--preview`;
+source-report checks honor its saved filtering audit, while plotted CSV medians
+remain unfiltered. All62 points/ideal anchors checked; chart PNG visually reviewed.
+Historical baseline `comm_final_20260912/sweeps/{qwen3,qwen35}` matches all164/300
+cases/contracts. Equal-case average latency reduction is **-7.872380%/-5.642619%**
+(regression), pooled464 cases **-6.430724%**. Mean case-median latency is
+81.486052→94.402049µs Q3 and103.108800→117.698082µs Q35; reduction of those means
+is -15.850562%/-14.149405%, a different weighting. Losses concentrate at Q3EP2
+(-25.743% mean reduction) andQ35EP4(-24.099%); EP>=8 mean reduction is
++15.783300%/+10.291559% over36/161 cases. Every higher-EP group improves on
+average. This is cross-allocation historical evidence with different preparation,
+not a paired causal code gain. Full per-case/by-EP data and formulas are retained
+in `plots/ep-scaling-fixed-tokens.comparison.json` and embedded HTML provenance.
 
 Original three views, aliases and shared-scale layout are preserved. Full EP64
 unfiltered case-median exposed dispatch ranges are 6.784–9.248 µs Q3 and

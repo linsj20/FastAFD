@@ -49,13 +49,32 @@ def audit(captured, markers, rank):
             norm = (record["stamps_ns"][3:3 + 2 * record["norm_rows"]]
                     + record["residual_preload_end_ns"])
             gate, selector = chains[pair["primary_start_ns"]]
-            workers = record["reset_worker_intervals_ns"]
-            reset = [s for worker in workers for s in worker] + record["stamps_ns"][1:3]
+            gate_stamps = [s for worker in record.get("gate_worker_intervals_ns", []) for s in worker]
+            if "gate_ready_ns" in record:
+                gate_stamps.append(record["gate_ready_ns"])
+            current_workers = record["reset_worker_intervals_ns"]
+            workers = list(current_workers) if record.get("reset_current_performed", True) else []
+            reset = [s for worker in current_workers for s in worker] + record["stamps_ns"][1:3]
+            reset += record.get("gate_consumer_ready_ns", [])
+            if "ahead_reset_performed" in record:
+                ahead_workers = record["ahead_reset_worker_intervals_ns"]
+                owner = record.get("ahead_reset_kernel", "selector")
+                if owner not in ("norm", "selector", "gate"):
+                    raise ValueError(f"Unknown ahead reset kernel: {owner}")
+                stamps = {"norm": norm, "selector": reset, "gate": gate_stamps}[owner]
+                stamps += [s for worker in ahead_workers for s in worker]
+                stamps += record["ahead_reset_observation_ns"]
+                if record["ahead_reset_performed"]:
+                    workers += ahead_workers
             # globaltimer = Nsight + offset; no average or best-fit alignment.
-            for stamps, start, end in (
-                    (combine, pair["primary_start_ns"], pair["primary_end_ns"]),
-                    (norm, pair["consumer_start_ns"], pair["consumer_end_ns"]),
-                    (reset, selector["start"], selector["end"])):
+            bounds = [
+                (combine, pair["primary_start_ns"], pair["primary_end_ns"]),
+                (norm, pair["consumer_start_ns"], pair["consumer_end_ns"]),
+                (reset, selector["start"], selector["end"]),
+            ]
+            if gate_stamps:
+                bounds.append((gate_stamps, gate["start"], gate["end"]))
+            for stamps, start, end in bounds:
                 lo, hi = max(stamps) - end, min(stamps) - start
                 lower = lo if lower is None else max(lower, lo)
                 upper = hi if upper is None else min(upper, hi)
@@ -72,16 +91,19 @@ def audit(captured, markers, rank):
             call[name + "_workers_guaranteed_overlap"] = sum(v > 0 for v in overlap)
             call[name + "_workers_guaranteed_inside"] = sum(
                 a >= start + upper and b <= end + lower for a, b in call["workers"])
-            call[name + "_minimum_worker_overlap_ns"] = min(overlap)
+            call[name + "_minimum_worker_overlap_ns"] = min(overlap) if overlap else None
         call["last_clear_before_main_start_ns"] = [
             call["main_ns"][0] + offset - max(b for _, b in call["workers"])
-            for offset in (lower, upper)]
+            for offset in (lower, upper)] if call["workers"] else None
     return {"rank": rank, "calls": len(calls), "clock_offset_ns": [lower, upper],
             "clock_offset_width_ns": upper - lower,
-            "calls_all_workers_inside_gate": sum(c["gate_workers_guaranteed_inside"] == 8 for c in calls),
+            "calls_all_workers_inside_gate": sum(
+                bool(c["workers"]) and c["gate_workers_guaranteed_inside"] == len(c["workers"]) for c in calls),
             "calls_any_worker_overlaps_gate": sum(c["gate_workers_guaranteed_overlap"] > 0 for c in calls),
             "calls_any_worker_overlaps_main": sum(c["main_workers_guaranteed_overlap"] > 0 for c in calls),
-            "calls_clear_before_main": sum(c["last_clear_before_main_start_ns"][0] >= 0 for c in calls),
+            "calls_without_clear": sum(not c["workers"] for c in calls),
+            "calls_clear_before_main": sum(c["last_clear_before_main_start_ns"] is not None and
+                                           c["last_clear_before_main_start_ns"][0] >= 0 for c in calls),
             "records": calls, "interpretation": __doc__}
 
 

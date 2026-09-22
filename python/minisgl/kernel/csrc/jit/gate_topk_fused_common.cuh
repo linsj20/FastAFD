@@ -86,6 +86,11 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
     const int num_tokens, const int num_experts, const int hidden_size,
     const int num_expert_splits,
     const int topk, const bool renormalize) {
+#ifdef MEGAMOE_RECYCLE_EARLY_PDL
+  // Reset CTAs need only the previous arena generation. Token selectors still
+  // acquire this producer with PDL::wait before reading logits or quantization.
+  device::PDL::launch<true>();
+#endif
   // v3 layout: grid = mtiles x num_expert_splits blocks. A block owns 8 experts with
   // the FULL K (no cross-block reduction); its 8 warps split K and run
   // fully independent per-warp cp.async pipelines (cp.async groups are
@@ -259,7 +264,9 @@ __launch_bounds__(kTPB) __global__ void gate_topk_fused_tc_kernel(
   // Let the dependent selector become resident while the tail of the gate
   // grid drains. Its grid-dependency wait below preserves the full producer
   // barrier before any logit is consumed.
+#ifndef MEGAMOE_RECYCLE_EARLY_PDL
   device::PDL::launch<true>();
+#endif
 }
 
 }  // namespace
