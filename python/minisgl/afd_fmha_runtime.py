@@ -1499,6 +1499,9 @@ class AfdFmhaRuntime:
             num_layers=int(self.model_config.num_layers),
             top_k=int(self.model_config.num_experts_per_tok),
             num_max_tokens_per_rank=self.max_rows,
+            num_max_decode_tokens_per_rank=(
+                max(int(bs) for bs in self.worker.decode_graph_bs) * self.fanin_capacity
+            ),
             num_lanes=self.num_lanes,
             tp_size=int(experts0.tp_size),
             tp_rank=int(self.worker.tp_rank),
@@ -1518,9 +1521,6 @@ class AfdFmhaRuntime:
             experts.down_proj_scale = None
             if layer_id % 4 == 3:
                 torch.cuda.empty_cache()
-        adapter.allocate_buffers()
-        self._mega_moe = adapter
-
         total_sms = int(
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
@@ -1542,6 +1542,8 @@ class AfdFmhaRuntime:
                 "DeepGEMM rejected the MegaMoE compute-SM budget: "
                 f"requested={compute_sms} actual={int(deep_gemm.get_num_sms())}"
             )
+        adapter.allocate_buffers()
+        self._mega_moe = adapter
         torch.cuda.empty_cache()
         log_line(
             self.worker.log_path,
@@ -1627,6 +1629,7 @@ class AfdFmhaRuntime:
             layer.mlp.gate.weight,
             lane=lane,
             num_token_non_padded=self.state.ctx.moe_num_token_non_padded,
+            phase=self.state.ctx.batch.phase,
         )
         if int(layer.mlp.experts.tp_size) > 1:
             output = layer.mlp.experts._comm.all_reduce(output)
@@ -1959,6 +1962,9 @@ class AfdFmhaRuntime:
 
     def _normalize_model_input(self, norm, hidden, residual, shared, shared_gate):
         if shared is None:
+            adapter = getattr(self, "_mega_moe", None)
+            if adapter is not None and adapter.normalize_output(norm, hidden, residual):
+                return hidden, residual
             return norm.forward(hidden, residual)
         if residual is None:
             raise RuntimeError("deferred shared output requires a residual")
@@ -1969,6 +1975,9 @@ class AfdFmhaRuntime:
 
     def _finalize_model_hidden(self, hidden, residual, shared, shared_gate, *, stream=None):
         if shared is None:
+            adapter = getattr(self, "_mega_moe", None)
+            if adapter is not None and adapter.normalize_output(self.model.model.norm, hidden, residual):
+                return hidden
             return self.model.finalize_hidden(hidden, residual)
         if stream is not None:
             shared.record_stream(stream)
@@ -2629,6 +2638,12 @@ class AfdFmhaRuntime:
                 self.state.stream.wait_event(self._graph_output_free)
             self._prepare_graph_replay(entry, batch, plan, bs)
             entry.graph.replay()
+        adapter = getattr(self, "_mega_moe", None)
+        if adapter is not None and adapter.trace_root:
+            self.state.stream.synchronize()
+            adapter.save_trace(plan.step_id, [
+                int(sub.positions.numel()) for sub in self._microbatches(batch)
+            ])
         if self.role == "attention":
             return None
         if entry.next_tokens is None:

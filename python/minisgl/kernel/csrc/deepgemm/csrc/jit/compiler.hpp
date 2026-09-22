@@ -107,13 +107,16 @@ public:
         fsync_path(path);
     }
 
-    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
+    std::filesystem::path cache_path(const std::string& name, const std::string& code) const {
         const auto kernel_signature = fmt::format("{}$${}$${}$${}", name, signature, flags, code);
-        const auto dir_path = cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
+        return cache_dir_path / "cache" / fmt::format("kernel.{}.{}", name, get_hex_digest(kernel_signature));
+    }
 
-        // Hit the runtime cache
-        if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
-            return runtime;
+    // Compile without loading a CUDA module or creating a device context.
+    std::filesystem::path precompile(const std::string& name, const std::string& code) const {
+        const auto dir_path = cache_path(name, code);
+        if (KernelRuntime::check_validity(dir_path))
+            return dir_path;
 
         // Compile into a temporary directory, then atomically rename the whole directory
         // NOTES: renaming a directory is atomic on both local and distributed filesystems,
@@ -152,7 +155,17 @@ public:
             safe_remove_all(tmp_dir_path);
         }
 
-        // Put into the runtime cache
+        DG_HOST_ASSERT(KernelRuntime::check_validity(dir_path));
+        return dir_path;
+    }
+
+    std::shared_ptr<KernelRuntime> build(const std::string& name, const std::string& code) const {
+        const auto dir_path = cache_path(name, code);
+        if (const auto runtime = kernel_runtime_cache->get(dir_path); runtime != nullptr)
+            return runtime;
+        if (get_env<int>("DG_JIT_REQUIRE_CACHE", 0))
+            DG_HOST_UNREACHABLE(fmt::format("Missing precompiled kernel: {}", dir_path.string()));
+        precompile(name, code);
         const auto runtime = kernel_runtime_cache->get(dir_path);
         DG_HOST_ASSERT(runtime != nullptr);
         return runtime;
@@ -201,7 +214,7 @@ class NVCCCompiler final: public Compiler {
     }
 
 public:
-    NVCCCompiler() {
+    explicit NVCCCompiler(const std::string& target_arch = "") {
         // Override the compiler signature
         nvcc_path = cuda_home / "bin" / "nvcc";
         if (const auto env_nvcc_path = get_env<std::string>("DG_JIT_NVCC_COMPILER"); not env_nvcc_path.empty())
@@ -211,7 +224,9 @@ public:
 
         // The override the compiler flags
         // Only NVCC >= 12.9 supports arch-specific family suffix
-        const auto arch = device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);
+        const auto arch = target_arch.empty()
+            ? device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9)
+            : target_arch;
         flags = fmt::format("{} -I{} --gpu-architecture=sm_{} "
                             "--compiler-options=-fPIC,-O3,-fconcepts,-Wno-deprecated-declarations,-Wno-abi "
                             "-O3 --expt-relaxed-constexpr --expt-extended-lambda",

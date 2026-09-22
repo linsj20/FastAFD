@@ -13,9 +13,28 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'codex_scripts'))
 import seed_native_cache
 import submit_plan
+from summarize_megamoe_router_timeline import audit_joined_preparation
 
 
 class CodexWorkflowTests(unittest.TestCase):
+    def test_joined_preparation_requires_exact_nodes_stream_and_metadata_order(self):
+        def row(start, end, name, stream=7):
+            return (start, end, name, 1, 1, stream)
+        producer, selector = row(100, 120, "producer"), row(110, 140, "selector")
+        preparation = [row(0, 20, "decomposition_collective_barrier("),
+                       row(19, 40, "at::native::FillFunctor<int>"),
+                       row(39, 60, "at::native::FillFunctor<int>"),
+                       row(59, 105, "decomposition_collective_barrier(")]
+        # Adjacent Nsight envelopes may overlap; metadata must follow preparation.
+        self.assertEqual(audit_joined_preparation(preparation, producer, selector), preparation)
+        invalid = [preparation[:-1], preparation + [row(70, 80, "unexpected")],
+                   [*preparation[:3], row(59, 111, "decomposition_collective_barrier(")],
+                   [*preparation[:3], row(59, 105, "decomposition_collective_barrier(", 8)],
+                   [preparation[0], row(19, 40, "unexpected"), *preparation[2:]]]
+        for rows in invalid:
+            with self.subTest(rows=rows), self.assertRaises(ValueError):
+                audit_joined_preparation(rows, producer, selector)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -91,7 +110,7 @@ class CodexWorkflowTests(unittest.TestCase):
         self.invoke(seed_native_cache, *args)
         node = cache / 'ray-node-192_0_2_1'
         for root in [node, node / 'rank1', node / 'rank2']:
-            self.assertEqual((root / 'module').resolve(), module)
+            self.assertTrue((root / 'module').samefile(module))
         with self.assertRaises(ValueError):
             self.invoke(seed_native_cache, *args)
 

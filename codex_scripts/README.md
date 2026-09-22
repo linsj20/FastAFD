@@ -1,121 +1,170 @@
 # Agent workflows
 
-Keep reusable launch, audit and analysis tools here. Experiment-specific plans,
-frozen helper versions, logs and generated reports belong under `scratch/` locally
-and the corresponding remote artifact directory. Read the relevant
-`CODEX_PROJECT_<topic>.md` before resuming a campaign.
+Keep reusable launch, correctness and analysis tools here. Plans, frozen workflows,
+logs and generated outputs belong under `scratch/` locally and the matching remote
+artifact directory. Read [MegaMoE optimization](../CODEX_PROJECT_megamoe_optimization.md)
+for current source selection, protocol, results and measurement contracts.
 
-## Main commands
+## Plan execution and CPU preparation
 
-| Task | Command |
+| Task | Tool |
 |---|---|
 | Submit `env.json` + `submit.json` | `python codex_scripts/submit_plan.py sbatch PLAN` |
-| Submit `env.json` + `launch.json` | `python codex_scripts/submit_plan.py afd PLAN` |
-| Preview an AFD launcher plan | Append `--dry-run` to the preceding command |
-| Monitor recorded jobs | `python codex_scripts/monitor_afd_jobs.py PLAN... --watch-seconds 180` |
-| Run several AFD plans in one allocation | `run_afd_plan_sequence.sbatch` |
-| Score saved model samples | `score_afd_samples.sbatch` |
-| Audit complete generation and fresh reference scores | `audit_afd_sample.py` |
-| Compare only matching saved reference prefixes | `compare_cached_alignment.py` |
-| Seed a compatible DeepGEMM host module | `seed_native_cache.py DONOR --cache-root CACHE --output RECORD` |
-| Seed completed TVM modules | Same command with `--kind tvm`; optional `--node-ip IP --rank-count N` |
-| Plan, collect and audit kernel sweeps | `megamoe_input_sweep.py` |
-| Execute an explicitly authorized sweep order | `run_megamoe_sweeps.py` |
+| Submit `env.json` + `launch.json` | `python codex_scripts/submit_plan.py afd PLAN` (add `--dry-run` to preview) |
+| Monitor recorded jobs | `monitor_afd_jobs.py PLAN... --watch-seconds 300` |
+| Run several model plans in one allocation | `run_afd_plan_sequence.sbatch` |
+| Seed compatible host/device/TVM modules | `seed_native_cache.py` |
+| CPU-compile saved DeepGEMM specializations | `precompile_deepgemm_cache.py` |
+| CPU-prepare a sweep's ordinary/profiling kernels | `precompile_megamoe_sweep.py` |
+| Own replacement paths in a fresh header overlay | `prepare_header_overlay.py` |
+| Run standard smoke with explicit native/router/header sources | `megamoe_header_smoke.py` |
+| Check saved IKET discovery resource allocation | `validate_iket_module_resources.py` |
+| Extract selected CUDA functions / inspect dispatch registers | `extract_cuda_sass.py`, `review_megamoe_dispatch_sass.py` |
 
-Submission requires a dedicated output directory and refuses an existing
-`job.json`. Meet the campaign's correctness gates and outstanding-job limit before
-submission. There is no automatic retry or promotion workflow. Scoring preserves
-all shards before enforcing the strict top-10 gate; Qwen3.5 text-only reference
-plans must include `--language-model-only` in `VLLM_EXTRA_ARGS`.
+Submission requires a dedicated output directory and refuses an existing `job.json`.
+Optional `--data-host oci-hsg-data` separates transfer from the submission host.
+There is no automatic retry/promotion. CPU preparation/analysis uses cpu-normal on
+HSG; GPU work uses short. Run complete validation/performance workloads, including
+kernel/chain comparisons where appropriate; never allocate GPUs for debugging,
+manual waiting or padded runtime. Check a timed-out observation before resubmitting.
 
-Cache seeding requires matching source/ABI, compiler target and execution image.
-It does not seed device kernels or establish binary compatibility. Existing
-unrelated native modules are never replaced.
+Cache donors must match source/ABI, compiler target and execution image. Device
+seeding uses `--kind device` with a CPU-precompiled donor; `DG_JIT_REQUIRE_CACHE=1`
+fails on missing specializations. Native compatibility remains the caller's
+responsibility. DeepEP seeding uses `--kind deepep --copy` and preserves build.signature;
+TVM supports node/rank scoping. Fresh CPU DeepEP builds need an explicit architecture
+(GB200: `TORCH_CUDA_ARCH_LIST=10.0`). Never overwrite unrelated caches.
 
-## Retained specialized tools
+CPU/GPU IKET include-path spelling must match literally: compiler flags enter cache
+keys even when filesystem aliases resolve identically. Header overlays own every
+replacement ancestor and reject existing destinations. Freeze base/overlay/cache
+while jobs consume them. `MEGAMOE_NATIVE_SOURCE_ROOT` pins native checks to the
+intended host source; a device-header override alone cannot validate descriptor ABI.
+Offline IKET allocation checks are not numerical correctness or ABI proof.
 
-| Purpose | Files |
+## Kernel comparisons and complete sweeps
+
+| Task | Tool |
 |---|---|
-| Repeated source comparisons and exact checks | `megamoe_source_abba.sbatch`, `compare_megamoe_results.sbatch`, `collect_megamoe_abba.py`, `summarize_megamoe_abba.py`, `audit_megamoe_exact_outputs.py`, `audit_megamoe_config_comparison.py` |
-| Bounded header/router overlays for the standard smoke test | `megamoe_header_smoke.py`; requires `MEGAMOE_HEADER_ROOT` and `MEGAMOE_TEST_ENTRY`; optional `MEGAMOE_ROUTER_SOURCE` requires production routes and full-pipeline timing |
-| Repeated sweep arms | `prepare_megamoe_sweep_abba.py`, `megamoe_sweep_abba.sbatch`, `collect_megamoe_sweep_arms.py`, `compare_megamoe_sweep_arms.py` |
-| Sweep execution and profiling | `megamoe_input_sweep.sbatch`, `profile_megamoe_iket.sbatch`, `iket_event_register_limits.py`, `review_megamoe_dispatch_sass.py` |
-| Historical comparisons | `compare_megamoe_sweeps.py`, `compare_megamoe_frozen_history.py`, `compare_megamoe_fullchain.py`, `freeze_megamoe_fullpath_history.py` |
-| Timing and routing analysis | `summarize_megamoe_router_timeline.py`, `compare_megamoe_router_timelines.py`, `summarize_megamoe_routing.py`, `summarize_megamoe_scaling.py`, `summarize_afd_kernel_families.py`, `analyze_afd_attention_gap.py` |
-| Reports and plots | `build_megamoe_comparison.py`, `plot_megamoe_config_comparison.py`, `plot_megamoe_decomposition.py`, `summarize_afd_sweep.py`, `compare_afd_sweep_metrics.py`, `plot_afd_sweep.py` |
-| Focused CUDA validation | `run_cuda_check.sbatch`, `validate_afd_graph_metadata.py`, `validate_fused_quant_outputs.py`, `validate_qwen35_gdn_fusion.py` |
-| Evidence archival | `archive_sweep_cases.py` |
+| Plan, collect and audit deduplicated AFD-equivalent inputs | `megamoe_input_sweep.py` |
+| Capture ordinary/IKET sweeps | `megamoe_input_sweep.sbatch`, `profile_megamoe_iket.sbatch` |
+| Validate/run/analyze explicit same-EP model groups | `run_megamoe_sweep_group.py validate\|capture\|analyze PLAN` |
+| Execute authorized sweep order | `run_megamoe_sweeps.py` |
+| Analyze mirrored comparisons, preserving ranks/calls | `analyze_megamoe_sweep_comparison.py` (`--ordinary-only` recovers a complete ordinary prefix) |
+| Trace producer-to-main intervals and repeated comparisons | `summarize_megamoe_router_timeline.py`, `compare_megamoe_rank_timelines.py` |
+| Phase/pair and rank-local startup summaries | `summarize_megamoe_latency.py`, `summarize_megamoe_startup.py` |
+| Three-window marker decoding | `decode_megamoe_readiness_windows.py` |
+| Decomposition-only collective preparation | `decomposition_barrier.py`, `decomposition_barrier.cu` |
+| All-rank CUDA event collection/comparison | `collect_cuda_rank_timings.py`, `compare_cuda_rank_timings.py` |
 
-`summarize_megamoe_latency.py NAME=decomposition.json ... --output comparison.json`
-compares metadata-origin critical CTA pairs, MMA release spread, per-pair
-first-MMA-to-compute-end spans, and ordinary kernel times. Per-pair spans separate
-startup skew from pipeline duration; they include pipeline waits. It also partitions
-each pair at `MegaCombineStart`, the first FC2 epilogue after accumulator readiness
-(not FC1 end or FC2 MMA start). It distinguishes actual `MegaMmaIssue` from the historical
-`MegaComputeStart` operand-ready proxy. Add `--markdown-output comparison.md`
-for side-by-side milestone tables, with ordinary timings separate and every
-instrumented capture retained. Add `--ordinary-input ordinary.json` to include
-ordinary-only repetitions in their execution order: an ordered object mapping
-each pass name to `mean`, `median`, `min`, and `max` in microseconds. It must
-include every profiled arm and match that arm's captured ordinary timings;
-repeated medians are never pooled. Operation starts, publication issues and consumer
-observations remain distinct; outgoing producer markers do not measure incoming
-network latency. Existing A/SF/index/gather markers are also joined to every
-compute pair; their observation gaps are not isolated operand-stall durations.
-Optional direct SF-store, index/score-store, SF-publication, and first-window A
-publication markers also retain per-CTA work-to-issue intervals. These do not
-measure publication completion or isolate fence cost. SF worker marker counts
-use `MEGAMOE_IKET_SF_WORK_WARPS` when those markers are present.
-For an explicitly direct producer-metadata reader, set
-`MEGAMOE_IKET_METADATA_MATERIALIZED=0`; the profiler requires SF detail and
-absence of the removed metadata-store marker. The decomposition records
-`receiver_metadata_materialized=false`, and metadata-copy timings are null.
-The default retains the metadata-store requirement for paths with SF detail.
-Per-warp activation publication uses
-`MEGAMOE_IKET_FIRST_PAYLOAD_PUBLISHERS_PER_CTA` and
-`MEGAMOE_IKET_FULL_PAYLOAD_PUBLISHERS_PER_CTA` (both default to 1).
-The summary retains individual first-window publication issues when multiple
-warps publish; the earliest issue does not certify the whole tile.
-Use `MEGAMOE_IKET_ACTIVATION_LOAD_SEMANTICS` to record whether the legacy
-`MegaGatherIssued` marker follows indexed gather or regular TMA, including
-the issuer count and expected completion bytes. Reports use “activation load.”
-Optional `GenphaseRemainderValidateStart` pairs with `GenphaseFullPayloadIssue`
-at the same CTA/warp. The summary rejects missing or reversed pairs, retains
-repeated raw-marker bounds/counts, and reports validation-to-publication issue
-time separately from consumer wait.
-For independent prefix/remainder producers, document that the latter publication
-certifies only remaining K bytes; consuming the prefix still requires its own acquire.
-The profiler supports explicit
-`FASTAFD_IKET_CAPTURE_PHASE=normal|profile` with capture-only mode, allowing all
-ordinary arms to finish before profiling; profile requires the same run's baseline.
+`precompile_megamoe_sweep.py MANIFEST... --source SOURCE --cache-root CACHE
+--iket-include INCLUDE` validates all-push capacity and prepares kernels without
+initializing CUDA. `--preparation-inputs` includes saved weight/input preparation
+specializations. Manifests can explicitly pin per-case bucket/source contracts;
+launch, preparation and analysis must use those values. All-push uses one expert
+wave and at most32-row tiles, retaining actual input counts for larger problems.
 
-The timing tools distinguish ordinary GPU execution from instrumented phase spans
-and client latency. Preserve all observations and historical provenance; a failed
-performance or alignment gate is a result, not permission to change the threshold.
-`profile_megamoe_iket.sbatch` retains direct source markers by CTA/warp and pairs
-instrumented selector metadata launches with MegaMoE samples when present.
-`megamoe_header_smoke.py` passes `DG_JIT_IKET_INCLUDE` to an overridden router;
-without it, the same sources build without IKET markers. No source injection.
-Detailed startup decomposition is the primary dispatch diagnostic: compare the
-same case's operation starts and first-MMA CTA pair, retaining every sample.
-The experimental Lamport payload harness uses
-`MEGAMOE_SMOKE_RESET_DISPATCH_PAYLOAD=1`: existing symmetric-memory GPU barrier, active-row
-source-bank reset, barrier, then producer+MegaMoE. Preparation and workload are
-separate graphs; CUDA event pairs exclude the entire preparation step. MegaMoE-only
-Nsight durations and IKET first-MMA timestamps are the primary measurements. Use that same setup for both compared arms;
-these event-pair timings are distinct from historical uninterrupted graph batches.
+The group runner does not submit/retry jobs. Plan validation checks every manifest,
+shape and required path before GPU use. The profiler captures every rank, exports
+`rank_decomposition/rank-R/decomposition.json`, and preserves rank0 report schema.
+`MEGAMOE_IKET_ROLE_CONTRACT=all_push_sweep` validates actual active marker roles,
+including sparse workers. Missing required markers remain errors. Explicit capture
+phases `normal|profile` allow all ordinary arms before profiling; profiling requires
+that run's ordinary baseline.
 
-## September 15 consolidation
+Current decomposition uses `MEGAMOE_DECOMPOSITION=1`,
+`MEGAMOE_SMOKE_PREPARE_BARRIER=collective` and explicitly
+`MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT=joined`. Preparation and workload share a
+CUDA graph; outer event span includes preparation, while Nsight workload duration
+and IKET phases exclude it. Barrier-to-metadata placement must pass. The default
+separate layout retains its stricter pre-producer placement audit.
 
-`submit_plan.py` replaces `submit_megamoe_plan.py` and `launch_afd_plan.py`.
-`seed_native_cache.py` replaces both native cache-seeding scripts.
-The still-used `audit_fullpath` function moved from the retired validation runner
-to `compare_megamoe_fullchain.py` without changing its gates.
+Initialize/record the entire CUDA event pool before warmups via
+`collect_cuda_rank_timings.make_timing_event_pairs`; use
+`summarize_megamoe_router_timeline.py --require-preinitialized-events` to audit it.
+For complete ordinary graph comparisons use `--require-graph-identity
+--retain-timestamps`, then `compare_megamoe_rank_timelines.py` with explicit ranks,
+samples, control and candidates, each with a matching `_repeat` arm.
+Joined collective captures additionally require `--joined-collective-preparation`:
+validate both barriers and both resets in the same graph/stream before metadata.
+The paired analyzer selects this audit from the plan's preparation contract.
 
-Removed the superseded automatic validation/report runners, three experimental
-per-warp marker analyzers, and the standalone experimental Lamport transport
-probe. Pre-cleanup versions are preserved under
-`scratch/megamoe/commit_cleanup_20260915/scripts_before` and in the corresponding
-remote artifact directory. Historical plans continue to use their frozen workflow
-copies; recreate a current plan using the commands above rather than rewriting
-completed experiment evidence.
+Latency analysis preserves actual MMA issue, metadata-origin coverage, pair-local
+pipeline spans and issue/publication/observation distinctions. Three-window decoder
+retains raw wire names and window ordinals; H<=2048 has no tail. Optional
+`decode_mma_retirement` requires the exact active even CTA set. Publication of one
+window does not certify other windows. Use explicit metadata materialization,
+SF-work-warp, publisher-count and activation-load-semantics settings matching the
+captured source; do not silently reinterpret historical tags.
+
+## Model correctness and overlap
+
+| Task | Tool |
+|---|---|
+| Score generated samples against fresh reference | `score_afd_samples.sbatch` |
+| Audit ordered prompt/token coverage and finite scores | `audit_afd_sample.py` |
+| Compare saved scores only at identical prefixes | `compare_cached_alignment.py` |
+| Separate path and PDL gains in paired orders | `compare_afd_ablations.py` |
+| Kernel families/complete graph spans | `summarize_afd_kernel_families.py` |
+| Explain attention/step differences | `analyze_afd_attention_gap.py` |
+| Account for overlapping trace regions | `summarize_cuda_coverage.py` |
+| Reset/output/consumer ordering | `summarize_megamoe_recycling.py` |
+| Bound reset overlap with one common clock-offset interval | `bound_megamoe_reset_overlap.py` |
+| Focused CUDA launch/metadata/quantization/GDN checks | `run_cuda_check.sbatch`, `validate_afd_graph_metadata.py`, `validate_fused_quant_outputs.py`, `validate_qwen35_gdn_fusion.py` |
+
+`audit_afd_sample.py` defaults to zero top10 misses. `--max-top10-misses N` applies
+only an explicitly agreed allowance; final all-push used4 across1,632 tokens.
+The legacy scoring wrapper still has a zero-miss exit gate. Preserve shards before
+that gate; Qwen3.5 reference plans need `--language-model-only` in VLLM_EXTRA_ARGS.
+
+Adapter correctness lives in `tests/afd_megamoe_adapter_smoke.py`; optional chain
+benchmark uses `MEGAMOE_ADAPTER_BENCH_ITERATIONS` and rows (default6). Model-matched
+Q3 B4 uses `MEGAMOE_SMOKE_BUCKET=1548` for pull; all-push remains1152. Keep reset and
+norm inside chain timing; exclude only norm fixture setup. Input seeds are fixed
+independently of preceding fixture coverage. Rank timing pools each rank before maxima.
+
+For selector-fused recycling use `--independent-readiness
+--hardware-output-dependency`; every combine writer must precede output use and all
+eight clears precede reuse readiness. Model diagnostics use
+`MINISGL_MEGAMOE_TRACE_ROOT` with measured capture metadata, explicit ranks/layers/
+lanes, and complete coverage. Instrumented latency is not ordinary performance.
+Profiler worker tags are global rank +1; Q3 A3:F1 EP8 tag25 is FFN0. Deferred final
+norm pairs remain in audits and require care for per-call critical-path claims.
+
+`FASTAFD_DEFER_CUDA_EXTRACTION=1` saves the exact CPU extraction argument list at
+`CASE_RUN_DIR/experiment/cuda-extract-command.json`; run it after GPU release.
+GPU capture completion and validated metric extraction are separate gates.
+
+## Reports and reference backend
+
+| Task | Tool |
+|---|---|
+| Full decomposition plots | `plot_megamoe_decomposition.py` |
+| Refresh same-format comparison HTML | `build_megamoe_comparison.py` |
+| Fixed-total-token EP scaling HTML | `plot_megamoe_ep_scaling.py`, template `megamoe_ep_scaling.html` |
+| AFD metric sweeps/comparisons/plots | `summarize_afd_sweep.py`, `compare_afd_sweep_metrics.py`, `plot_afd_sweep.py` |
+| Explicit installed TRT-LLM DeepGEMM reference sweep | `trtllm_megamoe_sweep.py`, `trtllm_megamoe_sweep.sbatch`, `trtllm_megamoe_iket_nvcc.sh`, `iket_event_register_limits.py` |
+| Archive complete cases/selected evidence | `archive_sweep_cases.py` |
+
+Load the visualization skill before producing/updating visualizations. Reference
+TRT-LLM sweeps use the original installed backend, not optimized AFD or TRT CuTe;
+ordinary timing uses the untouched image. Its sequence command runs one EP job and
+CPU analysis at a time, stopping on failure. `collect` exports the shared schema;
+build reports with `--source-format trtllm-original`.
+
+`build_megamoe_comparison.py --exclude-outliers` is an explicit report option:
+per-case distance from median must exceed max(3 ×1.4826×MAD,5% of median), separately
+for ordinary/IKET duration. One retained IKET set supplies all phase statistics.
+All cases/raw observations remain; `outlier_audit.json` records exact exclusions.
+Do not apply this option to optimization evidence without authorization.
+
+## September21 cleanup
+
+Removed27 obsolete helpers: the legacy ABBA and multi-arm sweep/history stacks, temporary
+marker-subset/profiling comparisons, rejected receiver/scheduler models and finished
+probe summaries. Current sweep/group runner, rank comparison, full profiler and
+correctness contracts remain. No retained code imports or invokes removed helpers.
+Original versions and the old workflow guide are archived once at
+`scratch/megamoe/deep_cleanup_20260921/before_cleanup.tar.gz`; the adjacent manifest
+lists exact filenames/reasons and additional code archives. Completed plans should use their frozen workflows;
+do not repoint them to a different current tool and silently change their contract.

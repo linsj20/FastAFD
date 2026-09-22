@@ -15,8 +15,13 @@ from minisgl.server.supervisor_ray import _build_ray_runtime_env
 
 
 class MegaMoEAfdProtocolTest(unittest.TestCase):
+    def test_model_trace_path_reaches_ray_workers(self):
+        with patch.dict(os.environ, {"MINISGL_MEGAMOE_TRACE_ROOT": "/model-trace"}):
+            for env in (_build_ray_runtime_env(), runtime_env()):
+                self.assertEqual(env["env_vars"]["MINISGL_MEGAMOE_TRACE_ROOT"], "/model-trace")
+
     def test_payload_selection_reaches_ray_workers(self):
-        for mode in ("pull", "compact_push"):
+        for mode in ("pull", "all_push"):
             with patch.dict(os.environ, {"MINISGL_MEGAMOE_PAYLOAD_MODE": mode}):
                 coordinator_env = _build_ray_runtime_env()
                 self.assertEqual(coordinator_env["env_vars"]["MINISGL_MEGAMOE_PAYLOAD_MODE"], mode)
@@ -48,6 +53,9 @@ class MegaMoEAfdProtocolTest(unittest.TestCase):
             loader = stack.enter_context(patch.object(
                 afd._weights, "Mxfp4ExpertWeightLoader", autospec=True))
             allocator = stack.enter_context(patch.object(mega, "MegaMoESymmBuffer", autospec=True))
+            allocator.return_value.payload_mode = "pull"
+            allocator.return_value.all_push = False
+            allocator.return_value.num_max_tokens_per_rank = 8
             adapter = afd.MegaMoEAfdAdapter(
                 group=object(), num_experts=8, num_local_experts=4,
                 hidden_size=1024, intermediate_size=512, num_layers=1,
@@ -60,16 +68,42 @@ class MegaMoEAfdProtocolTest(unittest.TestCase):
             self.assertEqual(allocator.call_count, 2)
             self.assertTrue(all(c.kwargs["inband_combine"] is True
                                 for c in allocator.call_args_list))
+            # Decode storage stays fixed for both small and 8K prompt budgets;
+            # only the explicit pull-prefill allocation follows the input limit.
+            stack.enter_context(patch.object(torch.cuda, "Stream"))
+            stack.enter_context(patch.object(torch.cuda, "Event"))
+            stack.enter_context(patch.object(torch.cuda, "synchronize"))
+            stack.enter_context(patch.dict(os.environ, {
+                "MINISGL_MEGAMOE_PAYLOAD_MODE": "all_push",
+            }))
+            allocator.return_value.payload_mode = "all_push"
+            allocator.return_value.all_push = True
+            allocator.return_value.num_max_tokens_per_rank = 1024
+            allocator.return_value.handle = SimpleNamespace(barrier=Mock())
+            allocator.return_value.y = torch.empty(8, 1024)
+            for prefill_capacity in (8, 8192):
+                allocator.reset_mock()
+                adapter.buffers = []
+                adapter.bucket = prefill_capacity
+                adapter.allocate_buffers()
+                self.assertEqual(
+                    [(c.kwargs["payload_mode"], c.kwargs["num_max_tokens_per_rank"])
+                     for c in allocator.call_args_list],
+                    [("all_push", 1024)] * 4 + [("pull", prefill_capacity)] * 2,
+                )
 
     def test_padded_empty_rank_participates_with_prepared_metadata(self):
         adapter = object.__new__(afd.MegaMoEAfdAdapter)
         adapter.hidden_size, adapter.bucket, adapter.num_lanes = 1024, 8, 1
+        adapter.all_push_reset_rows = 1024
+        adapter.prefill_buffers = []
         adapter.top_k, adapter.expert_map = 2, None
         adapter.gate_renormalize = True
         adapter.perfect_routing = adapter.defer_route_dependent_launch = False
         adapter.weights = {0: (object(), object())}
         adapter._run_mega_moe = Mock()
         buffer = SimpleNamespace(
+            all_push=False,
             topk_idx=torch.empty(8, 2, dtype=torch.int64),
             topk_weights=torch.empty(8, 2), x=torch.empty(8, 1024),
             x_sf=torch.empty(8, 32), y=torch.empty(8, 1024),
@@ -85,20 +119,57 @@ class MegaMoEAfdProtocolTest(unittest.TestCase):
         adapter._run_mega_moe.assert_called_once()
         self.assertTrue(all(adapter._run_mega_moe.call_args.kwargs.values()))
 
+        # Alternating layers use distinct storage. Reset and readiness belong
+        # to the native specialization, with no per-call events or peer barrier.
+        buffer.all_push = True
+        alternate = SimpleNamespace(**vars(buffer))
+        calls = Mock()
+        adapter.alternate_buffers = [alternate]
+        adapter.weights[1] = adapter.weights[0]
+        adapter._run_mega_moe = calls.moe
+        with patch.object(afd, "gate_topk", calls.gate):
+            for layer in (0, 1, 0):
+                adapter.forward(layer, torch.zeros(1, 1024), torch.zeros(8, 1024),
+                                lane=0, num_token_non_padded=0)
+        self.assertEqual([c[0] for c in calls.mock_calls], ["gate", "moe"] * 3)
+        self.assertEqual([c.args[3] for c in calls.moe.call_args_list],
+                         [buffer, alternate, buffer])
+        self.assertTrue(all(c.kwargs["recycle_payload"] for c in calls.gate.call_args_list))
+        self.assertTrue(all(c.kwargs["reset_rows"] == 1024 for c in calls.moe.call_args_list))
+
+        calls.reset_mock()
+        with patch.object(afd, "gate_topk", calls.gate), self.assertRaisesRegex(
+            RuntimeError, "exceeds row capacity=1024"
+        ):
+            adapter.forward(0, torch.zeros(1025, 1024), torch.zeros(8, 1024),
+                            lane=0, num_token_non_padded=1025)
+        self.assertFalse(calls.mock_calls)
+
+        # Prefill is an explicit phase policy, independent of the decode shape.
+        prefill = SimpleNamespace(**{**vars(buffer), "all_push": False})
+        adapter.prefill_buffers = [prefill]
+        calls.reset_mock()
+        with (patch.object(afd, "gate_topk", calls.gate),
+              patch.object(torch.cuda, "current_stream", side_effect=AssertionError("decode prep in prefill"))):
+            adapter.forward(0, torch.zeros(1, 1024), torch.zeros(8, 1024),
+                            lane=0, num_token_non_padded=0, phase="prefill")
+        self.assertEqual([c[0] for c in calls.mock_calls], ["gate", "moe"])
+        self.assertIs(calls.moe.call_args.args[3], prefill)
+
     def test_both_weight_wrappers_use_allocation_protocol(self):
         buffer = SimpleNamespace(buffer=object(), buffer_ptrs=[1, 2], rank=0,
-                                 num_max_tokens_per_rank=8, num_experts=8, num_topk=2, compact_push=False)
+                                 num_max_tokens_per_rank=8, num_experts=8, num_topk=2, all_push=False)
         extension = Mock()
         with patch.object(mega, "_ext", return_value=extension):
             for mode, compact in ((False, False), (True, False), (False, True), (True, True)):
-                buffer.compact_push = compact
+                buffer.all_push = compact
                 buffer.inband_combine = mode
                 with patch.dict(os.environ, {"DG_MEGAMOE_LAMPORT_COMBINE": str(int(not mode))}):
                     for name in ("fp8_fp4_mega_moe", "fp8_fp8_mega_moe"):
                         getattr(mega, name)(object(), (1, 2), (3, 4), buffer,
                                            routes_prepared=True, rank_gated_combine=True,
                                            route_ready_dispatch=True, rank_ready_route_publish=True)
-                        self.assertEqual(getattr(extension, name).call_args.args[-2:], (mode, buffer.compact_push))
+                        self.assertEqual(getattr(extension, name).call_args.args[-2:], (mode, buffer.all_push))
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -63,31 +64,6 @@ def _check_source_results(case: str, rank: int, **values: Any) -> None:
     print(f"MEGAMOE_RESULT_{mode.upper()}_OK case={case} rank={rank}", flush=True)
 
 
-_MEGAMOE_TIMING_SLOTS = (
-    "dispatch_pre_pull",
-    "dispatch_pull",
-    "dispatch_cleanup",
-    "tma_a_loop",
-    "tma_a_first_l1_arrival_wait",
-    "tma_a_l1_arrival_wait",
-    "tma_a_l2_arrival_wait",
-    "tma_a_empty_wait",
-    "tma_b_loop",
-    "tma_b_empty_wait",
-    "mma_loop",
-    "mma_first_full_wait",
-    "mma_tmem_empty_wait",
-    "mma_full_wait",
-    "epilogue_loop",
-    "epilogue_tmem_full_wait",
-    "l2_remote_writeback",
-    "tag2_barrier",
-    "combine",
-    "tma_a_first_l1_ready_from_kernel_start",
-    "mma_first_full_ready_from_kernel_start",
-)
-
-
 def _positive_int_list(name: str, default: str) -> list[int]:
     values = [int(value) for value in os.environ.get(name, default).split(",")]
     if not values or any(value <= 0 for value in values):
@@ -115,18 +91,46 @@ def _dispatch_preparation(get_buffer, rows):
     if setting == "0":
         return None
 
+    barrier_mode = os.environ.get("MEGAMOE_SMOKE_PREPARE_BARRIER", "symmetric")
+    if barrier_mode not in ("symmetric", "peer_signals", "collective"):
+        raise ValueError("Unknown dispatch preparation barrier")
+    collective = None
+    if barrier_mode == "collective":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "codex_scripts"))
+        from decomposition_barrier import CollectiveBarrier
+        buffer = get_buffer()
+        collective = CollectiveBarrier(buffer.group, buffer.buffer.device)
+
+    def barrier(buffer):
+        if collective is not None:
+            collective()
+            return
+        if barrier_mode == "symmetric":
+            if buffer.num_ranks > 32:
+                raise ValueError("EP>32 requires the explicit peer_signals preparation barrier")
+            buffer.handle.barrier(channel=0)
+            return
+        # The installed PyTorch barrier launches only one warp. Explicit
+        # peer operations cover EP64 using the same release/acquire signals.
+        # Publish to every peer before waiting; preparation stays untimed.
+        for peer in range(buffer.num_ranks):
+            if peer != buffer.rank:
+                buffer.handle.put_signal(peer, 0, 60000)
+        for peer in range(buffer.num_ranks):
+            if peer != buffer.rank:
+                buffer.handle.wait_signal(peer, 0, 60000)
+
     def prepare():
         buffer = get_buffer()
-        # Existing symmetric-memory GPU barrier; no extra NCCL communicator.
-        buffer.handle.barrier(channel=0)
+        barrier(buffer)
         buffer.reset_dispatch_payload(rows)
-        buffer.handle.barrier(channel=0)
+        barrier(buffer)
 
     return prepare
 
 
 def _time_prepared_graph(run_stage, prepare_stage, output, *, warmups, iterations):
-    """Separate preparation graph; kernel-only Nsight durations are primary."""
+    """Diagnose graph launch gaps; joined-layout event timings include preparation."""
     graph_batch = int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1"))
     if graph_batch != 1:
         raise ValueError("Prepared timing requires graph_batch=1")
@@ -134,36 +138,61 @@ def _time_prepared_graph(run_stage, prepare_stage, output, *, warmups, iteration
     run_stage()
     torch.cuda.synchronize()
     dist.barrier()
-    # Keep preparation and workload in separate graphs. IKET's tracker cannot
-    # instantiate the earlier NCCL/external-event graph; neither graph here has
-    # external event nodes. Event ranges still exclude every preparation replay.
-    preparation = torch.cuda.CUDAGraph()
+    # Compare a host launch between preparation/workload against one graph.
+    # Both layouts avoid external event nodes. Joined-layout outer CUDA events
+    # include preparation; Nsight workload and IKET phase durations do not.
+    layout = os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate")
+    if layout not in {"separate", "joined"}:
+        raise ValueError("Prepared graph layout must be separate or joined")
+    preparation = torch.cuda.CUDAGraph() if layout == "separate" else None
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(preparation):
-        prepare_stage()
+    if preparation is not None:
+        with torch.cuda.graph(preparation):
+            prepare_stage()
     with torch.cuda.graph(graph):
+        if layout == "joined":
+            prepare_stage()
         run_stage()
+    print(f"MEGAMOE_PREPARED_GRAPH_LAYOUT rank={dist.get_rank()} layout={layout} "
+          f"event_span_includes_preparation={layout == 'joined'}", flush=True)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "codex_scripts"))
+    from collect_cuda_rank_timings import make_timing_event_pairs
+    pairs = make_timing_event_pairs(iterations, device=output.device)
+    print(f"MEGAMOE_TIMING_EVENT_POOL_READY rank={dist.get_rank()} count={iterations}", flush=True)
     for _ in range(warmups):
-        preparation.replay()
+        if preparation is not None:
+            preparation.replay()
         graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
     profile = int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0"))
     if profile:
         torch.cuda.profiler.start()
-    pairs = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-             for _ in range(iterations)]
+    # Every rank finishes profiler initialization before timed work can begin.
+    dist.barrier()
     for start, end in pairs:
-        preparation.replay()
+        if preparation is not None:
+            preparation.replay()
         start.record()
         graph.replay()
         end.record()
     pairs[-1][1].synchronize()
-    total_ms = sum(start.elapsed_time(end) for start, end in pairs)
+    sample_ms = [start.elapsed_time(end) for start, end in pairs]
+    total_ms = sum(sample_ms)
     if profile:
         torch.cuda.profiler.stop()
     elapsed = torch.tensor([total_ms / iterations], dtype=torch.float64, device="cuda")
     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+    if os.environ.get("MEGAMOE_RANK_TIMING_OUTPUT"):
+        sys.path.insert(0, os.environ["MEGAMOE_RANK_TIMING_MODULE_ROOT"])
+        from collect_cuda_rank_timings import collect_rank_timings
+        collect_rank_timings(
+            sample_ms, os.environ["MEGAMOE_RANK_TIMING_OUTPUT"],
+            scope=("joined graph: preparation barrier/reset plus producer, selector, MegaMoE"
+                   if layout == "joined" else
+                   "prepared workload graph: producer, selector, and MegaMoE; preparation excluded"),
+            metadata={"device": str(output.device), "rank": dist.get_rank()},
+        )
     if not torch.isfinite(output).all():
         raise RuntimeError("prepared graph output is non-finite")
     return float(elapsed[0]), float(output.abs().max())
@@ -752,8 +781,6 @@ def _exact_qwen_fixed_perfect_case(
         raise RuntimeError("MEGAMOE_SMOKE_TIMING_SCOPE must be pipeline or megamoe")
     if warmups < 0 or iterations <= 0 or bucket < rows:
         raise RuntimeError("invalid fixed-perfect MegaMoE timing dimensions")
-    if int(os.environ.get("MEGAMOE_SMOKE_DEBUG_TIMINGS", "0")) != 0:
-        raise RuntimeError("fixed-perfect MegaMoE profiling forbids kernel timing")
     if num_experts <= 0 or num_experts % world_size:
         raise RuntimeError("fixed-perfect experts must be divisible by EP world size")
     if not 0 < top_k <= num_experts:
@@ -784,7 +811,7 @@ def _exact_qwen_fixed_perfect_case(
         hidden=hidden,
         intermediate_hidden=intermediate,
     )
-    if timing_scope == "megamoe" and production_routes and not buffer.compact_push:
+    if timing_scope == "megamoe" and production_routes and not buffer.all_push:
         raise RuntimeError("kernel-only replay requires in-kernel dispatch")
     flat = torch.arange(rows * top_k, dtype=torch.int64, device="cuda")
     fixed_ids = ((flat + token_offset * top_k) % num_experts).view(rows, top_k)
@@ -932,7 +959,9 @@ def _exact_qwen_fixed_perfect_case(
             "timing_iterations": iterations,
             "timing_graph_batch": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
             "timing_rank_reduction": "max",
-            "dispatch_reset_outside_timing": prepare_dispatch is not None,
+            "dispatch_reset_outside_timing": (prepare_dispatch is not None and
+                os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate") == "separate"),
+            "prepared_graph_layout": os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate"),
             "timing_cuda_profiler_range": int(os.environ.get("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE", "0")),
             "milliseconds": elapsed,
             "output_max": output_max,
@@ -963,7 +992,6 @@ def _exact_qwen_case(
     iterations = int(os.environ.get("MEGAMOE_SMOKE_ITERATIONS", "100"))
     bucket = int(os.environ.get("MEGAMOE_SMOKE_BUCKET", str(max(row_counts))))
     contend_cycles = int(os.environ.get("MEGAMOE_SMOKE_CONTEND_CYCLES", "0"))
-    debug_timings = int(os.environ.get("MEGAMOE_SMOKE_DEBUG_TIMINGS", "0"))
     route_prepare_modes = _nonnegative_int_list(
         "MEGAMOE_SMOKE_ROUTE_PREPARE_MODES", "0"
     )
@@ -980,8 +1008,6 @@ def _exact_qwen_case(
         raise RuntimeError("MegaMoE smoke warmups must be nonnegative and iterations positive")
     if contend_cycles < 0:
         raise RuntimeError("MEGAMOE_SMOKE_CONTEND_CYCLES must be nonnegative")
-    if debug_timings not in (0, 1):
-        raise RuntimeError("MEGAMOE_SMOKE_DEBUG_TIMINGS must be 0 or 1")
     if any(mode not in (0, 1) for mode in route_prepare_modes):
         raise RuntimeError("MEGAMOE_SMOKE_ROUTE_PREPARE_MODES only supports 0 and 1")
     if any(mode not in (0, 1) for mode in combine_modes):
@@ -1030,10 +1056,6 @@ def _exact_qwen_case(
     if bucket < max(row_counts):
         raise RuntimeError(
             f"MEGAMOE_SMOKE_BUCKET={bucket} is smaller than rows={max(row_counts)}"
-        )
-    if debug_timings and (len(row_counts) != 1 or len(sm_counts) != 1):
-        raise RuntimeError(
-            "MEGAMOE_SMOKE_DEBUG_TIMINGS requires exactly one row and SM configuration"
         )
 
     hidden = int(os.environ.get("MEGAMOE_SMOKE_HIDDEN", "4096"))
@@ -1266,12 +1288,12 @@ def _exact_qwen_case(
                     real = (row + rank) % 3 != 0
                     row_map.append(compact if real else -1)
                     compact += int(real)
-                for phase, metadata in enumerate(([prefix], [compact, *row_map])):
+                for phase, metadata in enumerate(([0], [prefix], [compact, *row_map])):
                     validity = torch.tensor(metadata, dtype=torch.int64, device="cuda")
                     output.fill_(float("nan"))
                     run_stage()
                     torch.cuda.synchronize()
-                    padding = (torch.arange(rows, device="cuda") >= prefix if phase == 0
+                    padding = (torch.arange(rows, device="cuda") >= metadata[0] if phase < 2
                                else validity[1:] < 0)
                     if (not torch.isfinite(output).all() or torch.count_nonzero(output[padding])
                             or (ids[padding] >= 0).any() or torch.count_nonzero(weights[padding])):
@@ -1305,60 +1327,11 @@ def _exact_qwen_case(
                     "output_max": output_max,
                     "max_active_experts": max_active,
                     "timed_scope": "router_and_megamoe",
-                    "dispatch_reset_outside_timing": prepare_dispatch is not None,
+                    "dispatch_reset_outside_timing": (prepare_dispatch is not None and
+                        os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate") == "separate"),
+                    "prepared_graph_layout": os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate"),
                     "calls_per_graph": int(os.environ.get("MEGAMOE_SMOKE_GRAPH_BATCH", "1")),
                 }
-                if debug_timings:
-                    timing_tensor = torch.zeros(
-                        len(_MEGAMOE_TIMING_SLOTS), dtype=torch.int64, device="cuda"
-                    )
-                    # Compile the timing specialization before the synchronized
-                    # measurement so one rank's JIT cannot become another rank's
-                    # in-kernel communication wait.
-                    prepare_input()
-                    megamoe_mega.fp8_fp8_mega_moe(
-                        output,
-                        transformed[0],
-                        transformed[1],
-                        buffer,
-                        debug_timings=timing_tensor,
-                        routes_prepared=bool(route_prepare_mode),
-                        rank_gated_combine=bool(rank_gated_combine_mode),
-                        route_ready_dispatch=bool(route_ready_dispatch_mode),
-                        rank_ready_route_publish=bool(
-                            rank_ready_route_publish_mode
-                        ),
-                    )
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    timing_tensor.zero_()
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    prepare_input()
-                    megamoe_mega.fp8_fp8_mega_moe(
-                        output,
-                        transformed[0],
-                        transformed[1],
-                        buffer,
-                        debug_timings=timing_tensor,
-                        routes_prepared=bool(route_prepare_mode),
-                        rank_gated_combine=bool(rank_gated_combine_mode),
-                        route_ready_dispatch=bool(route_ready_dispatch_mode),
-                        rank_ready_route_publish=bool(
-                            rank_ready_route_publish_mode
-                        ),
-                    )
-                    torch.cuda.synchronize()
-                    dist.barrier()
-                    local_timings = dict(
-                        zip(
-                            _MEGAMOE_TIMING_SLOTS,
-                            (int(value) for value in timing_tensor.cpu()),
-                        )
-                    )
-                    timings_by_rank: list[dict[str, int] | None] = [None] * world_size
-                    dist.all_gather_object(timings_by_rank, local_timings)
-                    results[key]["debug_timing_cycles_by_rank"] = timings_by_rank
                 dist.barrier()
 
     fixed_rows = min(row_counts)
@@ -1428,7 +1401,14 @@ def main() -> None:
         )
     local_rank = int(os.environ["SLURM_LOCALID"])
     device_index = 0 if torch.cuda.device_count() == 1 else local_rank
+    requested_device = os.environ.get("MEGAMOE_SMOKE_DEVICE_INDEX")
+    if requested_device is not None:
+        device_index = int(requested_device)
+        if not 0 <= device_index < torch.cuda.device_count():
+            raise ValueError("MEGAMOE_SMOKE_DEVICE_INDEX is outside visible GPUs")
     torch.cuda.set_device(device_index)
+    if requested_device is not None:
+        print(f"MEGAMOE_DEVICE_MAP rank={rank} local_rank={local_rank} device={device_index}", flush=True)
     expert_weight_dtype = os.environ.get(
         "MINISGL_MEGAMOE_EXPERT_WEIGHT_DTYPE", "fp8"
     )

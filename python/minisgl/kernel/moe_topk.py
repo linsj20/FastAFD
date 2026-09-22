@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -47,16 +48,21 @@ def _jit_moe_topk_softmax_module() -> Module:
 
 
 @functools.cache
-def _jit_gate_topk_fused_module() -> Module:
+def _jit_gate_topk_fused_module(all_push: bool = False, recycle: bool = False) -> Module:
     from .utils import KERNEL_PATH, load_jit
 
+    name = "gate_topk_fused_all_push" if all_push else "gate_topk_fused"
+    wrapper = "GateTopkAllPushKernel" if all_push else "GateTopkFusedKernel"
+    iket_include = os.environ.get("DG_JIT_IKET_INCLUDE") if all_push else None
     return load_jit(
-        "gate_topk_fused",
-        cuda_files=["gate_topk_fused.cu"],
-        cuda_wrappers=[("launch", "GateTopkFusedKernel::run")],
+        name + ("_recycle" if recycle else ""),
+        cuda_files=[name + ".cu"],
+        cuda_wrappers=[("launch", wrapper + "::run")],
         extra_include_paths=[
             str(KERNEL_PATH / "deepgemm" / "deep_gemm" / "include")
-        ],
+        ] + ([iket_include] if iket_include else []),
+        extra_cuda_cflags=(["-DIKET_BUILD_ENABLED=1"] if iket_include else [])
+        + (["-DMEGAMOE_RECYCLE=1"] if recycle else []),
     )
 
 
@@ -116,6 +122,9 @@ def gate_topk(
         torch.Tensor, torch.Tensor, int, int, int, int, bool, bool
     ] | None = None,
     perfect_balance: bool = False,
+    recycle_payload: bool = False,
+    recycle_rows: int = 0,
+    recycle_timings: torch.Tensor | None = None,
     defer_route_dependent_launch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused router for decode-sized batches: bf16 gate GEMM (tensor cores,
@@ -129,8 +138,8 @@ def gate_topk(
     of the top-k weights — the comm kernel then skips its quant phase.
 
     ``route_prepare`` = (symmetric buffer, device buffer-pointer table, rank,
-    ranks, aligned token capacity, MegaMoE SMs, rank-ready publication, compact
-    payload push) groups
+    ranks, aligned token capacity, MegaMoE SMs, rank-ready publication, all-push
+    payload) groups
     and remotely publishes the selected routes before MegaMoE starts.
 
     ``num_token_non_padded`` is a scalar valid-prefix count, or a CUDA tensor
@@ -207,13 +216,12 @@ def gate_topk(
     if n == 0:
         return ids, weights
     partials, counters = _gate_topk_workspace(hidden.device, (n + 15) // 16)
-    module = _jit_gate_topk_fused_module()
     x_q = x_sf = w_stage = None
     if quant_out is not None:
         x_q, x_sf, w_stage = quant_out
     route_workspace = route_buffer_ptrs = None
     route_rank = route_num_ranks = route_bucket = route_num_sms = 0
-    route_rank_ready = compact_push = False
+    route_rank_ready = all_push = False
     if route_prepare is not None:
         (
             route_workspace,
@@ -223,7 +231,7 @@ def gate_topk(
             route_bucket,
             route_num_sms,
             route_rank_ready,
-            compact_push,
+            all_push,
         ) = route_prepare
         if (
             not route_workspace.is_cuda
@@ -256,6 +264,11 @@ def gate_topk(
         raise RuntimeError(
             "deferred route dependent launch requires route preparation"
         )
+    if recycle_payload and (not all_push or not n <= recycle_rows <= route_bucket):
+        raise ValueError("payload recycling requires all-push and a prefix covering every row")
+    if not recycle_payload and (recycle_rows or recycle_timings is not None):
+        raise ValueError("reset rows/timings require payload recycling")
+    module = _jit_gate_topk_fused_module(all_push=bool(all_push), recycle=recycle_payload)
     module.launch(
         weights, ids,
         hidden.contiguous(), gate_weight.contiguous(),
@@ -269,7 +282,8 @@ def gate_topk(
         bool(route_rank_ready),
         bool(perfect_balance),
         bool(defer_route_dependent_launch),
-        bool(compact_push),
+        bool(all_push),
+        *([int(recycle_rows), recycle_timings] if all_push else []),
     )
     return ids, weights
 

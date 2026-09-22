@@ -21,7 +21,7 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const bool& use_fp8_dispatch, const std::string& activation,
-    const bool& inband_combine, const bool& compact_push) {
+    const bool& inband_combine, const bool& all_push) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
 
     // Workspace bytes
@@ -61,7 +61,7 @@ get_symm_buffer_size_for_mega_moe(
         );
     }
 
-    const auto l1_rows = compact_push ? workspace.get_compact_l1_num_tokens(hidden) : num_max_pool_tokens;
+    const auto l1_rows = all_push ? workspace.get_compact_l1_num_tokens(hidden) : num_max_pool_tokens;
     DG_HOST_ASSERT(l1_rows <= 0x7fffffffull);
 
     // L1 input buffer
@@ -154,8 +154,8 @@ static void fp8_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push,
-    const bool& use_fp8_weights
+    const bool& inband_combine, const bool& all_push,
+    const bool& use_fp8_weights, const int& reset_rows = 0
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -202,7 +202,11 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(not route_ready_dispatch or routes_prepared);
     DG_HOST_ASSERT(not rank_ready_route_publish or route_ready_dispatch);
     DG_HOST_ASSERT(not inband_combine or (rank_gated_combine and rank_ready_route_publish));
-    DG_HOST_ASSERT(not compact_push or (routes_prepared and rank_ready_route_publish));
+    DG_HOST_ASSERT(not all_push or (routes_prepared and rank_ready_route_publish));
+
+    DG_HOST_ASSERT(reset_rows == 0 ||
+                   (all_push && inband_combine && num_tokens <= reset_rows &&
+                    reset_rows <= num_max_tokens_per_rank));
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -218,9 +222,11 @@ static void fp8_mega_moe(
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
     if (debug_timings.has_value()) {
+        DG_HOST_ASSERT(all_push && reset_rows > 0);
         DG_HOST_ASSERT(debug_timings->is_cuda());
         DG_HOST_ASSERT(debug_timings->scalar_type() == torch::kInt64);
-        DG_HOST_ASSERT(debug_timings->numel() >= 21);
+        DG_HOST_ASSERT(debug_timings->numel() >=
+            24 + 3 * num_tokens + device_runtime->get_num_sms() + 16);
         DG_HOST_ASSERT(debug_timings->is_contiguous());
     }
 
@@ -231,7 +237,7 @@ static void fp8_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        true, activation, inband_combine, compact_push);
+        true, activation, inband_combine, all_push);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
@@ -257,7 +263,7 @@ static void fp8_mega_moe(
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
                                routes_prepared, rank_gated_combine,
-                               route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
+                               route_ready_dispatch, rank_ready_route_publish, inband_combine, all_push, reset_rows);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -286,15 +292,44 @@ static void fp8_fp4_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push) {
+    const bool& inband_combine, const bool& all_push) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
                  recipe, activation, activation_clamp, fast_math, debug_timings,
                  routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
-                 inband_combine, compact_push,
+                 inband_combine, all_push,
                  /* use_fp8_weights */ false);
+}
+
+static void fp8_fp4_mega_moe_recycle(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp,
+    const bool& fast_math,
+    const std::optional<torch::Tensor>& debug_timings,
+    const bool& routes_prepared,
+    const bool& rank_gated_combine,
+    const bool& route_ready_dispatch,
+    const bool& rank_ready_route_publish,
+    const bool& inband_combine, const bool& all_push, const int& reset_rows) {
+    fp8_mega_moe(y, l1_weights, l2_weights,
+                 cumulative_local_expert_recv_stats,
+                 sym_buffer, sym_buffer_ptrs, rank_idx,
+                 num_max_tokens_per_rank, num_experts, num_topk,
+                 recipe, activation, activation_clamp, fast_math, debug_timings,
+                 routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
+                 inband_combine, all_push,
+                 /* use_fp8_weights */ false, reset_rows);
 }
 
 static void fp8_fp8_mega_moe(
@@ -315,14 +350,14 @@ static void fp8_fp8_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push) {
+    const bool& inband_combine, const bool& all_push) {
     fp8_mega_moe(y, l1_weights, l2_weights,
                  cumulative_local_expert_recv_stats,
                  sym_buffer, sym_buffer_ptrs, rank_idx,
                  num_max_tokens_per_rank, num_experts, num_topk,
                  recipe, activation, activation_clamp, fast_math, debug_timings,
                  routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish,
-                 inband_combine, compact_push,
+                 inband_combine, all_push,
                  /* use_fp8_weights */ true);
 }
 
@@ -331,6 +366,7 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp4_mega_moe_recycle", &fp8_fp4_mega_moe_recycle);
     m.def("fp8_fp8_mega_moe", &fp8_fp8_mega_moe);
 #endif
 }

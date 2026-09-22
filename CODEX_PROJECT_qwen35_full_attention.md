@@ -135,7 +135,7 @@ A48:F16/EP16/B40/128K. Stream count alone does not establish a latency penalty.
   finish while GEMM continues. Two rotating slots use prior route publications
   to guarantee safe reuse, without a new payload-completion flag. Exact reserved
   negative-zero words are canonicalized only in activation/weight payloads;
-  packed scales remain exact. Details/proofs/trials: CODEX_PROJECT_qwen35_push_comm.md.
+  packed scales remain exact. Details/proofs/trials: CODEX_PROJECT_megamoe_optimization.md.
 - Combine retains its existing producer-push BF16 contributions, completion epoch
   and local TMA reduction. In-band combine variants increased actual latency and
   were removed from active code; rejected implementations remain archived.
@@ -213,7 +213,7 @@ Evidence=qwen35_score/alignment_summary.json and qwen35_generation/summary.json.
   tile/warp sweep or replace FlashInfer post-attention norm without numeric proof
   (prior V6 fusion failed alignment).
 - Communication protocol/component attempts and rejected combine variants are
-  fully recorded in CODEX_PROJECT_qwen35_push_comm.md. Full dispatch was only
+  fully recorded in CODEX_PROJECT_megamoe_optimization.md. Full dispatch was only
   provisional after noisy EP16 microbenchmarks; accumulated model result above
   supplies end-to-end latency evidence. Cleaned native validation7077011 passed
   on4GPUs (3:32): exact normal/negative/zero inputs, empty-source/prefix/interleaved

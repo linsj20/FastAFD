@@ -1,4 +1,4 @@
-"""Same-rank FP8-activation MegaMoE adapter for attention-only model workers."""
+"""FP8-activation MegaMoE adapter for FFN ranks in the AFD runtime."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ class MegaMoEAfdAdapter:
     """Route and run one fused MegaMoE kernel on the FFN rank set."""
 
     backend = "megamoe"
+    trace_root = None
+    # Fixed FFN-rank source + padded materialization row budget for model decode.
+    # Sources already aggregate this FFN rank's attention-rank fan-in.
+    # Prompt length only sizes the separate pull-prefill allocation.
+    all_push_capacity = 1024
 
     def __init__(
         self,
@@ -34,6 +39,7 @@ class MegaMoEAfdAdapter:
         tp_rank: int,
         gate_renormalize: bool,
         defer_route_dependent_launch: bool = False,
+        num_max_decode_tokens_per_rank: int = 1024,
     ) -> None:
         if not dist.is_initialized():
             raise RuntimeError("MegaMoEAfdAdapter requires torch.distributed")
@@ -53,6 +59,9 @@ class MegaMoEAfdAdapter:
         self.num_layers = int(num_layers)
         self.top_k = int(top_k)
         self.bucket = int(num_max_tokens_per_rank)
+        # Reset every source row any captured decode shape can address. This
+        # bound is fixed for the adapter; it never changes the allocation size.
+        self.all_push_reset_rows = int(num_max_decode_tokens_per_rank)
         self.num_lanes = max(1, int(num_lanes))
         self.gate_renormalize = bool(gate_renormalize)
         self.defer_route_dependent_launch = bool(defer_route_dependent_launch)
@@ -126,6 +135,12 @@ class MegaMoEAfdAdapter:
                 )
         self.expert_map = expert_map
         self.buffers: list[_mega.MegaMoESymmBuffer] = []
+        self.alternate_buffers: list[_mega.MegaMoESymmBuffer] = []
+        self._output_buffers: dict[int, _mega.MegaMoESymmBuffer] = {}
+        self.trace_root = os.environ.get("MINISGL_MEGAMOE_TRACE_ROOT")
+        self._trace_timings = {}
+        self._trace_output = {}
+        self.prefill_buffers: list[_mega.MegaMoESymmBuffer] = []
         self.weights: dict[
             int,
             tuple[
@@ -174,18 +189,46 @@ class MegaMoEAfdAdapter:
     def allocate_buffers(self) -> None:
         if self.buffers:
             return
-        self.buffers = [
-            _mega.MegaMoESymmBuffer(
+        mode = os.environ.get("MINISGL_MEGAMOE_PAYLOAD_MODE", "pull")
+        if mode == "all_push":
+            if not 0 < self.all_push_reset_rows <= self.all_push_capacity:
+                raise ValueError("all-push maximum decode rows must be in [1, 1024]")
+            if self.expert_weight_dtype != "fp4":
+                raise ValueError("Model all-push recycling requires FP4 expert weights")
+        def allocate(payload_mode=mode):
+            return _mega.MegaMoESymmBuffer(
                 self.group,
                 num_experts=self.num_experts,
-                num_max_tokens_per_rank=self.bucket,
+                num_max_tokens_per_rank=(self.all_push_capacity
+                                         if payload_mode == "all_push" else self.bucket),
                 num_topk=self.top_k,
                 hidden=self.hidden_size,
                 intermediate_hidden=self.intermediate_size,
                 inband_combine=True,
+                payload_mode=payload_mode,
             )
-            for _ in range(self.num_lanes)
-        ]
+        self.buffers = [allocate() for _ in range(self.num_lanes)]
+        if self.buffers[0].all_push:
+            self.alternate_buffers = [allocate() for _ in range(self.num_lanes)]
+            self.prefill_buffers = [allocate("pull") for _ in range(self.num_lanes)]
+            # One-time setup only. Runtime reuse is a destination-local epoch
+            # acquire, and retiring MegaMoE CTAs reset the next internal bank.
+            for pair in zip(self.buffers, self.alternate_buffers):
+                for buffer in pair:
+                    buffer.reset_dispatch_payload(self.all_push_capacity)
+                    buffer.handle.barrier(channel=0)
+                    self._output_buffers[buffer.y.data_ptr()] = buffer
+            torch.cuda.synchronize()
+        print(
+            f"MEGAMOE_AFD_PROTOCOL rank={self.rank} ranks={self.group_size} "
+            f"payload_mode={self.buffers[0].payload_mode} "
+            f"lanes={self.num_lanes} buffers_per_lane={1 + bool(self.alternate_buffers)} "
+            f"capacity={self.buffers[0].num_max_tokens_per_rank} "
+            f"decode_reset_rows={self.all_push_reset_rows} "
+            f"prefill_capacity={self.bucket} prefill_payload_mode=pull "
+            f"precision={self.precision}",
+            flush=True,
+        )
 
     def forward(
         self,
@@ -195,20 +238,45 @@ class MegaMoEAfdAdapter:
         *,
         lane: int,
         num_token_non_padded: int | torch.Tensor | None,
+        phase: str = "decode",
+        debug_timings: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = hidden_states.contiguous().view(-1, self.hidden_size)
         num_tokens = int(hidden.shape[0])
-        if num_tokens > self.bucket:
-            raise RuntimeError(
-                f"MegaMoE tokens={num_tokens} exceeds dispatch bucket={self.bucket}"
-            )
         try:
             l1_weights, l2_weights = self.weights[int(layer_id)]
         except KeyError as exc:
             raise RuntimeError(
                 f"layer {int(layer_id)} has no registered MegaMoE weights"
             ) from exc
-        buffer = self.buffers[int(lane) % self.num_lanes]
+        lane = int(lane) % self.num_lanes
+        if phase not in ("decode", "prefill"):
+            raise ValueError("MegaMoE phase must be decode or prefill")
+        bank = int(layer_id) % 2
+        buffer = (self.prefill_buffers[lane] if phase == "prefill" and self.prefill_buffers
+                  else self.buffers[lane])
+        capacity = self.all_push_reset_rows if buffer.all_push else self.bucket
+        if num_tokens > capacity:
+            raise RuntimeError(
+                f"MegaMoE {phase} tokens={num_tokens} exceeds row capacity={capacity}"
+            )
+        if buffer.all_push:
+            if num_tokens == 0:
+                raise RuntimeError("all-push requires a physical row; pad empty ranks")
+            if bank:
+                buffer = self.alternate_buffers[lane]
+        if self.trace_root and buffer.all_push:
+            from minisgl.kernel import deepgemm
+
+            key = (int(layer_id), lane)
+            if key not in self._trace_timings:
+                self._trace_timings[key] = torch.empty(
+                    24 + 3 * self.all_push_reset_rows + deepgemm.get_num_sms() + 16,
+                    dtype=torch.int64, device=hidden.device,
+                )
+            debug_timings = self._trace_timings[key]
+            debug_timings.zero_()
+            self._trace_output[buffer.y.data_ptr()] = debug_timings
         ids = buffer.topk_idx[:num_tokens]
         weights = buffer.topk_weights[:num_tokens]
         routes_prepared = num_tokens > 0
@@ -224,6 +292,9 @@ class MegaMoEAfdAdapter:
             out=(ids, weights),
             route_prepare=(buffer.route_prepare_args(rank_ready=True) if routes_prepared else None),
             perfect_balance=self.perfect_routing,
+            recycle_payload=buffer.all_push,
+            recycle_rows=self.all_push_reset_rows if buffer.all_push else 0,
+            recycle_timings=debug_timings if buffer.all_push else None,
             defer_route_dependent_launch=self.defer_route_dependent_launch,
         )
         y = buffer.y[:num_tokens]
@@ -236,8 +307,50 @@ class MegaMoEAfdAdapter:
             rank_gated_combine=True,
             route_ready_dispatch=routes_prepared,
             rank_ready_route_publish=routes_prepared,
+            **({"reset_rows": self.all_push_reset_rows} if buffer.all_push else {}),
+            **({"debug_timings": debug_timings} if debug_timings is not None else {}),
         )
         return y.view_as(hidden_states)
+
+    def normalize_output(self, norm, hidden, residual, *, debug_timings=None) -> bool:
+        """Acquire output while retiring producer CTAs recycle the next payload bank."""
+        buffer = self._output_buffers.get(hidden.data_ptr())
+        if buffer is None:
+            return False
+        from minisgl.kernel.megamoe_output_norm import megamoe_output_add_rmsnorm
+
+        if self.trace_root:
+            debug_timings = self._trace_output[hidden.data_ptr()]
+        megamoe_output_add_rmsnorm(
+            hidden, residual, norm.weight, norm.eps, buffer, debug_timings=debug_timings
+        )
+        return True
+
+    def save_trace(self, step_id: int, rows_per_lane: list[int]) -> None:
+        """Export a separately instrumented model replay after its stream finishes."""
+        import json
+        from pathlib import Path
+        from minisgl.kernel import deepgemm
+
+        if not self._trace_timings:
+            return
+        sms = deepgemm.get_num_sms()
+        root = Path(self.trace_root) / f"step-{step_id}"
+        root.mkdir(parents=True, exist_ok=True)
+        calls = {}
+        for (layer, lane), values in self._trace_timings.items():
+            rows = rows_per_lane[lane]
+            raw = values.tolist()
+            reset_offset = 24 + 3 * rows + sms
+            calls[f"{layer}:{lane}"] = {
+                "norm_rows": rows, "hidden": self.hidden_size,
+                "stamps": raw[21:reset_offset],
+                "cycle_timings": raw[:21],
+                "reset_worker_stamps": raw[reset_offset:reset_offset + 16],
+            }
+        (root / f"rank-{self.rank}.json").write_text(
+            json.dumps({"rank": self.rank, "calls": calls}) + "\n"
+        )
 
 
 __all__ = ["MegaMoEAfdAdapter"]

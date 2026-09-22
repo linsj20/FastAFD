@@ -43,6 +43,35 @@ def router_chains(graph):
     return {key: [record[key] for record in records] for key in records[0]}
 
 
+def dependent_overlap(graph, primary_pattern, consumer_pattern):
+    """Pair ordered same-stream calls; the caller must establish their correspondence."""
+    records = []
+    streams = sorted({r["streamId"] for r in graph if primary_pattern in r["name"]})
+    for stream in streams:
+        primary = [r for r in graph if r["streamId"] == stream and primary_pattern in r["name"]]
+        consumer = [r for r in graph if r["streamId"] == stream and consumer_pattern in r["name"]]
+        if len(primary) != len(consumer):
+            raise ValueError(f"Unmatched primary/consumer kernels on stream {stream}")
+        for ordinal, (a, b) in enumerate(zip(primary, consumer)):
+            if b["start"] < a["start"]:
+                raise ValueError(f"Unexpected primary/consumer order on stream {stream}")
+            records.append({
+                "stream": stream, "ordinal": ordinal,
+                "primary_start_ns": a["start"], "primary_end_ns": a["end"],
+                "consumer_start_ns": b["start"], "consumer_end_ns": b["end"],
+                # Model finalization can enqueue both lanes' producers before
+                # their ordered norms on the joined final stream.
+                "consumer_after_next_primary_start": ordinal + 1 < len(primary) and
+                    b["start"] >= primary[ordinal + 1]["start"],
+                "overlap_us": max(0, min(a["end"], b["end"]) - b["start"]) / 1000,
+                "consumer_end_before_primary_end_us": (a["end"] - b["end"]) / 1000,
+                "primary_start_to_consumer_end_us": (b["end"] - a["start"]) / 1000,
+            })
+    if not records:
+        raise ValueError("No primary/consumer pairs captured")
+    return records
+
+
 def attention_unions(graph):
     groups = {name: [r for r in graph if pattern in r["name"]] for name, pattern in
               (("fmha", "fmhaSm"), ("publish", "publish_o"), ("wait", "wait_ready_kernel"))}
@@ -61,6 +90,27 @@ def attention_unions(graph):
     }.items()}
 
 
+def successors(graph, pattern):
+    """Retain the next same-stream kernel in observed launch/start order."""
+    records = []
+    for stream in sorted({r["streamId"] for r in graph}):
+        rows = [r for r in graph if r["streamId"] == stream]
+        for current, following in zip(rows, rows[1:]):
+            if pattern in current["name"]:
+                records.append({
+                    "stream": stream, "current": current["name"],
+                    "successor": following["name"],
+                    "current_start_ns": current["start"],
+                    "current_end_ns": current["end"],
+                    "successor_start_ns": following["start"],
+                    "successor_end_ns": following["end"],
+                    "gap_us": (following["start"] - current["end"]) / 1000,
+                })
+    if not records:
+        raise ValueError(f"No successors for {pattern}")
+    return records
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sqlite", type=Path)
@@ -69,10 +119,17 @@ def main():
                         help="LABEL=literal kernel-name substring")
     parser.add_argument("--expected-graphs", type=int, default=16)
     parser.add_argument("--warmup-graphs", type=int, default=1)
+    parser.add_argument("--graph-pattern",
+                        help="Select complete graphs containing this kernel-name substring "
+                             "before checking counts and excluding warmups")
     parser.add_argument("--router-chains", action="store_true",
                         help="Measure per-stream producer-to-MegaMoE intervals and selector overlap")
     parser.add_argument("--attention-unions", action="store_true",
                         help="Measure useful attention work, overlapping waits and uncovered intervals")
+    parser.add_argument("--dependent-overlap", metavar="PRIMARY=CONSUMER",
+                        help="Pair kernel-name substrings per stream and retain overlap endpoints")
+    parser.add_argument("--successors", metavar="PATTERN",
+                        help="Retain the next same-stream kernel after each matching kernel")
     args = parser.parse_args()
     families = {}
     for item in args.family:
@@ -80,7 +137,10 @@ def main():
         if not label or not pattern or label in families:
             raise ValueError("Family labels must be unique and nonempty")
         families[label] = pattern
-    captured = graphs(args.sqlite)
+    all_graphs = graphs(args.sqlite)
+    captured = [(ordinal, graph) for ordinal, graph in enumerate(all_graphs, 1)
+                if args.graph_pattern is None or
+                any(args.graph_pattern in row["name"] for row in graph)]
     if len(captured) != args.expected_graphs:
         raise ValueError(f"Expected {args.expected_graphs} graphs, got {len(captured)}")
     if not 0 <= args.warmup_graphs < len(captured):
@@ -90,7 +150,9 @@ def main():
     names = {label: set() for label in families}
     chain_values = {}
     attention_values = {}
-    for ordinal, graph in enumerate(captured[args.warmup_graphs:], args.warmup_graphs + 1):
+    dependency_records = []
+    successor_records = []
+    for ordinal, graph in captured[args.warmup_graphs:]:
         start, end = span(graph)
         sample = {"graph_ordinal": ordinal, "graph_nodes": len(graph),
                   "graph_span_us": (end - start) / 1000, "families": {}}
@@ -114,8 +176,18 @@ def main():
             sample["attention_timeline"] = timeline
             for key, value in timeline.items():
                 attention_values.setdefault(key, []).append(value)
+        if args.dependent_overlap:
+            primary, consumer = args.dependent_overlap.split("=", 1)
+            paired = dependent_overlap(graph, primary, consumer)
+            sample["dependent_overlap"] = paired
+            dependency_records.extend(paired)
+        if args.successors:
+            following = successors(graph, args.successors)
+            sample["successors"] = following
+            successor_records.extend(following)
         samples.append(sample)
     result = {"sqlite": str(args.sqlite), "captured_graphs": len(captured),
+              "total_captured_graphs": len(all_graphs), "graph_pattern": args.graph_pattern,
               "warmup_graphs_excluded": args.warmup_graphs,
               "measured_graphs": len(samples), "samples": samples,
               "families": {label: {**stats(values[label]),
@@ -127,6 +199,23 @@ def main():
         result["router_chains"] = {key: stats(value) for key, value in chain_values.items()}
     if args.attention_unions:
         result["attention_timeline"] = {key: stats(value) for key, value in attention_values.items()}
+    if dependency_records:
+        result["dependent_overlap"] = {
+            "pairs": len(dependency_records),
+            "overlapping_pairs": sum(r["overlap_us"] > 0 for r in dependency_records),
+            "consumer_finished_during_primary": sum(
+                r["consumer_end_before_primary_end_us"] > 0 for r in dependency_records),
+            "consumers_after_next_primary_start": sum(
+                r["consumer_after_next_primary_start"] for r in dependency_records),
+            **{key: stats([r[key] for r in dependency_records]) for key in (
+                "overlap_us", "consumer_end_before_primary_end_us",
+                "primary_start_to_consumer_end_us")},
+        }
+    if successor_records:
+        result["successors"] = {
+            name: stats([r["gap_us"] for r in successor_records if r["successor"] == name])
+            for name in sorted({r["successor"] for r in successor_records})
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({label: stats(value) for label, value in values.items()}))

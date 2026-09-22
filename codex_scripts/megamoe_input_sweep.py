@@ -237,6 +237,9 @@ def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
     required_iterations = manifest.get("final_validation", {}).get("baseline_iterations")
     required_source = manifest.get("final_validation", {}).get("source")
     required_samples = manifest.get("final_validation", {}).get("phase_samples", 3)
+    required_layout = manifest.get("final_validation", {}).get("prepared_graph_layout")
+    if required_layout is not None:
+        assert required_layout in ("separate", "joined")
     assert isinstance(required_samples, int) and required_samples > 0
     experts, top_k = planned["experts"], planned["top_k"]
     aliases = []
@@ -245,6 +248,10 @@ def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
     checked = 0
     markers = {f"Mega{phase}{bound}" for phase in ("Dispatch", "Compute", "Combine")
                for bound in ("Start", "End")}
+    all_push = manifest.get("final_validation", {}).get("payload_mode") == "all_push"
+    if all_push:
+        assert manifest["final_validation"]["compute_start_marker"] == "MegaMmaIssue"
+        markers = (markers - {"MegaComputeStart"}) | {"MegaMmaIssue"}
     for case in manifest["cases"]:
         ep, tokens = case["ep"], case["global_tokens"]
         key = (ep, tokens)
@@ -264,14 +271,20 @@ def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
         path = paths[0]
         result = json.loads(path.read_text())
         contract = result["contract"]
-        if required_source:
+        override = case.get("capture_contract", {})
+        assert set(override) <= {"bucket", "source"}, (case["case_id"], "unknown capture override")
+        case_source = override.get("source", required_source)
+        if case_source:
             source = (path.parent / "source-snapshot.txt").read_text().strip()
-            assert Path(source).name == required_source, (case["case_id"], source)
+            assert Path(source).name == case_source, (case["case_id"], source)
         assert (contract["ep_size"], contract["global_tokens_per_launch"]) == key
-        assert contract["bucket"] == planned["bucket"]
+        assert contract["bucket"] == override.get("bucket", planned["bucket"])
         assert tuple(contract[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms")) == tuple(planned[k] for k in ("hidden", "intermediate", "experts", "top_k", "num_sms"))
         assert (contract["activation_dtype"], contract["weight_dtype"], contract["microbatches"]) == ("fp8", "fp4", 2)
         assert contract["iket_mode"] == "source-markers"
+        if required_layout is not None:
+            assert contract["prepared_graph_layout"] == required_layout
+            assert contract["preparation_in_cuda_event_span"] == (required_layout == "joined")
         assert contract["rank_interleaved_expert_mapping"] and contract["routes_prepared"]
         assert contract["input_route_distribution"] == "perfect_balance"
         # The first eight captures predate the variable-source-count schema.
@@ -288,7 +301,11 @@ def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
             rows = list(csv.DictReader(stream))
         assert len(rows) == len(result["samples"]) == required_samples
         for sample, row in zip(result["samples"], rows):
-            assert set(sample["marker_counts"]) == markers
+            if all_push:
+                assert markers <= set(sample["marker_counts"])
+                assert sample["compute_start_semantics"] == "actual_mma_issue"
+            else:
+                assert set(sample["marker_counts"]) == markers
             assert min(sample["marker_counts"].values()) > 0
             assert int(row["rank"]) == sample["rank"] == 0
             components = [float(row[k]) for k in (
@@ -304,6 +321,9 @@ def audit(manifest_path: Path, root: Path, *, quiet: bool = False) -> dict:
             report = json.loads((path.parent / name).read_text())
             assert report["status"] == "ok"
             info = next(iter(report["exact_qwen"].values()))
+            if required_layout is not None:
+                assert info["prepared_graph_layout"] == required_layout
+                assert info["dispatch_reset_outside_timing"] == (required_layout == "separate")
             assert (info["ep_size"], info["global_tokens"], info["rows_per_rank"]) == (ep, tokens, case["rows_per_rank"])
             assert info["routing"] == "fixed_global_sequence_rank_interleaved_balance"
             if ep == 64 and name == "baseline.json":

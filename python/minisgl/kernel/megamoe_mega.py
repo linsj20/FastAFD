@@ -20,15 +20,14 @@ def _ext():
 class MegaMoESymmBuffer:
     """Symmetric storage with communication protocols fixed at allocation.
 
-    ``payload_mode`` is ``"pull"`` (default) or ``"compact_push"``. Compact mode
-    publishes routes from the router. MegaMoE pushes deduplicated FP8/SF rows
-    and constructs local gather indices. The experimental Lamport dispatch
-    headers require ``reset_dispatch_payload(rows)`` before every invocation, with
-    peer completion ordered before any sender starts; reset is off critical path.
-    FC1 gathers activation and SF rows. Each invocation requires fresh router
-    publication; kernel-only replay cannot reuse retired metadata flags.
-    Dispatch supports up to 1024 active rows per rank
-    and top-k <= 32. Pull materializes contiguous expert rows.
+    ``payload_mode`` is ``"pull"`` (default) or ``"all_push"``. All-push uses
+    producer-owned routes/SF, deduplicated activation sends, and receiver-owned
+    materialization for regular TMA. Call ``reset_dispatch_payload(rows)`` before
+    every invocation, ordering peer completion before reset and all peer resets
+    before dispatch. Preparation belongs off the critical path. Replay must
+    include fresh producer/selector work; retired metadata cannot be reused.
+    The current path requires one expert wave, BLOCK_M <= 32, and enough unused
+    source capacity for padded materialized rows. Unsupported shapes fail.
     An explicit mode overrides ``MINISGL_MEGAMOE_PAYLOAD_MODE``.
     """
 
@@ -68,10 +67,10 @@ class MegaMoESymmBuffer:
         self.inband_combine = inband_combine
         if payload_mode is None:
             payload_mode = os.environ.get("MINISGL_MEGAMOE_PAYLOAD_MODE", "pull")
-        if payload_mode not in ("pull", "compact_push"):
-            raise ValueError("payload_mode must be 'pull' or 'compact_push'")
+        if payload_mode not in ("pull", "all_push"):
+            raise ValueError("payload_mode must be 'pull' or 'all_push'")
         self.payload_mode = payload_mode
-        self.compact_push = payload_mode == "compact_push"
+        self.all_push = payload_mode == "all_push"
         if self.num_experts % self.num_ranks:
             raise RuntimeError(
                 "MegaMoE experts must divide the symmetric rank group: "
@@ -88,7 +87,7 @@ class MegaMoESymmBuffer:
             True,
             "swiglu",
             self.inband_combine,
-            self.compact_push,
+            self.all_push,
         )
         allocator = torch if self.num_ranks == 1 else symm_mem
         self.buffer = allocator.empty(int(num_bytes), dtype=torch.int8, device="cuda")
@@ -139,8 +138,8 @@ class MegaMoESymmBuffer:
         (e.g. stream-ordered collectives on both sides). Values remain intact since
         several experts/N tiles can consume the same source row.
         """
-        if not self.compact_push:
-            raise RuntimeError("Lamport payload reset requires compact_push storage")
+        if not self.all_push:
+            raise RuntimeError("Lamport payload reset requires all_push storage")
         if not 0 <= num_tokens_per_rank <= self.num_max_tokens_per_rank:
             raise ValueError("Reset row count exceeds the source-bank capacity")
         source_rows = 2 * self.num_ranks * self.num_max_tokens_per_rank
@@ -159,8 +158,8 @@ class MegaMoESymmBuffer:
     def route_prepare_args(
         self, *, rank_ready: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, int, int, int, int, bool, bool]:
-        if self.compact_push and not rank_ready:
-            raise ValueError("compact payload push requires rank-ready metadata")
+        if self.all_push and not rank_ready:
+            raise ValueError("all-push requires rank-ready metadata")
         return (
             self.buffer,
             self.buffer_ptrs_device,
@@ -169,7 +168,7 @@ class MegaMoESymmBuffer:
             self.num_max_tokens_per_rank,
             int(_dg.get_num_sms()),
             bool(rank_ready),
-            self.compact_push,
+            self.all_push,
         )
 
 
@@ -207,7 +206,7 @@ def fp8_fp8_mega_moe(
         bool(route_ready_dispatch),
         bool(rank_ready_route_publish),
         sym_buffer.inband_combine,
-        sym_buffer.compact_push,
+        sym_buffer.all_push,
     )
 
 
@@ -217,6 +216,7 @@ def fp8_fp4_mega_moe(
     l2_weights: tuple[torch.Tensor, torch.Tensor],
     sym_buffer: MegaMoESymmBuffer,
     *,
+    reset_rows: int = 0,
     debug_timings: torch.Tensor | None = None,
     routes_prepared: bool = False,
     rank_gated_combine: bool = False,
@@ -224,7 +224,8 @@ def fp8_fp4_mega_moe(
     rank_ready_route_publish: bool = False,
 ) -> None:
     """Run one fused FP8-activation/MXFP4-weight MegaMoE kernel."""
-    _ext().fp8_fp4_mega_moe(
+    launch = _ext().fp8_fp4_mega_moe_recycle if reset_rows else _ext().fp8_fp4_mega_moe
+    launch(
         y,
         l1_weights,
         l2_weights,
@@ -245,7 +246,8 @@ def fp8_fp4_mega_moe(
         bool(route_ready_dispatch),
         bool(rank_ready_route_publish),
         sym_buffer.inband_combine,
-        sym_buffer.compact_push,
+        sym_buffer.all_push,
+        *([int(reset_rows)] if reset_rows else []),
     )
 
 

@@ -69,7 +69,7 @@ class GB200OverlapContractTests(unittest.TestCase):
             "gate_topk_select_kernel<IndexT, MapT, kPrepareRoutes, kRankReady,",
             select,
         )
-        self.assertIn("kPerfect, kRenormalize, kCompactPush>", select)
+        self.assertIn("kPerfect, kRenormalize, kAllPush>", select)
         self.assertIn("if constexpr (!kRenormalize)", select)
         self.assertIn("if (renormalize)", select)
         perfect_start = select.index("if constexpr (kPerfectBalance)")
@@ -84,7 +84,11 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertIn(
             "perfect balance requires a power-of-two expert count", kernel
         )
-        self.assertIn("inline constexpr int kMaxExperts = 512", kernel)
+        self.assertIn('#include "gate_topk_fused_common.cuh"', kernel)
+        common = (
+            ROOT / "python/minisgl/kernel/csrc/jit/gate_topk_fused_common.cuh"
+        ).read_text()
+        self.assertIn("inline constexpr int kMaxExperts = 512", common)
         self.assertIn("num_mtiles * num_expert_splits", kernel)
 
         for experts, topk in ((128, 8), (512, 10)):
@@ -642,7 +646,7 @@ class GB200OverlapContractTests(unittest.TestCase):
         self.assertNotIn("consumed_", runtime_source)
         self.assertNotIn("MINISGL_AFD_QWEN_SHARED_EXPERT_OVERLAP", runtime_source)
         self.assertNotIn("self._shared_expert_streams", runtime_source)
-        self.assertNotIn("extra_streams=", runtime_source)
+        self.assertNotIn("extra_streams=preparation_streams", runtime_source)
         moe_start = runtime_source.index("    def _run_model_moe")
         moe_end = runtime_source.index("    def warmup_decode_graphs", moe_start)
         moe_source = runtime_source[moe_start:moe_end]

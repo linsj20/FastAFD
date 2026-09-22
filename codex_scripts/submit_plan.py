@@ -19,6 +19,7 @@ def main():
     parser.add_argument('kind', choices=('sbatch', 'afd'))
     parser.add_argument('root', type=Path)
     parser.add_argument('--host', default='oci-hsg')
+    parser.add_argument('--data-host', help='Host used to copy the plan; submission still uses --host')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.dry_run and args.kind != 'afd':
@@ -44,7 +45,8 @@ def main():
     if not remote or remote == '/':
         raise ValueError('Require a dedicated remote output directory')
     subprocess.run(['ssh', args.host, shlex.join(['mkdir', '-p', *directories])], check=True)
-    subprocess.run(['rsync', '-a', str(root) + '/', args.host + ':' + remote + '/'],
+    copy_host = args.data_host if args.data_host is not None else args.host
+    subprocess.run(['rsync', '-a', str(root) + '/', copy_host + ':' + remote + '/'],
                    check=True)
     program = ('import json,os,subprocess,sys; d=json.load(sys.stdin); '
                "os.environ.update(d['env']); subprocess.run(d['cmd'],check=True)")

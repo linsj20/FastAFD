@@ -71,6 +71,29 @@ struct Workspace {
 #endif
     }
 
+    // Model recycling uses five words in the reserved padding of bank zero
+    // (2 * num_ranks uint64_t words, requiring at least two ranks).
+    // These counters do not alternate with routing metadata and are never
+    // cleared by ordinary metadata retirement. Initial workspace zeroing seeds
+    // generation zero as ready. Offsets and allocation size stay unchanged.
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_payload_ready_ptr() const {
+        return math::advance_ptr<uint32_t>(base,
+            kNumBarrierSignalBytes + (1ull + num_ranks) * sizeof(uint64_t));
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_output_ready_ptr() const { return get_payload_ready_ptr() + 1; }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_output_retired_ptr() const { return get_payload_ready_ptr() + 2; }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_reset_retired_ptr() const { return get_payload_ready_ptr() + 3; }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_output_target_ptr() const { return get_payload_ready_ptr() + 4; }
+
     CUTLASS_HOST_DEVICE
     uint64_t get_compact_l1_num_tokens(uint32_t hidden) const {
         const uint64_t bytes = 2ull * num_ranks * num_max_tokens_per_rank * (hidden + hidden / 32);

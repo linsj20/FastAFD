@@ -123,10 +123,9 @@ public:
     static std::string generate(const Args& args) {
         auto code = Derived::generate_impl(args);
 
-        // NOTES: we require that `generate_impl`'s includes never change
-        static std::string include_hash;
-        if (include_hash.empty())
-            include_hash = include_parser->get_hash_value(code);
+        // A runtime can select different headers (for example pull/all-push).
+        // IncludeParser already caches each header's transitive dependencies.
+        const auto include_hash = include_parser->get_hash_value(code);
 
         // TODO: optimize string concat performance
         code = fmt::format("// Includes' hash value: {}\n{}", include_hash, code);

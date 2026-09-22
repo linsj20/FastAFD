@@ -1,5 +1,30 @@
 # MegaMoE Pareto perf rerun — completed 2026-09-10 PDT
 
+## Optimized-only chart — September 17
+
+User requested a new HTML retaining only the two optimized curves from
+`scratch/visualizations/afd_128k_optimized_attention/afd-trtllm-perfect-balance-128k-pareto.html`.
+Created sibling `afd-trtllm-optimized-only-128k-pareto.html` and matching editable
+fragment under `visualization-source/`. Keeps AFD_Optimized66points/17Pareto and
+TRTLLM_Optimized24points/7Pareto, original colors, axes and point interactions.
+Removed baseline series/legend entries and unused EP2/EP64 keys. Original untouched.
+Exact embedded-data comparison PASS90points/24Pareto, axis bounds PASS, JS syntax
+PASS; rendered with visualize skill's standalone renderer. No benchmark rerun.
+
+Curve/kernel provenance lookup September17: AFD_Optimized is the final66-case
+attention-graph-edge sweep7061091–97, same early optimized MegaMoE lineage as
+the September9 Qwen3 decomposition, with the subsequent guarded64bit combine
+address correction and attention scheduling changes; not an assertion of identical
+frozen source. TRTLLM_Optimized24points exactly match sibling TensorRT-LLM
+`scratch/trtllm/reports/qwen3/megamoe-optimized-20260910/ep{4,8,16,32}-summary.json`,
+GPU7069905/07/09/11 (latencies and exclusion counts verified). TRT ports AFD's
+prepared routing/readiness, early weight reads, producer-rank gating, ordered
+CTA combine and static waves into newer DeepGEMM8b1392b9's ring implementation;
+it is not the same kernel binary/source. See sibling
+`CODEX_PROJECT_MEGAMOE_ALIGNMENT.md`. Thus the Qwen3 decomposition is the older
+AFD kernel baseline, not a direct phase breakdown of both full-model curves.
+Neither plotted curve represents September12–17 communication experiments.
+
 Current checkpoint (September 10): all requested work is complete. Final
 scheduling and Qwen3.5 barrier fix are promoted into main; superseded snapshot
 repos removed, source patches/results retained. See CODEX_PROJECT_attn_graph_edge.md.
@@ -305,8 +330,10 @@ User explicitly says fix must not affect perf meaningfully. Replied same-GPU
 before/after comparison including already-successfulshape; require meaningful
 regression investigation before sweeping.
 
-Reused codex_scripts/compare_megamoe_results.sbatch, minorgeneral improvements:
-allow explicit MEGAMOE_SMOKE_PROFILE_ONLY1 and save eachphase result.json.
+This historical run used the retired source-comparison launcher, preserved in the
+cleanup archive. Current comparisons use the manifest/group workflow documented in
+[codex_scripts/README.md](codex_scripts/README.md). At the time, the launcher added
+explicit profile-only selection and per-phase result JSONs.
 Remote bash-n passed, mirrored. Created independentcopy of candidate/python
 under diagnostics/perf-control-source/python BEFORE GPUallocation, replacedonly
 kernelheaderwith gitHEADoriginal (saved local diagnostics/control-kernel.cuh).

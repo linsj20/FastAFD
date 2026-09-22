@@ -46,10 +46,24 @@ for record in records:
    f.seek(max(0,path.stat().st_size-8192)); tail=f.read().decode(errors='replace')
   logs[str(path)]=tail.splitlines()[-12:]
  sample=root/'experiment/sample.json'
+ progress=[]
+ if row[1] == 'RUNNING' and record.get('sweep_plan'):
+  plan=json.loads(Path(record['sweep_plan']).read_text())
+  for group in plan['groups']:
+   sweep=Path(group['env']['MEGAMOE_SWEEP_ROOT'])
+   cases=group['env']['MEGAMOE_SWEEP_CASES'].split(',')
+   done=[]; started=[]
+   ordinary_only=group['env'].get('FASTAFD_IKET_CAPTURE_PHASE') == 'normal'
+   for case in cases:
+    runs=list((sweep/case).glob('*/source-snapshot.txt'))
+    if runs: started.append(case)
+    if any((p.parent/'baseline.json').is_file() and (ordinary_only or ((p.parent/'profiled.json').is_file() and len(list((p.parent/'ranks/rank-0/iket').glob('*.trace.json'))) == 1)) for p in runs):
+     done.append(case)
+   progress.append(dict(model=group['model'],completed=len(done),expected=len(cases),last_started=started[-1:]))
  print(json.dumps({'job':job,'state':row[1],'exit_code':row[2],
   'elapsed':row[3],'nodes':row[4],'reason':row[5],
   'queue_reason':queue_reasons.get(job),'logs':logs,
-  'ray_node_ips':sorted(node_ips),'extension_seeds':seeds,
+  'ray_node_ips':sorted(node_ips),'extension_seeds':seeds,'sweep_progress':progress,
   'sample_bytes':sample.stat().st_size if sample.is_file() else 0}),flush=True)
 '''
 

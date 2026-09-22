@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 
@@ -64,6 +65,7 @@ def inspect_reachable_registers(sass):
         if not allocation:
             continue
         pending, visited, unresolved = [entry + 1], set(), set()
+        operations = {}
         while pending:
             index = pending.pop()
             if index in visited or index >= len(instructions):
@@ -77,6 +79,7 @@ def inspect_reachable_registers(sass):
                 unresolved.add(current.strip())
                 continue
             predicate, operation, operands = match.groups()
+            operations[index] = operation
             transfer = operation.startswith(("BRA", "BRX", "JMP", "JMX", "CALL", "BSSY"))
             terminal = operation.startswith(("EXIT", "RET"))
             if transfer:
@@ -95,6 +98,7 @@ def inspect_reachable_registers(sass):
             "scope": "Reachable explicit instructions between register changes; unresolved transfers require review",
             "entry": line.strip(), "budget": int(allocation[1], 16),
             "instructions_checked": len(visited), "unresolved_transfers": sorted(unresolved),
+            "operation_counts": dict(Counter(operations.values())),
             **inspect_region("\n".join(instructions[i] for i in sorted(visited))),
         })
     return reports

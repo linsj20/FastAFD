@@ -4,13 +4,14 @@
 # Optional: MINISGL_DEEPGEMM_BUILD_DIR, DG_JIT_CACHE_DIR, TVM_FFI_CACHE_DIR, MEGAMOE_SMOKE_ROWS,
 #           MEGAMOE_SMOKE_SMS, MEGAMOE_SMOKE_BUCKET, MEGAMOE_SMOKE_WARMUPS,
 #           MEGAMOE_SMOKE_ITERATIONS, MEGAMOE_SMOKE_CONTEND_CYCLES
-#           MEGAMOE_SMOKE_DEBUG_TIMINGS, MEGAMOE_SMOKE_ROUTE_PREPARE_MODES,
+#           MEGAMOE_SMOKE_ROUTE_PREPARE_MODES,
 #           MEGAMOE_SMOKE_PROFILE_ONLY, MEGAMOE_SMOKE_FIXED_PERFECT_ONLY,
 #           MEGAMOE_SMOKE_PRODUCTION_ROUTES,
 #           MEGAMOE_SMOKE_TEST_SCRIPT,
 #           MEGAMOE_SMOKE_MEMCHECK (1 enables per-rank Compute Sanitizer logs),
 #           MEGAMOE_SMOKE_GPU_HEALTH (1 records nvidia-smi XML per node),
 #           MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX,
+#           MEGAMOE_SMOKE_DEFER_NSYS_STATS (1 exports on CPU after GPU release),
 #           MEGAMOE_SMOKE_COMBINE_MODES,
 #           MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES,
 #           MEGAMOE_SMOKE_SPECIALIZATION_MODES[_SBATCH],
@@ -37,6 +38,11 @@ set -euo pipefail
 
 : "${FASTAFD_SOURCE_REPO:?}" "${FASTAFD_IMAGE:?}" "${FASTAFD_VENV:?}" \
   "${OUTPUT_ROOT:?}"
+
+case "${MEGAMOE_SMOKE_DEFER_NSYS_STATS:-0}" in
+    0|1) ;;
+    *) echo "MEGAMOE_SMOKE_DEFER_NSYS_STATS must be 0 or 1" >&2; exit 2 ;;
+esac
 
 if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
     rank=${SLURM_PROCID:?}
@@ -85,14 +91,16 @@ if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
         export TMPDIR=/dev/shm/fastafd-megamoe-nsys-$SLURM_JOB_ID-$rank
         export MEGAMOE_SMOKE_CUDA_PROFILER_RANGE=1
         report_prefix=$MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX-rank$rank
-        "$nsys" profile --trace=cuda --sample=none --cpuctxsw=none \
-            --cuda-graph-trace=node --cuda-event-trace=false \
+        "$nsys" profile --trace="${MEGAMOE_SMOKE_NSYS_TRACE:-cuda}" --sample=none --cpuctxsw=none \
+            --cuda-graph-trace="${MEGAMOE_SMOKE_NSYS_GRAPH_TRACE:-node}" --cuda-event-trace=false \
             --capture-range=cudaProfilerApi --capture-range-end=stop \
             --force-overwrite=true --output="$report_prefix" \
             "${python_cmd[@]}"
-        "$nsys" stats --force-export=true --report cuda_gpu_kern_sum \
-            --format csv "$report_prefix.nsys-rep" \
-            > "$report_prefix.cuda_gpu_kern_sum.csv"
+        if [[ ${MEGAMOE_SMOKE_DEFER_NSYS_STATS:-0} == 0 ]]; then
+            "$nsys" stats --force-export=true --report cuda_gpu_kern_sum \
+                --format csv "$report_prefix.nsys-rep" \
+                > "$report_prefix.cuda_gpu_kern_sum.csv"
+        fi
         exit 0
     fi
     exec "${python_cmd[@]}"
@@ -100,7 +108,7 @@ fi
 
 CACHE_ROOT=${MINISGL_DEEPGEMM_BUILD_DIR:-$OUTPUT_ROOT/cache/deepgemm}
 TVM_CACHE_ROOT=${TVM_FFI_CACHE_DIR:-$OUTPUT_ROOT/cache/tvm_ffi}
-JOB_SCRIPT=${MEGAMOE_SMOKE_JOB_SCRIPT:-$(realpath "$0")}
+JOB_SCRIPT=${MEGAMOE_SMOKE_JOB_SCRIPT:-$FASTAFD_SOURCE_REPO/scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch}
 [[ -f $JOB_SCRIPT ]] || {
     echo "MegaMoE smoke job script is missing: $JOB_SCRIPT" >&2
     exit 2
@@ -133,7 +141,6 @@ srun --nodes="$SLURM_NNODES" --ntasks="$SLURM_NTASKS" \
     MEGAMOE_SMOKE_SMS="${MEGAMOE_SMOKE_SMS:-152}" \
     MEGAMOE_SMOKE_WARMUPS="${MEGAMOE_SMOKE_WARMUPS:-10}" \
     MEGAMOE_SMOKE_ITERATIONS="${MEGAMOE_SMOKE_ITERATIONS:-100}" \
-    MEGAMOE_SMOKE_DEBUG_TIMINGS="${MEGAMOE_SMOKE_DEBUG_TIMINGS:-0}" \
     MEGAMOE_SMOKE_PROFILE_ONLY="${MEGAMOE_SMOKE_PROFILE_ONLY:-0}" \
     MEGAMOE_SMOKE_FIXED_PERFECT_ONLY="${MEGAMOE_SMOKE_FIXED_PERFECT_ONLY:-0}" \
     MEGAMOE_SMOKE_PRODUCTION_ROUTES="${MEGAMOE_SMOKE_PRODUCTION_ROUTES:-0}" \

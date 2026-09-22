@@ -26,13 +26,14 @@ public:
         float activation_clamp;
         bool fast_math;
         bool use_fp8_weights;
-        bool enable_debug_timing;
+        bool trace_recycling;
         bool routes_prepared;
         bool rank_gated_combine;
         bool route_ready_dispatch;
         bool rank_ready_route_publish;
         bool inband_combine;
-        bool compact_push;
+        bool all_push;
+        int reset_rows;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -59,7 +60,7 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
+#include <deep_gemm/impls/{}>
 
 using namespace deep_gemm;
 
@@ -86,10 +87,11 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}
+        {}{}
     >);
 }};
-)", args.num_max_tokens_per_rank,
+)", args.all_push ? "sm100_fp8_fp4_mega_moe_all_push.cuh" : "sm100_fp8_fp4_mega_moe.cuh",
+    args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
     args.config.num_experts_per_wave,
@@ -104,13 +106,14 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.use_fp8_weights ? "true" : "false",
-    args.enable_debug_timing ? "true" : "false",
+    args.trace_recycling ? "true" : "false",
     args.routes_prepared ? "true" : "false",
     args.rank_gated_combine ? "true" : "false",
     args.route_ready_dispatch ? "true" : "false",
     args.rank_ready_route_publish ? "true" : "false",
     args.inband_combine ? "true" : "false",
-    args.compact_push ? "true" : "false");
+    args.all_push ? "true" : "false",
+    args.all_push ? fmt::format(", {}", args.reset_rows) : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -154,7 +157,7 @@ static void sm100_fp8_mega_moe_impl(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push
+    const bool& inband_combine, const bool& all_push, const int& reset_rows = 0
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -163,18 +166,19 @@ static void sm100_fp8_mega_moe_impl(
     // Heuristics
     const auto config = get_mega_moe_config(
         num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens);
+        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens,
+        /* num_dispatch_pull_stages */ 1, all_push);
 
     // Make tensormap
     constexpr int kGranK = 32;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, compact_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
-                                                     config.block_k, compact_push ? 1 : config.load_block_m,
+                                                     hidden, all_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
+                                                     config.block_k, all_push ? 8 : config.load_block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      config.swizzle_acts_mode);
     // Genphase stores all SF atoms of a pool block together, so refinement can
     // bulk-store contiguous atom runs instead of striding across the full pool.
-    const auto tensor_map_l1_acts_sf = compact_push ? make_tma_2d_desc(l1_acts_sf,
+    const auto tensor_map_l1_acts_sf = all_push ? make_tma_2d_desc(l1_acts_sf,
                                                         config.sf_block_m,
                                                         config.num_padded_sf_pool_tokens / config.sf_block_m * (hidden / 128),
                                                         config.sf_block_m, 1, config.sf_block_m, 0) :
@@ -237,13 +241,14 @@ static void sm100_fp8_mega_moe_impl(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .use_fp8_weights = use_fp8_weights,
-        .enable_debug_timing = debug_timings_ptr != nullptr,
+        .trace_recycling = debug_timings_ptr != nullptr,
         .routes_prepared = routes_prepared,
         .rank_gated_combine = rank_gated_combine,
         .route_ready_dispatch = route_ready_dispatch,
         .rank_ready_route_publish = rank_ready_route_publish,
         .inband_combine = inband_combine,
-        .compact_push = compact_push,
+        .all_push = all_push,
+        .reset_rows = reset_rows,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -264,25 +269,26 @@ static void sm100_fp8_mega_moe_impl(
                                   config.smem_size, 2)
     };
 
+    if (all_push) {
+        DG_HOST_ASSERT(num_tokens <= 1024);
+        DG_HOST_ASSERT(num_topk > 0 && num_topk <= 32);
+        DG_HOST_ASSERT(hidden > 1024 && hidden % 512 == 0);
+        DG_HOST_ASSERT(config.block_m <= 32 && config.num_epilogue_threads >= 256);
+        DG_HOST_ASSERT(config.num_experts_per_wave == num_experts_per_rank);
+        const int metadata_ctas = 2 * std::min(num_experts_per_rank, 2 * num_ranks);
+        const int pushers = layout::Workspace::genphase_pusher_ctas(num_max_tokens_per_rank);
+        DG_HOST_ASSERT(num_sms >= metadata_ctas + 1 + pushers);
+        // Device static assertions cover disjoint scratch and TMA transaction sizes.
+        // Actual padded materialization capacity is checked by the receiver.
+    }
     const auto code = SM100FP8FP4MegaMoERuntime::generate(args);
     const auto runtime = compiler->build(
         use_fp8_weights ? "sm100_fp8_fp8_mega_moe" : "sm100_fp8_fp4_mega_moe", code);
-    if (compact_push) {
-        DG_HOST_ASSERT(num_tokens <= 1024);
-        DG_HOST_ASSERT(num_topk > 0 && num_topk <= 32);
-        DG_HOST_ASSERT(hidden % 512 == 0);  // Bulk SF rows must be 16-byte aligned.
-        const int pushers = layout::Workspace::genphase_pusher_ctas(num_max_tokens_per_rank);
-        const int refine_smem = math::align(16 + 4 * num_experts_per_rank, 128) +
-            2 * config.block_m * sizeof(uint32_t);
-        const int smem = std::max({refine_smem, 128 + 16 * (hidden + hidden / 32),
-                                   8 * math::align(num_tokens * num_topk, 4) + 4 * num_experts_per_rank,
-                                   4 * (2 * num_experts_per_rank + 4)});
-        DG_HOST_ASSERT(smem <= config.smem_size);
-        DG_HOST_ASSERT(num_sms >= num_ranks + 1 + pushers);
-    }
     // Only the route-ready producer has an independent release/acquire epoch
     // that lets MegaMoE consume data without waiting for the whole selector
     // grid. Other callers retain ordinary stream ordering.
+    // Router auxiliary CTAs prepare the next activation bank. Norm follows
+    // this producer directly and joins its output through hardware PDL.
     SM100FP8FP4MegaMoERuntime::launch(
         runtime, args, /* force_pdl */ route_ready_dispatch);
 }
@@ -306,7 +312,7 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push
+    const bool& inband_combine, const bool& all_push, const int& reset_rows = 0
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
@@ -315,7 +321,7 @@ static void sm100_fp8_fp4_mega_moe(
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
         activation_clamp, fast_math, /* use_fp8_weights */ false,
-        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, all_push, reset_rows);
 }
 
 static void sm100_fp8_fp8_mega_moe(
@@ -337,7 +343,7 @@ static void sm100_fp8_fp8_mega_moe(
     const bool& rank_gated_combine,
     const bool& route_ready_dispatch,
     const bool& rank_ready_route_publish,
-    const bool& inband_combine, const bool& compact_push
+    const bool& inband_combine, const bool& all_push, const int& reset_rows = 0
 ) {
     sm100_fp8_mega_moe_impl(
         y, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf,
@@ -346,7 +352,7 @@ static void sm100_fp8_fp8_mega_moe(
         rank_idx, num_max_tokens_per_rank, num_experts_per_rank,
         num_tokens, num_topk, hidden, intermediate_hidden,
         activation_clamp, fast_math, /* use_fp8_weights */ true,
-        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, compact_push);
+        routes_prepared, rank_gated_combine, route_ready_dispatch, rank_ready_route_publish, inband_combine, all_push, reset_rows);
 }
 
 } // namespace deep_gemm

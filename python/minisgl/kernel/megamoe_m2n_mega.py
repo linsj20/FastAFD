@@ -376,6 +376,8 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
     boundaries = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
                               device=x.device, dtype=ax.dtype)
     idx = torch.bucketize(ax, boundaries)
+    # Bucketize sends ties downward; E2M1 nearest rounding selects the even code.
+    idx += ((ax == 0.75) | (ax == 1.75) | (ax == 3.5)).to(idx.dtype)
     code = idx.to(torch.uint8)
     sign = (x < 0) & (idx != 0)
     code = code | (sign.to(torch.uint8) << 3)

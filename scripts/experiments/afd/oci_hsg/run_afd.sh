@@ -1102,7 +1102,7 @@ deadline=$((SECONDS + 180))
 until [[ $(find "$READY" -maxdepth 1 -type f | wc -l) -eq "$NODES" ]]; do
     [[ $SECONDS -lt $deadline ]]; sleep 2
 done
-RAY_ADDRESS=$HEAD_ADDRESS NODES=$NODES "$PYTHON" - <<'PY'
+RAY_ADDRESS=$HEAD_ADDRESS NODES=$NODES ATTENTION_WORKERS=$ATTENTION_WORKERS FFN_EP=$FFN_EP "$PYTHON" - <<'PY'
 import os, time, ray
 ray.init(address=os.environ["RAY_ADDRESS"], logging_level="ERROR")
 deadline = time.monotonic() + 120
@@ -1113,6 +1113,29 @@ while time.monotonic() < deadline:
     time.sleep(2)
 else:
     raise RuntimeError([(n.get("NodeManagerAddress"), n.get("Resources")) for n in ray.nodes()])
+# Optional prebuilt host modules; donors must match this source and serving image.
+# Optional device donor was precompiled on CPUs for this exact serving source.
+# Refuse to overwrite unrelated cache entries.
+import subprocess, sys
+from pathlib import Path
+seed = Path(os.environ["FASTAFD_SOURCE_REPO"]) / "codex_scripts/seed_native_cache.py"
+for kind, donor_var, cache_var in (
+    ("deepgemm", "FASTAFD_DEEPGEMM_HOST_DONOR", "MINISGL_DEEPGEMM_BUILD_DIR"),
+    ("deepep", "FASTAFD_DEEPEP_HOST_DONOR", "MINISGL_DEEPEP_BUILD_DIR"),
+    ("tvm", "FASTAFD_TVM_NATIVE_DONOR", "TVM_FFI_CACHE_DIR"),
+    ("device", "FASTAFD_DEEPGEMM_JIT_DONOR", "DG_JIT_CACHE_DIR"),
+):
+    if donor := os.environ.get(donor_var):
+        command = [sys.executable, str(seed), donor, "--kind", kind,
+                   "--cache-root", os.environ[cache_var], "--output",
+                   str(Path(os.environ["RUN_DIR"]) / f"native_{kind}_seed.json")]
+        if kind in ("deepgemm", "deepep"):
+            command += ["--copy"]
+        else:
+            command += ["--rank-count", str(int(os.environ["ATTENTION_WORKERS"]) + int(os.environ["FFN_EP"]))]
+        for node in nodes:
+            command += ["--node-ip", node["NodeManagerAddress"]]
+        subprocess.run(command, check=True)
 PY
 
 # AFD uses a contiguous seven-port control block. Validate the whole block
@@ -2167,14 +2190,20 @@ PY
 if [[ "$SWEEP_CONTRACT" == comprehensive && "${NSYS:-0}" == 1 ]]; then
     CUDA_CASE_TEMP_ROOT=$CUDA_EXTRACT_TEMP_ROOT/$SLURM_JOB_ID-$CASE_ORDINAL
     mkdir -p "$CUDA_METRICS_ROOT" "$CUDA_CASE_TEMP_ROOT"
-    "$PYTHON" "$CUDA_EXTRACT_SCRIPT" \
+    CUDA_EXTRACT_ARGS=("$PYTHON" "$CUDA_EXTRACT_SCRIPT" \
         --result "$RUN_DIR/afd-result.json" \
         --plan "$CUDA_METRIC_PLAN" \
         --case-id "$CASE_ID" \
         --nsys /usr/local/cuda/bin/nsys \
         --cuda-span-module "$CUDA_SPAN_MODULE" \
         --temp-root "$CUDA_CASE_TEMP_ROOT" \
-        --output "$CUDA_METRICS_ROOT/$CASE_ID.json"
+        --output "$CUDA_METRICS_ROOT/$CASE_ID.json")
+    if [[ "${FASTAFD_DEFER_CUDA_EXTRACTION:-0}" == 1 ]]; then
+        "$PYTHON" -c 'import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]) + "\n")' \
+            "$RUN_DIR/cuda-extract-command.json" "${CUDA_EXTRACT_ARGS[@]}"
+    else
+        "${CUDA_EXTRACT_ARGS[@]}"
+    fi
 fi
 
 touch "$SNAPSHOT"

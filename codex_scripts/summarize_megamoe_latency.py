@@ -5,7 +5,82 @@ import argparse
 import json
 import math
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
+
+
+def average_rank_summaries(results, raw_inputs):
+    """Average one arm's local phase intervals after complete rank/call validation."""
+    by_rank, raw_by_rank, contracts = {}, {}, []
+    for name, result in results.items():
+        samples = result["samples"]
+        if not samples or len({sample["rank"] for sample in samples}) != 1:
+            raise ValueError(f"Require one nonempty rank trace per input: {name}")
+        rank = samples[0]["rank"]
+        if rank in by_rank:
+            raise ValueError(f"Duplicate decomposition rank: {rank}")
+        by_rank[rank] = {sample["ordinal"]: sample for sample in samples}
+        if len(by_rank[rank]) != len(samples):
+            raise ValueError(f"Duplicate decomposition call: {name}")
+        contracts.append({key: value for key, value in raw_inputs[name]["contract"].items()
+                          if key not in {"iket_profile_rank", "profile_rank_weights"}})
+        raw_samples = raw_inputs[name]["samples"]
+        raw_by_rank[rank] = {sample["measured_ordinal"]: sample for sample in raw_samples}
+        if (len(raw_by_rank[rank]) != len(raw_samples) or
+                any(sample["rank"] != rank for sample in raw_samples)):
+            raise ValueError(f"Raw decomposition rank/call mismatch: {name}")
+    if not contracts or any(contract != contracts[0] for contract in contracts):
+        raise ValueError("Rank averaging requires identical decomposition contracts")
+    world_size = contracts[0]["ep_size"]
+    if sorted(by_rank) != list(range(world_size)):
+        raise ValueError("Rank averaging requires every rank of the EP world")
+    ordinals = sorted(by_rank[0])
+    if (ordinals != list(range(len(ordinals))) or
+            any(sorted(samples) != ordinals for samples in by_rank.values()) or
+            any(sorted(samples) != ordinals for samples in raw_by_rank.values())):
+        raise ValueError("Rank averaging requires matching contiguous call ordinals")
+    def scalar_keys(sample):
+        return {key for key, value in sample.items()
+                if key.endswith("_us") and isinstance(value, (int, float))}
+    keys = scalar_keys(by_rank[0][0])
+    required = {"first_issue_from_metadata_us", "compute_end_from_metadata_us",
+                "issue_to_compute_end_us", "kernel_end_from_metadata_us"}
+    if not required <= keys:
+        raise ValueError("Missing core rank-local phase metrics")
+    for samples in by_rank.values():
+        for sample in samples.values():
+            if (scalar_keys(sample) != keys or
+                    any(not math.isfinite(sample[key]) for key in keys)):
+                raise ValueError("Rank-local phase metrics must match and be finite")
+    calls = [{"ordinal": ordinal, **{
+        key: mean(by_rank[rank][ordinal][key] for rank in sorted(by_rank))
+        for key in sorted(keys)}} for ordinal in ordinals]
+    rank_means = {rank: {key: mean(sample[key] for sample in samples.values())
+                        for key in sorted(keys)} for rank, samples in sorted(by_rank.items())}
+    phase_keys = ("pre_compute_dispatch_exposure_us", "compute_span_us",
+                  "post_compute_combine_exposure_us", "post_combine_tail_us",
+                  "dispatch_span_us", "combine_span_us", "communication_union_us",
+                  "kernel_envelope_us")
+    for samples in raw_by_rank.values():
+        for sample in samples.values():
+            if any(key not in sample or not math.isfinite(sample[key]) for key in phase_keys):
+                raise ValueError("Missing or nonfinite raw phase duration")
+    phase_calls = [{"ordinal": ordinal, **{
+        key: mean(raw_by_rank[rank][ordinal][key] for rank in sorted(raw_by_rank))
+        for key in phase_keys}} for ordinal in ordinals]
+    return {
+        "scope": "Arithmetic means of corresponding rank-local phase intervals and "
+                 "metadata-relative milestones; no absolute cross-rank timestamps averaged. "
+                 "Instrumented phases remain separate from ordinary E2E timing.",
+        "rank_count": world_size, "samples_per_rank": len(ordinals),
+        "calls": calls, "means": {key: mean(call[key] for call in calls) for key in sorted(keys)},
+        "phase_duration_calls": phase_calls,
+        "phase_duration_means": {key: mean(call[key] for call in phase_calls) for key in phase_keys},
+        "rank_means": rank_means,
+        "rank_mean_ranges": {key: {"min": min(row[key] for row in rank_means.values()),
+                                    "max": max(row[key] for row in rank_means.values())}
+                             for key in sorted(keys)},
+        "sources": {name: result["source"] for name, result in results.items()},
+    }
 
 
 def location(marker):
@@ -26,14 +101,15 @@ def startup_markers(markers, cta, origin):
         "GenphasePayloadSendStart", "GenphasePayloadDrained",
         "GenphasePayloadSenderDone", "GenphaseTailPublishStart", "GenphasePayloadStoresIssued",
         "GenphasePayloadValidateStart", "GenphaseRemainderValidateStart",
-        "GenphaseFullPayloadIssue", "GenphaseEnd", "MegaDispatchEnd",
+        "GenphaseFullPayloadIssue", "GenphaseMiddlePayloadIssue",
+        "GenphaseTailValidateStart", "GenphaseTailPayloadIssue", "GenphaseEnd", "MegaDispatchEnd",
         "GenphaseSfStoresIssued", "GenphaseMetadataStoresIssued",
         "GenphaseSfReadyIssue", "GenphaseFirstPayloadIssue",
         "MegaMetadataAcquired", "MegaIndicesReady", "MegaPayloadReady",
         "MegaGatherSfStart", "MegaGatherSfReady", "MegaGatherIssued",
         "MegaTileReady", "MegaOperandsWait", "MegaMmaIssue", "MegaComputeStart",
         "MegaFirstFc1AccObserved", "MegaFirstFc1EpiObserved",
-        "MegaRemainderWaitStart", "MegaRemainderReady",
+        "MegaRemainderWaitStart", "MegaRemainderReady", "MegaTailWaitStart", "MegaTailReady",
     }
     for marker in markers:
         x, y, z = location(marker)[0]
@@ -99,7 +175,8 @@ def sender_store_retirement(markers, origin):
     return result
 
 
-def local_readiness_publications(markers, origin, metadata_materialized=True):
+def local_readiness_publications(markers, origin, metadata_materialized=True,
+                                 sf_stores_instrumented=True, three_window_ready=False):
     """Pair local work with publication issue, without claiming completion."""
     names = ("GenphaseSfStoresIssued", "GenphaseMetadataStoresIssued",
              "GenphaseSfReadyIssue", "GenphasePayloadValidateStart",
@@ -113,8 +190,10 @@ def local_readiness_publications(markers, origin, metadata_materialized=True):
     sf_issues = events["GenphaseSfReadyIssue"]
     sf_stores = events["GenphaseSfStoresIssued"]
     metadata_stores = events["GenphaseMetadataStoresIssued"]
-    if sf_issues.keys() != sf_stores.keys():
+    if sf_stores_instrumented and sf_issues.keys() != sf_stores.keys():
         raise ValueError("Incomplete local SF publication markers")
+    if not sf_stores_instrumented and sf_stores:
+        raise ValueError("Unexpected SF store markers under explicit omission contract")
     if metadata_materialized:
         if sf_issues.keys() != metadata_stores.keys():
             raise ValueError("Incomplete local metadata store markers")
@@ -123,17 +202,19 @@ def local_readiness_publications(markers, origin, metadata_materialized=True):
     sf = []
     for cta in sorted(sf_issues):
         issue = min(t for times in sf_issues[cta].values() for t in times)
-        stores = {warp: bounds(times) for warp, times in sf_stores[cta].items()}
-        last_store = max(value["last"] for value in stores.values())
+        stores = ({warp: bounds(times) for warp, times in sf_stores[cta].items()}
+                  if sf_stores_instrumented else {})
+        last_store = max(value["last"] for value in stores.values()) if stores else None
         metadata = (bounds([t for times in metadata_stores[cta].values() for t in times])
                     if metadata_materialized else None)
-        if last_store > issue:
+        if last_store is not None and last_store > issue:
             raise ValueError(f"SF publication precedes worker store markers: {cta}")
         sf.append(dict(
             cta=list(cta), sf_store_phase_ends_by_warp=stores,
             metadata_stores_from_metadata_us=metadata,
             sf_publication_issue_from_metadata_us=issue,
-            last_sf_phase_end_to_publication_issue_us=issue - last_store,
+            last_sf_phase_end_to_publication_issue_us=(
+                issue - last_store if last_store is not None else None),
             metadata_stores_minus_sf_publication_issue_us=(
                 metadata["last"] - issue if metadata is not None else None),
         ))
@@ -163,7 +244,13 @@ def local_readiness_publications(markers, origin, metadata_materialized=True):
     result = dict(sf=sf, activation=activation)
     starts = [m for m in markers if m["name"] == "GenphaseRemainderValidateStart"]
     if starts:
-        publications = [m for m in markers if m["name"] == "GenphaseFullPayloadIssue"]
+        publication_name = ("GenphaseMiddlePayloadIssue" if three_window_ready
+                            else "GenphaseFullPayloadIssue")
+        other_name = ("GenphaseFullPayloadIssue" if three_window_ready
+                      else "GenphaseMiddlePayloadIssue")
+        if any(m["name"] == other_name for m in markers):
+            raise ValueError("Readiness publication disagrees with window contract")
+        publications = [m for m in markers if m["name"] == publication_name]
         begin, ends = {}, {}
         for items, target in ((starts, begin), (publications, ends)):
             for m in items:
@@ -185,6 +272,8 @@ def local_readiness_publications(markers, origin, metadata_materialized=True):
                                   raw_start_count=len(times), raw_publication_count=len(publications),
                                   validation_to_publication_us=max(publications) - min(times)))
         result["remainder"] = intervals
+        result["remainder_scope"] = ("middle window only" if three_window_ready
+                                      else "all bytes after prefix")
     return result
 
 
@@ -260,6 +349,12 @@ def summarize(data):
     metadata_materialized = data.get("interpretation", {}).get("receiver_metadata_materialized", True)
     if not isinstance(metadata_materialized, bool):
         raise ValueError("receiver_metadata_materialized must be boolean")
+    sf_stores_instrumented = data.get("interpretation", {}).get(
+        "receiver_sf_stores_instrumented", True)
+    if not isinstance(sf_stores_instrumented, bool):
+        raise ValueError("receiver_sf_stores_instrumented must be boolean")
+    if not sf_stores_instrumented and metadata_materialized:
+        raise ValueError("SF store omission requires direct producer metadata")
     samples = []
     for sample in data["samples"]:
         markers = sample["source_markers"]
@@ -279,7 +374,7 @@ def summarize(data):
             key = (x & ~1, y, z)
             pair_starts[key] = min(pair_starts.get(key, float("inf")), marker["time_us"])
         for marker in markers:
-            if marker["name"] in ("MegaIndicesReady", "MegaPayloadReady",
+            if marker["name"] in ("MegaMetadataAcquired", "MegaIndicesReady", "MegaPayloadReady",
                                   "MegaGatherSfReady", "MegaGatherIssued"):
                 x, y, z = location(marker)[0]
                 key = (x & ~1, y, z)
@@ -328,6 +423,13 @@ def summarize(data):
             if key in pair_operands:
                 operands = {name: bounds(values) for name, values in pair_operands[key].items()}
                 pair["first_stage_observations_from_metadata_us"] = operands
+                if "MegaMetadataAcquired" in operands:
+                    # Keep the observation count: callers must establish complete
+                    # CTA coverage before treating this as a pair-wide anchor.
+                    pair["metadata_acquire_observation_count"] = len(
+                        pair_operands[key]["MegaMetadataAcquired"])
+                    pair["last_metadata_acquire_marker_to_mma_us"] = (
+                        pair["first_issue_from_metadata_us"] - operands["MegaMetadataAcquired"]["last"])
                 if "MegaPayloadReady" in operands and "MegaGatherSfReady" in operands:
                     # These are different consumers' observations, not the exact
                     # publication or arrival times of the two operands.
@@ -423,7 +525,10 @@ def summarize(data):
                 p.get("first_issue_minus_local_startup_end_us", 0) < 0 for p in pair_spans),
             sender_publication_intervals=sender_intervals,
             sender_store_retirement=sender_store_retirement(markers, origin),
-            local_readiness_publications=local_readiness_publications(markers, origin, metadata_materialized),
+            local_readiness_publications=local_readiness_publications(
+                markers, origin, metadata_materialized, sf_stores_instrumented,
+                bool(data["contract"].get("three_window_ready", False))),
+            readiness_windows=sample.get("readiness_windows"),
             first_pair_gather=first_pair_gather(markers, cta, first["time_us"], origin),
             producer_from_metadata_us=producer_bounds,
             operation_markers_from_metadata_us=operation_markers,
@@ -438,6 +543,71 @@ def summarize(data):
             },
         ))
     return dict(kernel_us=data["nsys_kernel_us"], samples=samples)
+
+
+def attach_readiness_handoffs(arm, mapping):
+    """Join explicitly mapped first-tile publishers and consumers on one rank.
+
+    The caller must establish tile ownership from the actual scheduler/input.
+    Do not infer expert assignment from CTA number or assume balanced routing.
+    Signed differences are retained: publication markers follow release issue,
+    so they are observations, not exact release-completion timestamps.
+    """
+    if (not isinstance(mapping.get("scope"), str) or not mapping["scope"].strip()
+            or not isinstance(mapping.get("pairs"), list)):
+        raise ValueError("Readiness map requires scope and explicit pairs")
+    entries = {}
+    for entry in mapping["pairs"]:
+        for field in ("leader_cta", "sf_publisher_cta", "activation_publisher_cta"):
+            value = entry.get(field)
+            if (not isinstance(value, list) or len(value) != 3 or
+                    any(type(v) is not int or v < 0 for v in value)):
+                raise ValueError(f"Invalid readiness map CTA: {field}")
+        key = tuple(entry["leader_cta"])
+        if key[0] % 2 or key in entries:
+            raise ValueError(f"Duplicate/nonleader readiness mapping: {key}")
+        entries[key] = entry
+    for sample in arm["samples"]:
+        if not sample["first_issue_is_actual"]:
+            raise ValueError("Readiness handoff requires actual MMA issue markers")
+        pairs = sample["compute_pairs"]
+        if entries.keys() != {tuple(p["leader_cta"]) for p in pairs}:
+            raise ValueError("Readiness map must cover every measured compute pair")
+        publications = sample["local_readiness_publications"]
+        sf = {tuple(p["cta"]): p for p in publications["sf"]}
+        activation = {tuple(p["cta"]): p for p in publications["activation"]}
+        handoffs = []
+        for pair in pairs:
+            entry = entries[tuple(pair["leader_cta"])]
+            sf_key = tuple(entry["sf_publisher_cta"])
+            a_key = tuple(entry["activation_publisher_cta"])
+            if sf_key not in sf or a_key not in activation:
+                raise ValueError("Readiness map references an unobserved publisher")
+            if "publication_issues_by_warp_from_metadata_us" in activation[a_key]:
+                raise ValueError("Readiness handoff requires a whole-tile A publication")
+            observations = pair.get("first_stage_observations_from_metadata_us", {})
+            if not {"MegaGatherSfReady", "MegaPayloadReady"} <= observations.keys():
+                raise ValueError("Readiness handoff lacks first-stage consumer observations")
+            sf_issue = sf[sf_key]["sf_publication_issue_from_metadata_us"]
+            a_issue = activation[a_key]["first_A_publication_issue_from_metadata_us"]
+            handoffs.append({
+                **entry,
+                "sf_publication_from_metadata_us": sf_issue,
+                "A_publication_from_metadata_us": a_issue,
+                "sf_publication_to_last_observation_us":
+                    observations["MegaGatherSfReady"]["last"] - sf_issue,
+                "A_publication_to_last_observation_us":
+                    observations["MegaPayloadReady"]["last"] - a_issue,
+                "both_publications_to_mma_us":
+                    pair["first_issue_from_metadata_us"] - max(sf_issue, a_issue),
+            })
+        sample["local_readiness_handoffs"] = handoffs
+        sample["readiness_handoff_us"] = {
+            field: bounds([h[field] for h in handoffs]) for field in (
+                "sf_publication_to_last_observation_us",
+                "A_publication_to_last_observation_us", "both_publications_to_mma_us")
+        }
+    arm["readiness_map_scope"] = mapping["scope"]
 
 
 def read_ordinary_passes(path, result):
@@ -461,6 +631,62 @@ def read_ordinary_passes(path, result):
                 abs_tol=1e-9) for key in fields):
             raise ValueError(f"Ordinary timing input disagrees with capture: {name}")
     return passes
+
+
+def attach_marker_intervals(arm, data, mapping):
+    """Pair one start/end observation at each explicitly declared CTA/warp."""
+    for field in ("scope", "start_marker", "end_marker"):
+        if not isinstance(mapping.get(field), str) or not mapping[field].strip():
+            raise ValueError(f"Interval map requires {field}")
+    if mapping["start_marker"] == mapping["end_marker"]:
+        raise ValueError("Interval start and end markers must differ")
+    entries = mapping.get("locations")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Interval map requires explicit locations")
+    expected = set()
+    for entry in entries:
+        cta, warp = entry.get("cta"), entry.get("warp")
+        if (not isinstance(cta, list) or len(cta) != 3
+                or any(type(v) is not int or v < 0 for v in cta)
+                or type(warp) is not int or not 0 <= warp < 32):
+            raise ValueError(f"Invalid interval location: {entry}")
+        key = tuple(cta), warp
+        if key in expected:
+            raise ValueError(f"Duplicate interval location: {entry}")
+        expected.add(key)
+    raw = {(s["rank"], s["measured_ordinal"]): s for s in data["samples"]}
+    summarized = {(s["rank"], s["ordinal"]) for s in arm["samples"]}
+    if len(raw) != len(data["samples"]) or raw.keys() != summarized:
+        raise ValueError("Interval sample identities disagree")
+    for sample in arm["samples"]:
+        source = raw[sample["rank"], sample["ordinal"]]
+        origin = source["metadata_transfer_start_us"]
+        events = {name: {} for name in (mapping["start_marker"], mapping["end_marker"])}
+        for marker in source["source_markers"]:
+            if marker["name"] not in events:
+                continue
+            key, value = location(marker), marker["time_us"]
+            target = events[marker["name"]]
+            if (key in target or not math.isfinite(value)
+                    or not 0 <= value <= source["kernel_envelope_us"]):
+                raise ValueError(f"Duplicate or invalid interval marker: {marker}")
+            target[key] = value
+        if any(set(event) != expected for event in events.values()):
+            raise ValueError("Interval map does not exactly cover both observed marker sets")
+        intervals = []
+        for cta, warp in sorted(expected):
+            start = events[mapping["start_marker"]][cta, warp] - origin
+            end = events[mapping["end_marker"]][cta, warp] - origin
+            if end < start:
+                raise ValueError(f"Reversed marker interval: {cta}, warp {warp}")
+            intervals.append(dict(cta=list(cta), warp=warp, start_us=start,
+                                  end_us=end, duration_us=end - start))
+        sample["marker_intervals"] = intervals
+        sample["marker_interval_bounds"] = {
+            field: bounds([interval[field] for interval in intervals])
+            for field in ("start_us", "end_us", "duration_us")
+        }
+    arm["marker_interval_map"] = mapping
 
 
 def markdown_report(result, notes, ordinary_passes=None):
@@ -571,11 +797,27 @@ def markdown_report(result, notes, ordinary_passes=None):
             row(label, lambda s, field=field: median([
                 pair[field] for pair in s["compute_pairs"] if field in pair
             ]) if any(field in pair for pair in s["compute_pairs"]) else None)
+        if any("readiness_map_scope" in arm for arm in result.values()):
+            for field, label in (
+                ("sf_publication_to_last_observation_us", "Matched SF publication to last observation, median"),
+                ("A_publication_to_last_observation_us", "Matched A publication to last observation, median"),
+                ("both_publications_to_mma_us", "Matched later publication to MMA, median"),
+            ):
+                row(label, lambda s, field=field:
+                    s["readiness_handoff_us"][field]["median"]
+                    if "readiness_handoff_us" in s else None)
         row("Remainder issuer wait, median duration", lambda s: median([
             v["wait_us"] for v in s["remainder_wait_intervals"]
         ]) if s["remainder_wait_intervals"] else None)
         row("Final accumulator-ready observation", lambda s: s["compute_end_from_metadata_us"])
         row("Compute span, duration", lambda s: s["issue_to_compute_end_us"])
+        if any("marker_interval_map" in arm for arm in result.values()):
+            for field, label in (("start_us", "Mapped interval start, median"),
+                                 ("end_us", "Mapped interval end, median"),
+                                 ("duration_us", "Mapped interval duration, median")):
+                row(label, lambda s, field=field:
+                    s["marker_interval_bounds"][field]["median"]
+                    if "marker_interval_bounds" in s else None)
         row("Kernel end", lambda s: s["kernel_end_from_metadata_us"])
         row("First MMA from selector entry, duration", lambda s: s["first_issue_from_selector_us"])
     lines += ["", "**Marker scope and sources**", "",
@@ -588,6 +830,13 @@ def markdown_report(result, notes, ordinary_passes=None):
     for name, arm in result.items():
         source = Path(arm["source"]).resolve()
         lines.append(f"- {cell(name)}: [{source.name}](<{source}>)")
+        if "readiness_map_scope" in arm:
+            lines += ["", f"  Readiness mapping: {cell(arm['readiness_map_scope'])}"]
+        if "marker_interval_map" in arm:
+            mapping = arm["marker_interval_map"]
+            lines += ["", f"  Interval mapping: {cell(mapping['scope'])} "
+                      f"({cell(mapping['start_marker'])} → {cell(mapping['end_marker'])}). "
+                      "Paired observations include all work and waiting between these markers."]
         for key in ("genphase_index_scatter", "sf_ready_contract", "index_path", "activation_load", "remainder_wait"):
             if notes[name].get(key):
                 lines.append("")
@@ -604,20 +853,45 @@ def main():
     parser.add_argument("--ordinary-input", type=Path,
                         help="Ordered JSON of ordinary pass timings, including repeats; "
                              "requires --markdown-output")
+    parser.add_argument("--readiness-map", action="append", default=[], metavar="NAME=JSON",
+                        help="Explicit first-tile publisher map with scope and pairs; "
+                             "no inferred CTA/expert mapping")
+    parser.add_argument("--interval-map", action="append", default=[], metavar="NAME=JSON",
+                        help="Named start/end markers and exact CTA/warp coverage with a scope statement")
+    parser.add_argument("--rank-mean-output", type=Path,
+                        help="Also average one arm's complete per-rank phase traces; retain all inputs")
     args = parser.parse_args()
     if args.ordinary_input and not args.markdown_output:
         parser.error("--ordinary-input requires --markdown-output")
-    result, notes = {}, {}
+    result, notes, raw_inputs = {}, {}, {}
     for item in args.inputs:
         name, path = item.split("=", 1)
         if name in result:
             raise ValueError(f"Duplicate arm: {name}")
         data = json.loads(Path(path).read_text())
+        raw_inputs[name] = data
         result[name] = summarize(data)
         notes[name] = data.get("interpretation", {})
         result[name]["source"] = path
+    mapped = set()
+    for item in args.readiness_map:
+        name, path = item.split("=", 1)
+        if name not in result or name in mapped:
+            raise ValueError(f"Unknown or duplicate readiness-map arm: {name}")
+        attach_readiness_handoffs(result[name], json.loads(Path(path).read_text()))
+        mapped.add(name)
+    mapped = set()
+    for item in args.interval_map:
+        name, path = item.split("=", 1)
+        if name not in result or name in mapped:
+            raise ValueError(f"Unknown or duplicate interval-map arm: {name}")
+        attach_marker_intervals(result[name], raw_inputs[name], json.loads(Path(path).read_text()))
+        mapped.add(name)
     ordinary = read_ordinary_passes(args.ordinary_input, result) if args.ordinary_input else None
+    rank_mean = average_rank_summaries(result, raw_inputs) if args.rank_mean_output else None
     args.output.write_text(json.dumps(result, indent=2) + "\n")
+    if args.rank_mean_output:
+        args.rank_mean_output.write_text(json.dumps(rank_mean, indent=2) + "\n")
     if args.markdown_output:
         args.markdown_output.write_text(markdown_report(result, notes, ordinary))
     for name, arm in result.items():

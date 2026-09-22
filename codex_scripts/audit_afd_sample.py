@@ -20,8 +20,12 @@ def main():
     parser.add_argument("--prompts", type=int, required=True)
     parser.add_argument("--tokens-per-prompt", type=int, required=True)
     parser.add_argument("--score-json", type=Path)
+    parser.add_argument("--max-top10-misses", type=int, default=0,
+                        help="Allowed total tokens outside top10; default remains strict")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.max_top10_misses < 0 or (args.max_top10_misses and not args.score_json):
+        parser.error("A nonzero miss allowance requires scores and must be nonnegative")
     prompts = [line.strip() for line in args.prompt_file.read_text().splitlines()
                if line.strip() and not line.strip().startswith("#")]
     sample = json.loads(args.sample_json.read_text())
@@ -77,13 +81,15 @@ def main():
                 summary["total_generated_tokens"] == count, "Scorer summary coverage mismatch")
         require(math.isclose(summary["overall_top10_hit_rate"], top10 / count),
                 "Invalid top10 summary")
-        result.update(passed=top10 == count, scored=True, score_json=str(args.score_json),
+        result.update(passed=count - top10 <= args.max_top10_misses,
+                      max_top10_misses=args.max_top10_misses, top10_misses=count - top10,
+                      scored=True, score_json=str(args.score_json),
                       top1_tokens=top1, top10_tokens=top10, finite_logprobs=True,
                       finite_candidate_logprobs=True, outside_top10=outside_top10)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
     if not result["passed"]:
-        raise SystemExit("Alignment failed: tokens outside top10; see audit output")
+        raise SystemExit("Alignment failed: top10 miss allowance exceeded; see audit output")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ for case_id in requested:
     case = cases[case_id]
     assert not list((Path(sys.argv[1]).parent / case_id).glob("*/decomposition.json")), f"case already complete: {case_id}"
     assert case["ep"] == int(sys.argv[3]), "case EP does not match allocation"
-    c = manifest["contract"]
+    c = dict(manifest["contract"], **case.get("capture_contract", {}))
     print(case_id, case["rows_per_rank"], case["global_tokens"],
           *(c[k] for k in ("model", "hidden", "intermediate", "experts", "top_k", "num_sms", "bucket")),
           sep="\t")

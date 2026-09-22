@@ -213,8 +213,9 @@ def _build_extension_path(
 
         nvcc = _resolve_nvcc()
         env = _build_nvcc_env(nvcc)
-        major, minor = torch.cuda.get_device_capability()
-        env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
+        if not env.get("TORCH_CUDA_ARCH_LIST"):
+            major, minor = torch.cuda.get_device_capability()
+            env["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
         env.setdefault("MAX_JOBS", os.environ.get("MAX_JOBS", "16"))
 
         for old_so in lib_dir.glob(f"{_EXT_NAME}*.so"):

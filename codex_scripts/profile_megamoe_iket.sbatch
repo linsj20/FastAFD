@@ -26,6 +26,13 @@
 #SBATCH --job-name=fastafd-megamoe-iket
 
 set -euo pipefail
+for retired_option in MEGAMOE_IKET_RECEIVER_ROUTE_SORT MEGAMOE_IKET_SOURCE_PARALLEL_SORT \
+    MEGAMOE_IKET_EXPERT_PARALLEL_SORT MEGAMOE_IKET_SOURCE_DIRECT_SORT \
+    MEGAMOE_IKET_COMBINE_RETIREMENT_DIAGNOSTIC; do
+    [[ ${!retired_option:-0} == 0 ]] || {
+        echo "$retired_option requires its historical frozen workflow" >&2; exit 2;
+    }
+done
 
 FASTAFD_USER_ROOT=${FASTAFD_USER_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_comparch_sysarch/users/shengjiel}
 FASTAFD_SOURCE_REPO=${FASTAFD_SOURCE_REPO:-$FASTAFD_USER_ROOT/FastAFD/source/local-mirror}
@@ -89,35 +96,25 @@ if [[ ${FASTAFD_IKET_RANK_MODE:-} == normal || \
         export MEGAMOE_RESULT_MODE=compare
     fi
     rank=${SLURM_PROCID:?}
+    # Keep all local GPUs visible for symmetric-memory device identity. Rotate
+    # the assignment so the profiled logical rank uses physical device0.
+    export MEGAMOE_SMOKE_DEVICE_INDEX=$(( (SLURM_LOCALID + MEGAMOE_IKET_TASKS_PER_NODE - MEGAMOE_IKET_PROFILE_RANK % MEGAMOE_IKET_TASKS_PER_NODE) % MEGAMOE_IKET_TASKS_PER_NODE ))
     rank_root=$FASTAFD_IKET_RUN_ROOT/ranks/rank-$rank
     mkdir -p "$rank_root" "/dev/shm/fastafd-megamoe-iket-$SLURM_JOB_ID-$rank"
     export TMPDIR=/dev/shm/fastafd-megamoe-iket-$SLURM_JOB_ID-$rank
-    if [[ $rank == "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
-        if [[ $FASTAFD_IKET_RANK_MODE == normal ]]; then
-            export MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT=$FASTAFD_IKET_RUN_ROOT/profile-rank-weights.pt
-        else
-            export MEGAMOE_SMOKE_WEIGHT_CACHE_INPUT=$FASTAFD_IKET_RUN_ROOT/profile-rank-weights.pt
-        fi
-    fi
-    if [[ $FASTAFD_IKET_RANK_MODE == normal &&
-          $rank == "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
+    # Each rank retains its own weights for the subsequent IKET processes.
+    if [[ $FASTAFD_IKET_RANK_MODE == normal ]]; then
+        export MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT=$rank_root/profile-rank-weights.pt
         export OUTPUT_ROOT=$rank_root
         export MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX=$rank_root/nsys/megamoe
-        export MEGAMOE_SMOKE_NSYS_PROFILE_RANK=$MEGAMOE_IKET_PROFILE_RANK
+        export MEGAMOE_SMOKE_NSYS_PROFILE_RANK=$rank
         export MEGAMOE_SMOKE_RANK_MODE=run
+        export MEGAMOE_SMOKE_NSYS_TRACE=cuda-sw
+        export MEGAMOE_SMOKE_NSYS_GRAPH_TRACE=node:host-only
         exec bash "$FASTAFD_SOURCE_REPO/scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch"
     fi
-    if [[ $FASTAFD_IKET_RANK_MODE == normal || \
-          $rank != "$MEGAMOE_IKET_PROFILE_RANK" ]]; then
-        # Source-mode IKET runs discovery and capture in separate processes.
-        # Peers must join both worlds, with identical rank IDs and inputs.
-        if [[ $FASTAFD_IKET_RANK_MODE == profile ]]; then
-            "$FASTAFD_VENV/bin/python" \
-                "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
-        fi
-        exec "$FASTAFD_VENV/bin/python" \
-            "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
-    fi
+    export MEGAMOE_SMOKE_WEIGHT_CACHE_INPUT=$rank_root/profile-rank-weights.pt
+    # Every rank runs both IKET discovery and capture with its own output root.
     # Add optional SModel dependencies only to the profiler interpreter.
     # Its child workload retains the original Python environment.
     exec /usr/bin/python3 -c '
@@ -333,6 +330,10 @@ metadata_materialized_value = os.environ.get("MEGAMOE_IKET_METADATA_MATERIALIZED
 if metadata_materialized_value not in ("0", "1"):
     raise SystemExit("MEGAMOE_IKET_METADATA_MATERIALIZED must be 0 or 1")
 metadata_materialized = metadata_materialized_value == "1"
+local_reduce_value = os.environ.get("MEGAMOE_IKET_LOCAL_REDUCE_MARKERS", "0")
+if local_reduce_value not in ("0", "1"):
+    raise SystemExit("MEGAMOE_IKET_LOCAL_REDUCE_MARKERS must be 0 or 1")
+local_reduce_markers = local_reduce_value == "1"
 rows_per_rank = (global_tokens + ep_size - 1) // ep_size
 balance_ranks = bool(int(os.environ.get("MEGAMOE_SMOKE_BALANCE_RANKS", "0")))
 hidden, intermediate, experts, top_k, num_sms, bucket = (
@@ -367,6 +368,12 @@ def load_benchmark(name: str) -> tuple[dict, dict]:
         raise SystemExit(f"invalid {name}: timing scope mismatch")
     if record.get("routes_prepared") is not True:
         raise SystemExit(f"invalid {name}: routes were not prepared")
+    layout = os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate")
+    if layout not in ("separate", "joined"):
+        raise SystemExit(f"invalid prepared graph layout: {layout}")
+    if layout == "joined" and (record.get("prepared_graph_layout") != "joined" or
+                               record.get("dispatch_reset_outside_timing") is not False):
+        raise SystemExit(f"invalid {name}: joined preparation timing contract")
     expected_routing = ("fixed_global_sequence_rank_interleaved_balance" if balance_ranks
                         else "fixed_global_sequence_perfect_balance")
     if record.get("routing") != expected_routing:
@@ -513,6 +520,59 @@ for rank_dir in rank_dirs:
             )
         base = min(start for _, start, _ in rows)
         kernel_end = max(end for _, _, end in rows)
+        window_mode = os.environ.get("MEGAMOE_IKET_THREE_WINDOW_READY", "0")
+        if window_mode not in ("0", "1"):
+            raise SystemExit("invalid three-window readiness contract")
+        three_window = window_mode == "1"
+        middle_end = int(os.environ["MEGAMOE_IKET_MIDDLE_WINDOW_END"]) if three_window else None
+        decoded_source_markers = [
+            {"name": indexed_value(trace["stringTable"], m["markerNameIdx"]),
+             "location": lifetime_location(m, trace["locationTable"]),
+             "time_us": (int(m["timestamp"]) - base) / 1000.0}
+            for m in launch.get("markers", [])]
+        readiness_windows = None
+        role_contract = os.environ.get("MEGAMOE_IKET_ROLE_CONTRACT", "legacy")
+        if role_contract not in ("legacy", "all_push_sweep"):
+            raise SystemExit("unknown dispatch role contract")
+        sweep_roles = None
+        if role_contract == "all_push_sweep":
+            # The compiled specialization establishes tile and scheduling geometry.
+            # Balanced routing determines active workers independently of markers.
+            parameters = [int(x) for x in re.findall(r"Lj(\d+)E", name)]
+            if (not balance_ranks or len(parameters) < 20 or
+                    parameters[:5] != [bucket, hidden, intermediate, experts, top_k] or
+                    parameters[5] != experts // ep_size or parameters[6] not in (16, 32) or
+                    parameters[7:9] != [128, 128] or parameters[15:20] != [128, 128, 256, num_sms, ep_size]):
+                raise SystemExit("all-push role contract requires the recorded one-wave specialization")
+            owners = min(experts // ep_size, 2 * ep_size)
+            total_routes = global_tokens * top_k
+            quotient, remainder = divmod(total_routes, experts)
+            expert_counts = [quotient + int(e * ep_size + rank < remainder)
+                             for e in range(experts // ep_size)]
+            active_sf = sorted({e % owners for e, count in enumerate(expert_counts) if count})
+            l1_tiles = sum((count + parameters[6] - 1) // parameters[6]
+                           for count in expert_counts) * (2 * intermediate // parameters[7])
+            pushers = min((bucket + 127) // 128, 8)
+            sweep_roles = dict(active_index_ctas=active_sf,
+                active_validation_ctas=[owners + e for e in active_sf],
+                active_issuer_ctas=list(range(min(num_sms, l1_tiles))),
+                allocated_pushers=pushers, active_pushers=min(pushers, (rows_per_rank + 3) // 4))
+        if three_window:
+            sys.path.insert(0, os.environ["MEGAMOE_IKET_WINDOW_DECODER_ROOT"])
+            from decode_megamoe_readiness_windows import decode_readiness_windows
+            decoded_source_markers, readiness_windows = decode_readiness_windows(
+                decoded_source_markers, hidden=hidden, num_sms=num_sms,
+                validation_ctas=int(os.environ["MEGAMOE_IKET_METADATA_PAYLOAD_CTAS"]),
+                index_ctas=int(os.environ["MEGAMOE_IKET_METADATA_INDEX_CTAS"]), middle_end=middle_end,
+                **({k: sweep_roles[k] for k in ("active_index_ctas", "active_validation_ctas", "active_issuer_ctas")}
+                   if sweep_roles is not None else {}))
+        elif any(m["name"] in {"GenphaseWindowValidateStart", "GenphaseWindowPayloadIssue",
+                              "MegaWindowWaitStart", "MegaWindowReady", "GenphaseMiddlePayloadIssue"}
+                 for m in decoded_source_markers):
+            raise SystemExit("unexpected multiwindow markers")
+        semantic_event_names = {id(m): d["name"] for m, d in zip(launch.get("markers", []), decoded_source_markers)}
+        def marker_event(marker):
+            return semantic_event_names[id(marker)]
         metric = {
             "kernel_envelope_us": (kernel_end - base) / 1000.0,
         }
@@ -538,7 +598,7 @@ for rank_dir in rank_dirs:
         # tiles finish; its duration must not be added to the compute duration.
         points = {}
         marker_counts = {}
-        event_names = {indexed_value(trace["stringTable"], m["markerNameIdx"])
+        event_names = {marker_event(m)
                        for m in launch.get("markers", [])}
         compute_events = event_names & {"MegaComputeStart", "MegaMmaIssue"}
         if len(compute_events) != 1:
@@ -559,7 +619,7 @@ for rank_dir in rank_dirs:
                 times = [
                     int(marker["timestamp"])
                     for marker in launch.get("markers", [])
-                    if indexed_value(trace["stringTable"], marker["markerNameIdx"])
+                    if marker_event(marker)
                     == event_name
                 ]
                 if not times:
@@ -572,14 +632,14 @@ for rank_dir in rank_dirs:
                 ) / 1000.0
         metric.update(points)
         sf_owner_events = [marker for marker in launch.get("markers", [])
-                           if indexed_value(trace["stringTable"], marker["markerNameIdx"]) == "MegaSFByTMAA"]
+                           if marker_event(marker) == "MegaSFByTMAA"]
         if sf_owner_events:
             locations = {marker.get("locIdx", marker.get("locationIdx")) for marker in sf_owner_events}
             if None in locations or len(locations) != num_sms:
                 raise SystemExit("incomplete TMA-A scale-factor ownership markers")
             marker_counts["MegaSFByTMAA"] = len(sf_owner_events)
         payload_acquires = [m for m in launch.get("markers", [])
-                            if indexed_value(trace["stringTable"], m["markerNameIdx"]) == "MegaPayloadAcquired"]
+                            if marker_event(m) == "MegaPayloadAcquired"]
         if payload_acquires:
             locations = {m.get("locIdx", m.get("locationIdx")) for m in payload_acquires}
             times = [int(m["timestamp"]) for m in payload_acquires]
@@ -595,12 +655,20 @@ for rank_dir in rank_dirs:
             points["dispatch_end_us"] = max(points["dispatch_end_us"], metric["payload_acquire_first_us"])
             metric.update(points)
         genphase = None
-        if any(indexed_value(trace["stringTable"], marker["markerNameIdx"]) == "GenphaseStart"
+        if any(marker_event(marker) == "GenphaseStart"
                for marker in launch.get("markers", [])):
             communication = launch
             genphase = {}
-            events_present = {indexed_value(trace["stringTable"], marker["markerNameIdx"])
+            events_present = {marker_event(marker)
                               for marker in communication.get("markers", [])}
+            if local_reduce_markers:
+                required = {"MegaLocalReduceStart", "MegaLocalReduceEnd",
+                            "GenphaseSfReadyIssue", "GenphaseFirstPayloadIssue",
+                            ("GenphaseMiddlePayloadIssue" if three_window else "GenphaseFullPayloadIssue")}
+                omitted = {"GenphaseSfStoresIssued", "GenphasePayloadSendStart"}
+                if (metadata_materialized or not required <= events_present
+                        or omitted & events_present):
+                    raise SystemExit("local-reduction marker trade contract mismatch")
             send_detail = [name for name in ("TopkStaged", "TopkWritten", "TopkSent")
                            if "Genphase" + name in events_present]
             input_detail = ["InputsReady"] if "GenphaseInputsReady" in events_present else []
@@ -628,32 +696,35 @@ for rank_dir in rank_dirs:
                 transport_detail.append("PayloadValidateStart")
             if "GenphaseRemainderValidateStart" in events_present:
                 transport_detail.append("RemainderValidateStart")
+            if three_window and hidden > middle_end:
+                transport_detail.extend(["TailValidateStart", "TailPayloadIssue"])
             readiness_detail = [name for name in (
                 "SfStoresIssued", "MetadataStoresIssued", "SfReadyIssue", "FirstPayloadIssue")
                 if "Genphase" + name in events_present]
             if "SfStoresIssued" in readiness_detail:
                 if ("MetadataStoresIssued" in readiness_detail) != metadata_materialized:
                     raise SystemExit("receiver metadata materialization marker contract mismatch")
-            elif not metadata_materialized:
+            elif not metadata_materialized and not local_reduce_markers:
                 raise SystemExit("direct producer metadata requires SF store detail markers")
             transport_detail.extend(readiness_detail)
-            index_release = "FullPayloadIssue" if "GenphaseFullPayloadIssue" in events_present else "IndexReady"
+            index_release = "MiddlePayloadIssue" if three_window else ("FullPayloadIssue" if "GenphaseFullPayloadIssue" in events_present else "IndexReady")
             metadata_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_CTAS", ep_size))
             index_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_INDEX_CTAS", metadata_ctas))
             validation_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_PAYLOAD_CTAS", metadata_ctas))
             if not 0 < index_ctas <= metadata_ctas or not 0 < validation_ctas <= metadata_ctas:
                 raise SystemExit("invalid metadata role CTA counts")
-            if index_release == "FullPayloadIssue" and "GenphaseIndexReady" in events_present:
+            if index_release in ("FullPayloadIssue", "MiddlePayloadIssue") and "GenphaseIndexReady" in events_present:
                 raise SystemExit("ambiguous full-payload/index publication marker contract")
             if len(payload_events) > 1 or (not payload_events and not cleanup_retirement):
                 raise SystemExit("ambiguous or missing generation-specialized payload marker")
             payload_event = payload_events[0] if payload_events else None
             if send_detail and (len(send_detail) != 2 or "TopkSent" not in send_detail):
                 raise SystemExit("incomplete generation-specialized metadata send markers")
-            for event in ("Start", *input_detail, *producer_metadata, *expert_lists, *cleanup_retirement, *send_detail, "TopkReceived", "SizesReady", index_release,
+            size_detail = ["SizesReady"]
+            for event in ("Start", *input_detail, *producer_metadata, *expert_lists, *cleanup_retirement, *send_detail, "TopkReceived", *size_detail, index_release,
                           *payload_events, *transport_detail, *refine_events, *fused_scatter, *index_scatter, "End"):
                 events = [marker for marker in communication.get("markers", [])
-                          if indexed_value(trace["stringTable"], marker["markerNameIdx"]) == "Genphase" + event]
+                          if marker_event(marker) == "Genphase" + event]
                 times = [int(marker["timestamp"]) for marker in events]
                 if not times:
                     raise SystemExit(f"rank {rank}: missing Genphase{event}")
@@ -666,6 +737,17 @@ for rank_dir in rank_dirs:
                 genphase[event] = {"first_us": (min(times) - base) / 1000,
                                    "last_us": (max(times) - base) / 1000,
                                    "count": len(locations), "raw_count": len(times)}
+            if sweep_roles is not None:
+                def event_location(marker):
+                    return marker.get("locIdx", marker.get("locationIdx"))
+                size_events = [m for m in communication.get("markers", [])
+                               if marker_event(m) == "GenphaseSizesReady"]
+                size_locations = {event_location(m) for m in size_events}
+                helper_inputs = [m for m in communication.get("markers", [])
+                                 if marker_event(m) == "GenphaseInputsReady"
+                                 and event_location(m) in size_locations]
+                if helper_inputs:
+                    raise SystemExit("unexpected retired receiver-sort markers")
             begin, end = genphase["Start"]["first_us"], genphase["End"]["last_us"]
             if begin > end or any(not (begin <= value["first_us"] <= value["last_us"] <= end)
                                   for value in genphase.values()):
@@ -676,10 +758,10 @@ for rank_dir in rank_dirs:
             else:
                 refiners = (1 if producer_payload else genphase[payload_event]["count"] + 1) if fused_scatter or index_scatter else genphase["RefineStart"]["count"]
             expected_counts = {"TopkReceived": metadata_ctas,
-                               index_release: validation_ctas if index_release == "FullPayloadIssue" else index_ctas,
-                               "SizesReady": 1,
+                               index_release: validation_ctas if index_release in ("FullPayloadIssue", "MiddlePayloadIssue") else index_ctas,
                                "Start": metadata_ctas + refiners, "End": metadata_ctas + refiners}
-            if index_release == "FullPayloadIssue":
+            expected_counts.update({name: 1 for name in size_detail})
+            if index_release in ("FullPayloadIssue", "MiddlePayloadIssue"):
                 expected_counts[index_release] *= int(os.environ.get("MEGAMOE_IKET_FULL_PAYLOAD_PUBLISHERS_PER_CTA", "1"))
             if payload_event:
                 expected_counts[payload_event] = 1 if producer_payload else refiners - (0 if cleanup_retirement else 1)
@@ -689,6 +771,8 @@ for rank_dir in rank_dirs:
                 expected_counts["PayloadValidateStart"] = validation_ctas
             if "RemainderValidateStart" in transport_detail:
                 expected_counts["RemainderValidateStart"] = validation_ctas
+            if three_window and hidden > middle_end:
+                expected_counts.update(TailValidateStart=validation_ctas, TailPayloadIssue=validation_ctas)
             for event in readiness_detail:
                 count = validation_ctas if event == "FirstPayloadIssue" else index_ctas
                 if event == "SfStoresIssued":
@@ -702,8 +786,21 @@ for rank_dir in rank_dirs:
             expected_counts.update({name: ep_size for name in send_detail})
             expected_counts.update({name: refiners if producer_metadata else metadata_ctas + refiners for name in input_detail})
             expected_counts.update({name: metadata_ctas for name in producer_metadata + expert_lists + cleanup_retirement})
+            if sweep_roles is not None:
+                if (payload_event != "PayloadStoresIssued" or not producer_metadata or
+                        not index_scatter or cleanup_retirement):
+                    raise SystemExit("all-push sweep marker ownership differs from its source contract")
+                refiners = sweep_roles["allocated_pushers"] + 1
+                active = len(sweep_roles["active_index_ctas"])
+                expected_counts.update(Start=metadata_ctas + refiners, End=metadata_ctas + refiners,
+                    InputsReady=refiners, PayloadStoresIssued=sweep_roles["active_pushers"],
+                    SfReadyIssue=active, FirstPayloadIssue=active, MiddlePayloadIssue=active,
+                    PayloadValidateStart=active, RemainderValidateStart=active,
+                    TailValidateStart=active, TailPayloadIssue=active)
             if refiners < (0 if cleanup_retirement else 1 if producer_payload else 2) or any(genphase[key]["count"] != count for key, count in expected_counts.items()):
-                raise SystemExit("incomplete generation-specialized dispatch role markers")
+                raise SystemExit("incomplete generation-specialized dispatch role markers: " + str({
+                    key: (genphase[key]["count"], count) for key, count in expected_counts.items()
+                    if genphase[key]["count"] != count}))
             metric["genphase_start_us"] = begin
             metric["genphase_end_us"] = end
             metric["genphase_span_us"] = end - begin
@@ -748,7 +845,7 @@ for rank_dir in rank_dirs:
             names = ("MegaDispatchRemoteIssue", "MegaDispatchRemoteArrived", "MegaDispatchRemotePublished")
             by_location = {}
             for marker in launch.get("markers", []):
-                event = indexed_value(trace["stringTable"], marker["markerNameIdx"])
+                event = marker_event(marker)
                 if event in names:
                     entry = by_location.setdefault(marker["locIdx"], {name: [] for name in names})
                     entry[event].append(int(marker["timestamp"]))
@@ -789,7 +886,7 @@ for rank_dir in rank_dirs:
                              ("MegaEpiL2Wait", "epi_l2_wait"),
                              ("MegaEpiL2Ready", "epi_l2_ready")):
             times = [int(m["timestamp"]) for m in launch.get("markers", [])
-                     if indexed_value(trace["stringTable"], m["markerNameIdx"]) == event]
+                     if marker_event(m) == event]
             if times:
                 if not base <= min(times) <= max(times) <= kernel_end:
                     raise SystemExit(f"invalid {event} timestamps")
@@ -798,12 +895,13 @@ for rank_dir in rank_dirs:
                 marker_counts[event] = len(times)
         remainder_warps = int(os.environ.get("MEGAMOE_IKET_REMAINDER_WARPS_PER_CTA", "0"))
         if remainder_warps:
-            expected = {(x, 0, 0, w) for x in range(num_sms) for w in range(remainder_warps)}
+            issuer_ctas = sweep_roles["active_issuer_ctas"] if sweep_roles is not None else range(num_sms)
+            expected = {(x, 0, 0, w) for x in issuer_ctas for w in range(remainder_warps)}
             remainder = {}
             for event in ("MegaRemainderWaitStart", "MegaRemainderReady"):
                 observed = {}
                 for m in launch.get("markers", []):
-                    if indexed_value(trace["stringTable"], m["markerNameIdx"]) != event:
+                    if marker_event(m) != event:
                         continue
                     loc = lifetime_location(m, trace["locationTable"])
                     key = (*loc["ctaId"], loc["warpId"])
@@ -817,6 +915,9 @@ for rank_dir in rank_dirs:
             for key in expected:
                 if not base <= remainder["MegaRemainderWaitStart"][key] <= remainder["MegaRemainderReady"][key] <= kernel_end:
                     raise SystemExit(f"invalid remainder-wait interval at {key}")
+        if {"MegaReturnProgress", "MegaLocalOperandsReady"} & {
+                marker_event(m) for m in launch.get("markers", [])}:
+            raise SystemExit("retired diagnostic capture requires its frozen workflow")
         if producers:
             producer = next(p for p in producer_samples
                             if p["rank"] == rank and p["measured_ordinal"] == ordinal)
@@ -842,12 +943,8 @@ for rank_dir in rank_dirs:
                 "launch_source": source,
                 "kernel_name": name,
                 "kernel_start_timestamp_ns": base,
-                "source_markers": [
-                    {"name": indexed_value(trace["stringTable"], m["markerNameIdx"]),
-                     "location": lifetime_location(m, trace["locationTable"]),
-                     "time_us": (int(m["timestamp"]) - base) / 1000.0}
-                    for m in launch.get("markers", [])
-                ],
+                "source_markers": decoded_source_markers,
+                **({"readiness_windows": readiness_windows} if readiness_windows is not None else {}),
                 "marker_counts": marker_counts,
                 "dispatch_messages": messages,
                 "genphase_markers_relative_to_megamoe": genphase,
@@ -860,7 +957,7 @@ for rank_dir in rank_dirs:
                     {"location": indexed_value(trace["locationTable"], m["locIdx"]),
                      "time_us": (int(m["timestamp"]) - base) / 1000.0}
                     for m in launch.get("markers", [])
-                    if indexed_value(trace["stringTable"], m["markerNameIdx"]) == compute_start_event
+                    if marker_event(m) == compute_start_event
                 ],
                 **metric,
             }
@@ -925,9 +1022,12 @@ result = {
         "rank_interleaved_expert_mapping": balance_ranks,
         "kernel_assumes_perfect_routing": False,
         "timed_scope": baseline_record["timed_scope"],
+        "prepared_graph_layout": os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT", "separate"),
+        "preparation_in_cuda_event_span": os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT") == "joined",
         "route_producer_in_timed_region": baseline_record["timed_scope"] == "route_producer_and_megamoe",
         "warp_summary_selects_megamoe_only": True,
         "genphase_dispatch": bool(genphase),
+        "three_window_ready": os.environ.get("MEGAMOE_IKET_THREE_WINDOW_READY", "0") == "1",
         "genphase_direct_sf_gather": bool(genphase and "IndexScatter" in genphase),
         "genphase_sf_by_tma_a": bool(sf_owner_events),
         "genphase_metadata_from_producer": bool(genphase and "MetadataFromProducer" in genphase),
@@ -943,10 +1043,16 @@ result = {
         "dispatch_detail": dispatch_detail,
         "metadata_detail": metadata_detail,
         "critical_points": os.environ["MEGAMOE_IKET_CRITICAL"] == "1",
-        "profile_rank_weights": "profile-rank-weights.pt",
+        "profile_rank_weights": f"ranks/rank-{profile_rank}/profile-rank-weights.pt",
     },
     "interpretation": {
+        "cuda_event_scope": ("Preparation barrier/reset and producer-to-MegaMoE workload; outer event span is not the plotted kernel duration."
+                             if os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT") == "joined" else
+                             "Prepared workload graph; preparation is outside the outer CUDA-event span."),
+        "phase_scope": "Nsight main-kernel duration and IKET source-marker phases exclude the preparation barrier/reset; they come from separate executions.",
         "receiver_metadata_materialized": metadata_materialized,
+        "receiver_sf_stores_instrumented": not local_reduce_markers,
+        "local_reduction": os.environ.get("MEGAMOE_IKET_LOCAL_REDUCE_SEMANTICS", "Not separately instrumented"),
         "first_fc1_accumulator_probe": os.environ.get("MEGAMOE_IKET_ACCUMULATOR_PROBE_SEMANTICS", "Absent unless explicitly enabled by the captured source."),
         "remainder_wait": os.environ.get("MEGAMOE_IKET_REMAINDER_SEMANTICS", "Absent unless explicitly enabled by the captured source."),
         "producer_origin": "Producer-entry metrics use the paired selector's first observed warp entry, excluding the preceding gate GEMM/quantization kernel. They include selector work and PDL overlap through MegaMoE completion. These are instrumented envelopes, not ordinary Nsight kernel durations. Metadata-start metrics begin at the first destination transfer marker, whose operation differs between descriptor allocation and broadcast. Compare common-origin timing as well as kernel-relative starts when PDL signal placement changes.",
@@ -967,7 +1073,7 @@ result = {
         "genphase_payload_publication": "PayloadIssued follows generic stores, writer proxy fences, CTA joins and async SYS release issue; it does not assert remote visibility. PayloadDrained follows full TMA write completion, a CTA join and async SYS release issue. PayloadPushed in older variants follows TMA write drains and a separate sender system fence. Compare receiver-dependent milestones and first MMA; these source milestones have different ordering work.",
         "payload_source_phase": os.environ.get("MEGAMOE_IKET_PAYLOAD_SOURCE_SEMANTICS", "Source-load and send-start markers delimit phases whose instruction boundaries depend on the transport. Consult source locations and the run contract; compare receiver readiness and actual MMA as well as source intervals."),
         "receiver_validation": os.environ.get("MEGAMOE_IKET_RECEIVER_VALIDATION_SEMANTICS", "Optional PayloadValidateStart marks first-tile activation validation. Separate validation warpgroups may start before SF/index phase1; only phase2 publication joins those dependencies. Consult variant ownership and marker location. Each generic vector load validates all four scalar words and materializes observed values in receiver-owned HBM; phase2 releases gather. PayloadStoresIssued precedes sender completion/retirement; GenphaseEnd remains the retirement boundary. All-four-gather instrumentation records indices, activation readiness and gather issue on warps0..3; earlier traces sampled warp0 only. Buffer capacity is guarded and reset stays outside timing."),
-        "lamport_payload_readiness": "PayloadSenderDone is sender retirement, not a separate payload-ready publication. For row-tail Lamport variants, MegaPayloadReady follows acquisition of the first tile's source-row final FP8 words; bulk activation/SF writes precede those in-band completion words. MegaGatherIssued samples activation warp0. MegaGatherSfReady samples SF warp0 in shared-role variants or SF warp2 in split-role variants; neither marker covers every producer. Their order depends on the variant. Consult source marker locations and the run contract for granularity. Payload preparation and replay resets are outside MegaMoE and excluded from prepared-harness event timing.",
+        "lamport_payload_readiness": "PayloadSenderDone is sender retirement, not a separate payload-ready publication. For row-tail Lamport variants, MegaPayloadReady follows acquisition of the first tile's source-row final FP8 words; bulk activation/SF writes precede those in-band completion words. MegaGatherIssued samples activation warp0. MegaGatherSfReady samples SF warp0 in shared-role variants or SF warp2 in split-role variants; neither marker covers every producer. Their order depends on the variant. Consult source marker locations and the run contract for granularity. Payload preparation and replay resets are outside MegaMoE; cuda_event_scope records whether outer event timing includes them.",
         "mma_issue_semantics": "MegaComputeStart and legacy first_mma metrics mark operand-barrier completion before SF UTCCP and MMA. Where available, MegaMmaIssue and mma_issue metrics mark immediately before the first fma call after SF copying and descriptor preparation. Compare matched instrumentation; do not silently treat the legacy proxy as actual issue.",
         "epilogue_combine_lifetime_us": (
             "epilogue/combine warp entry-to-exit; includes its compute wait"
@@ -996,7 +1102,9 @@ result = {
     "summary_us": summary,
     "samples": samples,
 }
-(run_root / "decomposition.json").write_text(
+analysis_root = run_root / "rank_decomposition" / f"rank-{profile_rank}"
+analysis_root.mkdir(parents=True, exist_ok=True)
+(analysis_root / "decomposition.json").write_text(
     json.dumps(result, indent=2, sort_keys=True) + "\n"
 )
 csv_records = []
@@ -1020,12 +1128,12 @@ for sample in samples:
         **{name: sample[name] for name in metric_names},
     }
     csv_records.append(record)
-with (run_root / "decomposition.csv").open("w", newline="") as stream:
+with (analysis_root / "decomposition.csv").open("w", newline="") as stream:
     writer = csv.DictWriter(stream, fieldnames=list(csv_records[0]))
     writer.writeheader()
     writer.writerows(csv_records)
 
-print(f"FASTAFD_MEGAMOE_IKET_RESULT={run_root / 'decomposition.json'}")
+print(f"FASTAFD_MEGAMOE_IKET_RESULT={analysis_root / 'decomposition.json'}")
 print(f"nsys_kernel_us={nsys_us}")
 for name in (
     "kernel_envelope_us",
