@@ -11,7 +11,7 @@ from .utils import load_jit, make_cpp_args
 def _jit_module(head_dim: int):
     args = make_cpp_args(head_dim)
     return load_jit(
-        "afd_fmha_transport",
+        "afd_fmha_transport_edges",
         *args,
         cuda_files=["afd_fmha_transport.cu"],
         cuda_wrappers=[

@@ -167,6 +167,20 @@ retained sources and current paths. Support: `#oci-hsg-cs-001-support`.
 
 ## AGA / NVL576
 
+- September22 rack-scale submission: each domain has16physical racks,9trays×4GPUs
+  per rack in the topology definition. No domain currently exposes all144trays;
+  d002 has141,missingR04-T05/R13-T06/R15-T02. User approved512GPUs(A496:F16),
+  eight trays in each rack. Exact128-node request needs `--segment=8
+  --consolidate-segments`; omitting these failed topology validation. GPU39892
+  accepted underQOSnormal. See [rack scaling](CODEX_PROJECT_aga_bringup.md#rack-scaling-and-communication)
+  for the reusable mapper, per-rack routing and batch4–7 Nsight sequence.
+
+- September22 optimized Qwen3 promotion uses `sbatch --propagate=NONE` for
+  GPU and analysis allocations. Current login limits are NPROC300/400 and
+  AS/RSS8GiB; inheriting them caused Ray startup fork failure before inference.
+  CPU39750 confirmed propagation-disabled NPROC1543356 and unlimited AS;
+  GPU39751 then completed the32GPU one-rack capture. See
+  [promotion](CODEX_PROJECT_aga_bringup.md#qwen3-promotion) for exact plans and evidence.
 - `FastAFD/source/local-mirror` holds current source/docs without `.git` or
   historical snapshots. Fresh dependencies now live under `FastAFD/dependencies`;
   active setup/tests under `FastAFD/artifacts/aga_bringup/20260915`. Both original

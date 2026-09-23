@@ -133,6 +133,10 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("metric", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--q-wait-kernel", default="wait_ready_kernel")
+    parser.add_argument("--q-publish-kernel", default="publish_qkv_kernel")
+    parser.add_argument("--same-host", action="store_true",
+                        help="Use shared-host capture origins; caller must verify placement")
     args = parser.parse_args()
     agraphs, mgraphs = graphs(args.attention), graphs(args.model)
     metric = json.loads(args.metric.read_text())
@@ -144,8 +148,8 @@ def main():
         mstart, mend = span(mrows)
         attn = select(arows, "fmhaSm")
         apub = select(arows, "quantize_publish_o_fp8_kernel")
-        awaiters = select(arows, "wait_ready_kernel")
-        mpub = select(mrows, "publish_qkv_kernel")
+        awaiters = select(arows, args.q_wait_kernel)
+        mpub = select(mrows, args.q_publish_kernel)
         mwaiters = select(mrows, "wait_ready_kernel")
         moe = select(mrows, "mega_moe")
         head = select(mrows, "nvjet_")
@@ -196,6 +200,8 @@ def main():
                 ),
                 previous_publish_start_us=(publication["start"] - prev["end"]) / 1e3,
                 previous_publish_end_us=(publication["end"] - prev["end"]) / 1e3,
+                publish_next_attention_overlap_us=max(0, min(publication["end"], nxt["end"])
+                                                      - max(publication["start"], nxt["start"])) / 1e3,
             ))
         # Bound a constant model->attention trace shift using both message directions.
         # Publication starts before its peer's ready waiter can finish. This is a
@@ -204,6 +210,18 @@ def main():
         upper.extend(a["end"] - m["start"] for a, m in zip(awaiters, mpub))
     shift_low, shift_high = max(lower) - 2000, min(upper) + 2000
     assert shift_low <= shift_high, "No consistent cross-trace causal envelope"
+    clock_difference = None
+    if args.same_host:
+        origins = []
+        for path in (args.attention, args.model):
+            with sqlite3.connect(path) as db:
+                origins.append((db.execute("SELECT startTime FROM ANALYSIS_DETAILS").fetchone()[0],
+                                db.execute("SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME").fetchone()[0]))
+        shift = origins[1][0] - origins[0][0]
+        clock_difference = shift - (origins[1][1] - origins[0][1])
+        assert abs(clock_difference) <= 100, "Clock origins differ by more than 0.1us"
+        assert shift_low <= shift <= shift_high, "Shared-host shift violates Q/O causality"
+        shift_low = shift_high = shift
     boundary, producer = [], []
     for step in range(3, 17):
         arows, mrows, previous = agraphs[step - 1], mgraphs[step - 1], mgraphs[step - 2]
@@ -219,7 +237,7 @@ def main():
         })
     for step in range(2, 17):
         arows, mrows = agraphs[step - 1], mgraphs[step - 1]
-        attn, mpub = select(arows, "fmhaSm"), select(mrows, "publish_qkv_kernel")
+        attn, mpub = select(arows, "fmhaSm"), select(mrows, args.q_publish_kernel)
         for index in range(2, len(attn), 2):
             publication = mpub[index + 1]
             previous_moe = max((r for r in select(mrows, "mega_moe")
@@ -247,6 +265,8 @@ def main():
                                              if late else None),
             next_attention_before_previous_publication_ends=sum(
                 r["gap_us"] < r["previous_publish_end_us"] for r in rows),
+            publication_overlaps_next_attention=sum(r["publish_next_attention_overlap_us"] > 0 for r in rows),
+            mean_publication_overlap_us=mean(r["publish_next_attention_overlap_us"] for r in rows),
         )
     args.output.mkdir(parents=True, exist_ok=True)
     for name, rows in [("per_step", steps), ("attention_transitions", gaps),
@@ -256,6 +276,7 @@ def main():
         case_id=metric["case_id"], reports=metric["profiled_roles"],
         all_15_steps_mean=averages(steps), steps_3_to_16_mean=averages(steps[1:]),
         transitions=directions,
+        clock_origin_disagreement_ns=clock_difference,
         model_to_attention_shift_envelope_us=[shift_low / 1e3, shift_high / 1e3],
         boundary_mean_envelope=averages(boundary),
         producer_mean_envelope=averages(producer),
@@ -265,7 +286,8 @@ def main():
         caveats=[
             "The reported step metric is maximum representative GPU graph span, not host request latency.",
             "Kernel-end/start timestamps show sub-microsecond cross-stream overlaps; net gaps preserve the sum identity.",
-            "Cross-trace alignment uses ordered Q/O handshakes and a 2us endpoint margin, not raw host-clock subtraction.",
+            ("Cross-trace alignment uses same-host capture origins, checked against Q/O causal bounds."
+             if args.same_host else "Cross-trace alignment uses ordered Q/O handshakes and a 2us endpoint margin, not raw host-clock subtraction."),
             "Steps 3-16 are diagnostic only; all original 15 accepted samples remain in the performance result.",
         ],
     )

@@ -63,6 +63,9 @@ class _FabricRecord:
     q_ready_shape: tuple[int, ...] = ()
     q_ready_offset: int = 0
     q_ready_writers: tuple[int, ...] = ()
+    q_inbox_handle: bytes | None = None
+    q_inbox_shape: tuple[int, ...] = ()
+    q_inbox_offset: int = 0
     kv_handle: bytes | None = None
     kv_shape: tuple[int, ...] = ()
     kv_offset: int = 0
@@ -144,6 +147,15 @@ class AfdFmhaRuntime:
             2 if bool(self.model_config.attn_output_gate) else 1
         )
         self.is_hybrid_attention = bool(self.model_config.is_hybrid_attention)
+        self.qkv_lamport = os.environ.get("MINISGL_AFD_QKV_LAMPORT", "0") == "1"
+        if self.qkv_lamport:
+            if (self.is_hybrid_attention or self.q_transport_multiplier != 1
+                    or int(worker.attn_tp_size) != 1 or int(worker.mlp_tp_size) != 1
+                    or self.head_dim != 128 or int(self.model_config.num_qo_heads) != 64
+                    or int(self.model_config.num_kv_heads) != 4):
+                raise RuntimeError("Lamport QKV requires Qwen3 64Q/4KV/head128, TP1")
+            from minisgl.kernel.afd_qkv_lamport import module
+            module()
         if self.is_hybrid_attention:
             if int(worker.attn_tp_size) != 1 or int(worker.mlp_tp_size) != 1:
                 raise RuntimeError(
@@ -454,6 +466,9 @@ class AfdFmhaRuntime:
                 q_ready_shape=tuple(int(x) for x in self.q_ready.shape),
                 q_ready_offset=int(self.q_ready_owner.byte_offset),
                 q_ready_writers=q_ready_writers,
+                q_inbox_handle=attention_handle if self.qkv_lamport else None,
+                q_inbox_shape=tuple(self.state.fabric_q_inbox.tensor.shape) if self.qkv_lamport else (),
+                q_inbox_offset=int(self.state.fabric_q_inbox.byte_offset) if self.qkv_lamport else 0,
                 kv_handle=attention_handle,
                 kv_shape=tuple(int(x) for x in kv_owner.tensor.shape),
                 kv_offset=int(kv_owner.byte_offset),
@@ -672,7 +687,7 @@ class AfdFmhaRuntime:
         shape = getattr(record, f"{kind}_shape")
         if handle is None or not shape:
             raise RuntimeError(f"AFD fabric record is missing {kind} allocation")
-        if kind.endswith("_ready"):
+        if kind.endswith("_ready") or kind == "q_inbox":
             dtype = torch.int64
         elif kind == "o_scale":
             dtype = torch.int32
@@ -695,6 +710,11 @@ class AfdFmhaRuntime:
     def _build_descriptors(self, records: tuple[_FabricRecord, ...]) -> None:
         worker = self.worker
         if self.role == "mlp":
+            if self.qkv_lamport:
+                boxes = [self._import("q_inbox", self._record(records, "attention", dp, 0)).tensor
+                         for dp in self._mapped_attn_dp_ranks]
+                self.qkv_mailboxes = torch.tensor(
+                    [[x.data_ptr(), x.stride(0)] for x in boxes], dtype=torch.int64)
             q_rows: list[list[int]] = []
             kv_rows: list[list[int]] = []
             q_ready_rows: list[list[int]] = []
@@ -2768,6 +2788,14 @@ class AfdFmhaRuntime:
             raise RuntimeError(
                 "FMHA QKV publication requires capture-owned or eager source offsets"
             )
+        if self.qkv_lamport:
+            from minisgl.kernel.afd_qkv_lamport import publish
+            offsets = tuple(batch.afd_fmha_source_token_offsets)
+            spans = [b - a for a, b in zip(offsets, offsets[1:])]
+            if batch.phase != "decode" or len(set(spans)) != 1 or not 1 <= spans[0] <= 4:
+                raise RuntimeError("Lamport QKV requires uniform 1–4 decode rows per peer")
+            publish(q, k, v, self.qkv_mailboxes, slot=slot, epoch=epoch + 1)
+            return
         publish_qkv(
             q,
             k,
@@ -2795,6 +2823,14 @@ class AfdFmhaRuntime:
             raise RuntimeError(f"AFD Q rows {rows} exceed slot capacity {self.max_rows}")
         slot = epoch % self.transport_slots
         q_slot = self.q_slots[slot, :rows]
+        if self.qkv_lamport:
+            from minisgl.kernel.afd_qkv_lamport import receive
+            if batch.phase != "decode" or self.num_mb != 2:
+                raise RuntimeError("Lamport QKV currently requires MB2 decode")
+            receive(self.state.fabric_q_inbox.tensor, self.q_slots, self.state.fabric_kv.tensor,
+                    batch.out_loc, layer=(epoch // self.num_mb) % len(self.remote_attention_layers),
+                    slot=slot, epoch=epoch + 1, timeout_ms=self.timeout_ms)
+            return q_slot
         wait_ready(
             self.q_ready[slot],
             self.timeout_record,

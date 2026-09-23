@@ -3,6 +3,8 @@
 # Each plan must fit the whole allocation and supply a unique RUN_DIR.
 # Required: FASTAFD_PLAN_SEQUENCE (JSON list of plan directories), FASTAFD_IMAGE,
 # FASTAFD_SEQUENCE_ROOT, FASTAFD_SEQUENCE_SCRIPT (this file's durable path).
+# Optional: FASTAFD_SEQUENCE_FABRIC_SCOPE=domain for one AGA NVL576 domain,
+# FASTAFD_SEQUENCE_RACK_MAP (map_afd_racks.py output), FASTAFD_CONTAINER_MOUNTS.
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --partition=batch
 #SBATCH --qos=short
@@ -19,12 +21,23 @@ set -euo pipefail
 if [[ ${FASTAFD_SEQUENCE_INSIDE:-0} != 1 ]]; then
     mapfile -t hosts < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
     export HEAD_HOST=${hosts[0]}
-    mapfile -t fabrics < <(printf '%s\n' "${hosts[@]}" | sed -E 's/-T[0-9]+$//' | sort -u)
-    (( ${#fabrics[@]} == 1 )) || { echo 'AFD sequence requires one NVL72 fabric' >&2; exit 2; }
+    case ${FASTAFD_SEQUENCE_FABRIC_SCOPE:-rack} in
+        rack) suffix='-T[0-9]+$' ;;
+        domain)
+            for host in "${hosts[@]}"; do
+                [[ $host =~ ^nvl576d[0-9]+-R[0-9]+-T[0-9]+$ ]] || exit 2
+            done
+            suffix='-R[0-9]+-T[0-9]+$' ;;
+        *) echo 'Unknown FASTAFD_SEQUENCE_FABRIC_SCOPE' >&2; exit 2 ;;
+    esac
+    mapfile -t fabrics < <(printf '%s\n' "${hosts[@]}" | sed -E "s/$suffix//" | sort -u)
+    (( ${#fabrics[@]} == 1 )) || { echo 'AFD sequence spans the requested fabric scope' >&2; exit 2; }
+    FASTAFD_SEQUENCE_ALLOCATED_HOSTS=$(IFS=,; echo "${hosts[*]}")
+    export FASTAFD_SEQUENCE_ALLOCATED_HOSTS
     exec srun --nodes="$SLURM_JOB_NUM_NODES" --ntasks="$SLURM_JOB_NUM_NODES" \
         --ntasks-per-node=1 --gres=gpu:4 --mem=0 --kill-on-bad-exit=1 \
         --container-image="$FASTAFD_IMAGE" --container-mount-home \
-        --container-mounts=/lustre:/lustre --no-container-remap-root \
+        --container-mounts="${FASTAFD_CONTAINER_MOUNTS:-/lustre:/lustre}" --no-container-remap-root \
         env FASTAFD_SEQUENCE_INSIDE=1 bash "$FASTAFD_SEQUENCE_SCRIPT"
 fi
 
@@ -47,6 +60,15 @@ for directory, values in settings.items():
         raise ValueError(f'AFD plan {directory} missing explicit environment: {sorted(missing)}')
 if len({values['RUN_DIR'] for values in settings.values()}) != len(plans):
     raise ValueError('AFD plans must use distinct RUN_DIR values')
+if mapping_path := os.environ.get('FASTAFD_SEQUENCE_RACK_MAP'):
+    mapping = json.loads(Path(mapping_path).read_text())
+    expected = {node['host'] for node in mapping['inventory']}
+    actual = set(os.environ['FASTAFD_SEQUENCE_ALLOCATED_HOSTS'].split(','))
+    if actual != expected:
+        raise ValueError('Allocation differs from the prepared rack mapping')
+    for directory, values in settings.items():
+        if any(values.get(key) != value for key, value in mapping['environment'].items()):
+            raise ValueError(f'AFD plan {directory} differs from the prepared rank mapping')
 rank, nodes = int(os.environ['SLURM_PROCID']), int(os.environ['SLURM_JOB_NUM_NODES'])
 state = Path(os.environ['FASTAFD_SEQUENCE_ROOT']) / 'state' / os.environ['SLURM_JOB_ID']
 state.mkdir(parents=True, exist_ok=True)

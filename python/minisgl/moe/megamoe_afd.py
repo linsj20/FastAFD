@@ -62,6 +62,9 @@ class MegaMoEAfdAdapter:
         # Reset every source row any captured decode shape can address. This
         # bound is fixed for the adapter; it never changes the allocation size.
         self.all_push_reset_rows = int(num_max_decode_tokens_per_rank)
+        self.all_push_capacity = int(os.environ.get("MINISGL_MEGAMOE_ALL_PUSH_CAPACITY", "1024"))
+        if self.all_push_capacity < 1024:
+            raise ValueError("MegaMoE all-push capacity must be at least 1024 rows")
         self.num_lanes = max(1, int(num_lanes))
         self.gate_renormalize = bool(gate_renormalize)
         self.defer_route_dependent_launch = bool(defer_route_dependent_launch)
@@ -196,7 +199,7 @@ class MegaMoEAfdAdapter:
         mode = os.environ.get("MINISGL_MEGAMOE_PAYLOAD_MODE", "pull")
         if mode == "all_push":
             if not 0 < self.all_push_reset_rows <= self.all_push_capacity:
-                raise ValueError("all-push maximum decode rows must be in [1, 1024]")
+                raise ValueError("all-push maximum decode rows exceed the configured capacity")
             if self.expert_weight_dtype != "fp4":
                 raise ValueError("Model all-push recycling requires FP4 expert weights")
         def allocate(payload_mode=mode):

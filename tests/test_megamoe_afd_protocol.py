@@ -17,6 +17,9 @@ from minisgl.server.supervisor_ray import _build_ray_runtime_env
 class MegaMoEAfdProtocolTest(unittest.TestCase):
     def test_optimization_settings_reach_ray_workers(self):
         settings = {
+            "MINISGL_AFD_QKV_EDGE": "1",
+            "MINISGL_AFD_QKV_LAMPORT": "1",
+            "MINISGL_MEGAMOE_ALL_PUSH_CAPACITY": "1604",
             "MINISGL_MEGAMOE_TRACE_ROOT": "/model-trace",
             "MINISGL_MEGAMOE_RECYCLE_EARLY_PDL": "1",
             "MINISGL_MEGAMOE_RECYCLE_CTAS": "1",

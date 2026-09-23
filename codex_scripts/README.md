@@ -13,6 +13,12 @@ for current source selection, protocol, results and measurement contracts.
 | Submit `env.json` + `launch.json` | `python codex_scripts/submit_plan.py afd PLAN` (add `--dry-run` to preview) |
 | Monitor recorded jobs | `monitor_afd_jobs.py PLAN... --watch-seconds 300` |
 | Run several model plans in one allocation | `run_afd_plan_sequence.sbatch` |
+| Map TP1 attention ranks to rack-local FFN GPUs | `map_afd_racks.py` |
+| Correlate coordinator CPU work with FFN graph submission | `analyze_afd_cpu_dispatch.py COORDINATOR_CPU_JSON WORKER_CPU_JSON WORKER_SQLITE --output REPORT_JSON` |
+| Inspect kernel resources and concurrent GPU work | `analyze_nsys_kernel_overlap.py TRACE_SQLITE --kernel NAME_SUBSTRING --output REPORT_JSON` |
+| Explain attention microbatch gaps and publication overlap | `analyze_afd_attention_gap.py ATTENTION_SQLITE FFN_SQLITE METRIC_JSON OUTPUT`; Lamport uses `--q-wait-kernel receive_qkv_lamport_kernel --q-publish-kernel publish_qkv_lamport_kernel`; `--same-host` requires verified placement |
+| Compare QKV communication mechanisms in one rack | `bench_qkv_fanout.py` (embedded CUDA, CPU preparation, checked GPU comparisons and analysis) |
+| Prepare and analyze rack-mapped Qwen3 model cases | `prepare_afd_rack_run.py prepare/validate/analyze --root RUN` with an explicit `mapping.json` |
 | Seed compatible host/device/TVM modules | `seed_native_cache.py` |
 | CPU-compile saved DeepGEMM specializations | `precompile_deepgemm_cache.py` |
 | CPU-prepare a sweep's ordinary/profiling kernels | `precompile_megamoe_sweep.py` |
@@ -22,11 +28,71 @@ for current source selection, protocol, results and measurement contracts.
 | Extract selected CUDA functions / inspect dispatch registers | `extract_cuda_sass.py`, `review_megamoe_dispatch_sass.py` |
 
 Submission requires a dedicated output directory and refuses an existing `job.json`.
+CPU-dispatch analysis requires coordinator/worker traces from the same host. It
+aligns matching worker CPU/NVTX materialization ranges, reports alignment spread,
+and measures command cadence, coordinator stages and worker preparation against
+actual CUDA graph-launch API timestamps. It uses existing captures, with no GPU run.
+QKV fan-out uses real fabric allocations and exact Q/K/V checks before slot reuse.
+`submit --experiment protocol --profile --iterations 96` compares LL64, LL128 and
+flag-based controls with fixed launch resources. `--experiment polling` isolates
+whole-packet versus tag-only polling and a quiescent-payload diagnostic control.
+`--experiment measurement` compares CUDA-event instrumentation on/off in the same
+binary. These are mechanism comparisons, not parameter searches. No polling-delay
+or CTA-grid tuning. LL64 uses atomic32-bit data+32-bit epoch pairs; LL128 uses
+NVLink ordered128B lines,120Bdata plus8Bepoch. LL128 applies to the tested Blackwell
+NVLink setting; vector stores are not generally atomic. Receivers unpack into
+model-like94-layer/128K cache and Q slots. `trace` separates push time, sampled
+receiver arrival→store span and all-receiver-ready roundtrip upper bound. The
+latter includes returning ACKs and graph overhead, excludes the payload checker,
+and uses matched ready observations for the control and Lamport paths.
+`--experiment final` measures completion without Nsight: a publisher-clock marker
+precedes the push, and a warp observes all receiver ACKs before recording the end.
+This is a completion upper bound including the return ACK and launch boundaries;
+input generation and exact payload checking lie outside each measured interval.
+It compares the reference and16SM sender in both orders, plus an explicit
+CUDA-event instrumentation control whose stop event follows receiver completion.
+One CUDA-event pair outside capture surrounds the entire checked graph; a checked
+warm replay excludes first-replay setup from the final result. Device
+timestamps inside its boundaries provide an independent cross-check. The whole
+graph includes fills/checks and is not communication latency. Raw samples and
+event boundary overhead are retained. Nsight supplies kernel breakdowns separately.
+`--experiment production` compares original and integrated direct-edge publication.
+`--group-sizes 4,8,16,32` exercises A3/A7/A15/A31 using all32GPUs. CPU preparation
+is separate; `--prepared PATH` reuses an explicitly unchanged compiled module.
+Each submission freezes this same script in its result root; rejected experiments
+remain reproducible there without cluttering the maintained script.
+`model --model-template PLAN --model-ratio 7` reuses the matching promoted32GPU
+Qwen3 environment for the original direct-edge control/candidate comparison.
+`analyze` runs saved strict metric extraction and verifies the executed kernel.
+Keep each attempt in a fresh output root. `MINISGL_AFD_QKV_EDGE=0` selects the
+original transport; default direct-edge dispatch is restricted to validated grouped
+decode. Opt-in `MINISGL_AFD_QKV_LAMPORT=1` selects the integrated small-decode
+LL128 path for Qwen3 TP1/MB2; validation status is in the A17 Lamport project doc.
+`--experiment integration` checks the exact production sender/receiver module.
+Model inboxes require128B fabric-view alignment; no return ACK is added to the
+model path. The existing transport remains the default.
 Optional `--data-host oci-hsg-data` separates transfer from the submission host.
 There is no automatic retry/promotion. CPU preparation/analysis uses cpu-normal on
 HSG; GPU work uses short. Run complete validation/performance workloads, including
 kernel/chain comparisons where appropriate; never allocate GPUs for debugging,
 manual waiting or padded runtime. Check a timed-out observation before resubmitting.
+
+Rack mapping uses an explicit JSON inventory of `{host,address,rack,gpus}` nodes;
+`address` must match Ray's node address. Run `map_afd_racks.py inventory.json
+--ffn-racks R01,R02,... --output mapping.json` on CPU before submission, then merge
+its `environment` object into each plan's `env.json`. Keep the manifest with the
+plan and verify the allocation and observed rank placement against it. Each named
+rack gets one FFN GPU, and every remaining GPU there sends to that FFN. Each
+attention-only rack distributes its GPUs equally across all FFNs. Ordering the
+attention ranks by destination preserves existing integer AFD routing, with no
+transport or model change. TP1 and equal positive fan-in are required; invalid or
+uneven layouts fail. Slots describe node capacity, not pinned CUDA ordinals.
+Fabric connectivity and allocation size remain the caller's responsibility.
+For 18×32 GPUs with16FFNs this produces31 local+2+2=35 attention GPUs per FFN;
+16×36 produces35 local attention GPUs per FFN. For an AGA multi-rack sequence,
+set `FASTAFD_SEQUENCE_FABRIC_SCOPE=domain`, `FASTAFD_SEQUENCE_RACK_MAP` to the
+manifest path, and `FASTAFD_CONTAINER_MOUNTS=/lustre:/lustre,/scratch:/scratch`.
+The wrapper checks one NVL576 domain, exact hosts, and each plan's mapping.
 
 Cache donors must match source/ABI, compiler target and execution image. Device
 seeding uses `--kind device` with a CPU-precompiled donor; `DG_JIT_REQUIRE_CACHE=1`

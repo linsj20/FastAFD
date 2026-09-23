@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace {
 
@@ -328,6 +329,43 @@ __global__ void publish_qkv_kernel(const PublishQKVParams params) {
       params.ready_edges,
       params.slot,
       params.ready_value);
+}
+
+// Assign each CTA to one descriptor rather than scanning all source edges.
+template <int kHeadDim>
+__global__ void publish_qkv_edges_kernel(PublishQKVParams p, int blocks_per_edge) {
+  constexpr int packs = kHeadDim / 4;
+  const int edge = blockIdx.x / blocks_per_edge;
+  const int lane = (blockIdx.x % blocks_per_edge) * blockDim.x + threadIdx.x;
+  const int stride = blocks_per_edge * blockDim.x;
+  if (edge < p.kv_edges) {
+    const auto* d = p.kv_desc + edge * 8;
+    const int64_t first = p.source_offsets[d[7]];
+    const int64_t rows = p.source_offsets[d[7]+1] - first;
+    auto* cache = reinterpret_cast<__nv_bfloat16*>(d[0]);
+    for (int64_t i=lane; i<rows*d[3]*packs; i+=stride) {
+      const int pack=i%packs, head=(i/packs)%d[3];
+      const int64_t row=first+i/(packs*d[3]);
+      const int64_t loc=p.loc_i64 ? static_cast<const int64_t*>(p.out_loc)[row]
+                                 : static_cast<const int*>(p.out_loc)[row];
+      const int64_t dst=((int64_t(p.layer)*d[5]+loc)*d[4]+d[2]+head)*kHeadDim+pack*4;
+      const int64_t src=(d[1]+head)*kHeadDim+pack*4;
+      *reinterpret_cast<uint64_t*>(cache+dst)=*reinterpret_cast<const uint64_t*>(p.k+row*p.k_stride+src);
+      *reinterpret_cast<uint64_t*>(cache+dst+d[6]*d[5]*d[4]*kHeadDim)=*reinterpret_cast<const uint64_t*>(p.v+row*p.v_stride+src);
+    }
+  }
+  if (edge < p.q_edges) {
+    const auto* d=p.q_desc+edge*7;
+    const int64_t first=p.source_offsets[d[6]], rows=p.source_offsets[d[6]+1]-first;
+    auto* dst=reinterpret_cast<__nv_bfloat16*>(d[0])+int64_t(p.slot)*d[5]*d[4]*kHeadDim;
+    for (int64_t i=lane; i<rows*d[3]*packs; i+=stride) {
+      const int pack=i%packs, head=(i/packs)%d[3];
+      const int64_t row=i/(packs*d[3]);
+      *reinterpret_cast<uint64_t*>(dst+(row*d[4]+d[2]+head)*kHeadDim+pack*4)=
+          *reinterpret_cast<const uint64_t*>(p.q+(first+row)*p.q_stride+(d[1]+head)*kHeadDim+pack*4);
+    }
+  }
+  finish_payload_publication<true>(p.completion_counter,p.ready_desc,1,p.slot,p.ready_value);
 }
 
 template <int kHeadDim, bool kSingleEdge, bool kGated>
@@ -830,7 +868,21 @@ struct AfdFmhaTransportKernel {
     const bool single_edge =
         single_ready and source_offset_count.unwrap() == 2 and
         q_edges.unwrap() == 1 and kv_edge_count == 1;
-    if (single_edge)
+    // Measured grouped Qwen3 decode path: avoid every CTA scanning every edge.
+    // Retain the generic grid outside these small grouped Qwen3 shapes.
+    const char* edge_setting = std::getenv("MINISGL_AFD_QKV_EDGE");
+    const bool edge_enabled = edge_setting == nullptr || edge_setting[0] != '0';
+    const bool grouped_decode = single_ready && q_edges.unwrap() >= 7 &&
+        q_edges.unwrap() == source_offset_count.unwrap() - 1 &&
+        kv_edge_count == q_edges.unwrap() &&
+        rows.unwrap() <= 4 * q_edges.unwrap() &&
+        kHeadDim == 128 && q_width.unwrap() == 8192 && kv_width_value == 512;
+    if (edge_enabled && grouped_decode) {
+      constexpr int blocks_per_edge = 8;
+      const LaunchKernel edge_launch(
+          blocks_per_edge * q_edges.unwrap(), kThreads, device.unwrap());
+      edge_launch(publish_qkv_edges_kernel<kHeadDim>, params, blocks_per_edge);
+    } else if (single_edge)
       launch(publish_qkv_kernel<kHeadDim, true, true>, params);
     else if (single_ready)
       launch(publish_qkv_kernel<kHeadDim, false, true>, params);

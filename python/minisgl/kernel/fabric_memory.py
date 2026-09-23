@@ -32,16 +32,20 @@ def allocate_fabric_tensor(
 
 def allocate_fabric_tensors(
     specs: Sequence[tuple[Sequence[int], torch.dtype]],
+    *,
+    alignment: int = 16,
 ) -> tuple[FabricTensor, ...]:
     """Co-allocate typed views so one exported handle covers one publication arena."""
     if not specs:
         raise ValueError("fabric allocation requires at least one tensor view")
+    if alignment < 16 or alignment & (alignment - 1):
+        raise ValueError("fabric view alignment must be a power of two, at least 16")
     layouts: list[tuple[Sequence[int], torch.dtype, int, int]] = []
     next_offset = 0
     for shape, dtype in specs:
         num_bytes = _required_bytes(shape, dtype)
-        alignment = max(16, torch.empty((), dtype=dtype).element_size())
-        next_offset = _align_up(next_offset, alignment)
+        view_alignment = max(alignment, torch.empty((), dtype=dtype).element_size())
+        next_offset = _align_up(next_offset, view_alignment)
         layouts.append((shape, dtype, next_offset, num_bytes))
         next_offset += num_bytes
     allocation = _load_extension().FabricAllocation.allocate(next_offset)

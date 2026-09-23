@@ -200,13 +200,19 @@ class AfdAttentionState:
             config.model_config.head_dim,
         )
         q_ready_shape = (2, len(q_ready_writers))
-        self.fabric_kv, self.fabric_q, self.fabric_q_ready = allocate_fabric_tensors(
-            (
-                (kv_shape, self.dtype),
-                (q_shape, torch.bfloat16),
-                (q_ready_shape, torch.int64),
-            )
-        )
+        specs = [
+            (kv_shape, self.dtype),
+            (q_shape, torch.bfloat16),
+            (q_ready_shape, torch.int64),
+        ]
+        lamport = os.environ.get("MINISGL_AFD_QKV_LAMPORT", "0") == "1"
+        if lamport:
+            specs.append(((2, int(config.afd_max_comm_tokens), 2464), torch.int64))
+        owners = allocate_fabric_tensors(tuple(specs), alignment=128 if lamport else 16)
+        self.fabric_kv, self.fabric_q, self.fabric_q_ready = owners[:3]
+        if lamport:
+            self.fabric_q_inbox = owners[3]
+            self.fabric_q_inbox.tensor.zero_()
         self.fabric_q_ready.tensor.zero_()
         return self.fabric_kv.tensor
 

@@ -40,7 +40,6 @@ from compare_minisgl_vllm import (  # noqa: E402
     MiniSGLSample,
     compare_prompt,
     get_first_served_model,
-    load_tokenizer,
     print_report,
     sample_bundle_from_json,
     score_with_vllm,
@@ -343,6 +342,8 @@ def _score_all(args: argparse.Namespace, urls: list[str]) -> dict[str, Any]:
     tokenizer_model = args.model or bundle.get("tokenizer_model")
     if not tokenizer_model:
         raise RuntimeError("Tokenizer model must be supplied via --model or stored in sample-json.")
+    from minisgl.hf_support import load_tokenizer
+
     tokenizer = load_tokenizer(tokenizer_model)
     samples = list(bundle["samples"])
     shards: list[list[tuple[int, dict[str, Any]]]] = [[] for _ in urls]

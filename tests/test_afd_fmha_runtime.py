@@ -12,7 +12,7 @@ from minisgl.afd_fmha_runtime import (
     _FabricRecord,
     _stream_identity,
 )
-from minisgl.kernel.fabric_memory import FabricTensor
+from minisgl.kernel.fabric_memory import FabricTensor, allocate_fabric_tensors
 
 
 class _Context:
@@ -238,6 +238,27 @@ class _FakeEvent:
 
 
 class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
+    def test_lamport_inbox_alignment_after_ready_words(self) -> None:
+        def allocate(size):
+            storage = torch.zeros(size, dtype=torch.uint8)
+            return SimpleNamespace(tensor=lambda: storage)
+
+        extension = SimpleNamespace(FabricAllocation=SimpleNamespace(allocate=allocate))
+        specs = (((2, 64), torch.bfloat16), ((2, 1), torch.int64),
+                 ((2, 16), torch.int64))
+        with patch("minisgl.kernel.fabric_memory._load_extension", return_value=extension):
+            legacy = allocate_fabric_tensors(specs)
+            aligned = allocate_fabric_tensors(specs, alignment=128)
+            self.assertEqual(legacy[-1].byte_offset % 128, 16)
+            self.assertTrue(all(view.byte_offset % 128 == 0 for view in aligned))
+            self.assertTrue(all(view.allocation is aligned[0].allocation for view in aligned))
+            aligned[-1].tensor.fill_(7)
+            self.assertEqual(aligned[-1].tensor.tolist(), [[7] * 16] * 2)
+            self.assertEqual(aligned[1].tensor.count_nonzero().item(), 0)
+            for invalid in (0, 8, 96):
+                with self.subTest(alignment=invalid), self.assertRaises(ValueError):
+                    allocate_fabric_tensors(specs, alignment=invalid)
+
     def test_decode_replay_preserves_each_sources_padding(self) -> None:
         runtime = object.__new__(AfdFmhaRuntime)
         runtime.remote_attention_layers = (0, 1)
@@ -1204,6 +1225,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.is_hybrid_attention = True
         runtime.model_config = SimpleNamespace(layer_types=("full_attention",))
         runtime.q_transport_multiplier = 2
+        runtime.qkv_lamport = False
         runtime.transport_slots = 2
         runtime.max_rows = 2
         runtime.source_max_rows = 2
@@ -1331,6 +1353,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         runtime.remote_attention_layers = (3, 7) if hybrid else (0, 1)
         runtime.is_hybrid_attention = hybrid
         runtime.q_transport_multiplier = 2 if hybrid else 1
+        runtime.qkv_lamport = False
         runtime.state = SimpleNamespace(ctx=ctx, stream=root, attn_backends=backends)
         runtime.max_rows = 4
         runtime.source_max_rows = 4
@@ -1480,6 +1503,7 @@ class AfdFmhaRuntimeScheduleTest(unittest.TestCase):
         )
         runtime.is_hybrid_attention = False
         runtime.q_transport_multiplier = 1
+        runtime.qkv_lamport = False
         runtime.state = SimpleNamespace(
             ctx=ctx,
             attn_backends=tuple(make_backend(mb) for mb in range(3)),

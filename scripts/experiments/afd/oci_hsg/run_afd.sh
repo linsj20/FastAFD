@@ -552,6 +552,13 @@ if [[ -n "$ATTENTION_GPUS_OVERRIDE" ]]; then
     FFN_TRAYS=$(( (FFN_GPUS + 3) / 4 ))
     SHARED_ROLE_TRAYS=$(( ATTENTION_TRAYS + FFN_TRAYS - NODES ))
 fi
+if [[ -n ${FASTAFD_PLAN_NODES:-} ]]; then
+    [[ $FASTAFD_PLAN_NODES =~ ^[1-9][0-9]*$ ]] && (( FASTAFD_PLAN_NODES >= NODES )) || {
+        echo 'FASTAFD_PLAN_NODES must cover the active topology' >&2; exit 2;
+    }
+    NODES=$FASTAFD_PLAN_NODES
+    ALLOCATED_GPUS=$(( NODES * 4 ))
+fi
 if [[ "$SWEEP_CONTRACT" == comprehensive || "$MODEL_KEY" == minimax ]]; then
     MAX_TOTAL_TRAYS=${FASTAFD_MAX_TOTAL_TRAYS:-18}
 else

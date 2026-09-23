@@ -104,10 +104,15 @@ if [[ -n "${AFD_ATTENTION_GPU_COUNT:-}" ]]; then
   }
   _TOTAL_ACTIVE_GPUS=$(( AFD_ATTENTION_GPU_COUNT + AFD_MLP_EP_SIZE ))
   _EXPECTED_NODES=$(( (_TOTAL_ACTIVE_GPUS + AFD_GPUS_PER_NODE - 1) / AFD_GPUS_PER_NODE ))
-  (( _EXPECTED_NODES == AFD_TOTAL_NODES )) || {
+  if [[ ${MINISGL_AFD_PLACEMENT_CONTRACT:-} == rack_local_balanced ]]; then
+    [[ -n ${MINISGL_AFD_ATTN_NODES:-} && -n ${MINISGL_AFD_MLP_NODES:-} ]] && \
+      (( _EXPECTED_NODES <= AFD_TOTAL_NODES )) || {
+        echo 'explicit rack placement requires enough allocated nodes and both rank maps' >&2; exit 2;
+      }
+  elif (( _EXPECTED_NODES != AFD_TOTAL_NODES )); then
     echo "packed topology requires $_EXPECTED_NODES nodes for $_TOTAL_ACTIVE_GPUS active GPUs, got $AFD_TOTAL_NODES" >&2
     exit 2
-  }
+  fi
   _PACKED_ROWS=$(
     python - "$AFD_ATTN_TP_SIZE" "$AFD_ATTENTION_GPU_COUNT" \
       "$AFD_MLP_EP_SIZE" "$AFD_GPUS_PER_NODE" "${_AFD_NODES[@]}" <<'PY'
@@ -184,7 +189,9 @@ record = {
     "attention_dp_size": int(os.environ["AFD_ATTN_DP_SIZE"]),
     "attention_tp_size": int(os.environ["AFD_ATTN_TP_SIZE"]),
     "ffn_ep_size": int(os.environ["AFD_MLP_EP_SIZE"]),
-    "placement_contract": "explicit contiguous active-GPU slots",
+    "placement_contract": os.environ.get(
+        "MINISGL_AFD_PLACEMENT_CONTRACT", "explicit contiguous active-GPU slots"
+    ),
 }
 Path(sys.argv[1]).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 PY

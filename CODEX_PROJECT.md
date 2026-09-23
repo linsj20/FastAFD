@@ -7,6 +7,82 @@ user's answer. Read the relevant memory and `codex_scripts/README.md` before wor
 
 ## Current MegaMoE state — September22, 2026
 
+Completed: real-model A17:F1 EP8 batches4–7 on8racks, one FFN/rack,
+with Nsight verification. Opt-in QKV LL128 (no receiver ACK),144 active GPUs on40
+four-GPU trays. Exact integrated transport GPU40681 and CPU40691 placement/arena
+alignment passed; GPU40692 completed all4cases in14m56s. CPU40693 analyzedB4–6;
+40695 completedB7 after allowing <=100ns clock conversion disagreement (observed25ns).
+Publisher medians2.66–3.55µs across8FFNs; same-host sender-start→receiver-end medians
+4.946/6.516/6.096/7.741µs forB4–7, including unpack,2820 samples/case. Thus4–6µs
+completion target is not met across all batches. No gradual comm slowdown observed.
+Fullgraph B5–7 passed stability (21.041/21.807/26.267ms means); B4 rejected:
+one67.96ms step among14 roughly17–18ms. EP8 batch7 all-push capacity1920.
+User then authorized excluding outliers: only B4 step14 dropped (>10% from median).
+Filtered graph latency B4–7=17.447/21.041/21.807/26.267ms;
+TPS/user=57.32/47.53/45.86/38.07; TPS/144activeGPU=216.53/224.43/259.85/251.69.
+Trace retention corrected per user's reminder and Nsight agreement: exactly8reports,
+one attention+oneFFN percase under `scratch/afd/cases/qwen3/isl_131072/ep_8/a17-f1/`.
+The576-report collection folder and extra payloads were removed; shared results
+in `scratch/afd/reports/qwen3/aga-a17-lamport-20260922/`.
+See [A17 Lamport run](CODEX_PROJECT_aga_bringup.md#a17-lamport-model-run).
+Session staging: all36 selected CPU checks pass after a targeted generic-Ray
+environment forwarding fix (CPU40697/40698); scorer CLI and3remote shell syntax
+checks pass. Code/docs synced to AGA. Session-only commit excludes unrelated
+MegaMoE sweep/compiler/plot edits and all scratch artifacts. Batch7's exposed
+publication is Q-readiness imbalance:4-token return125.72µs exceeds intervening
+3-token attention116.00µs; both lanes already have early attention graph edges.
+
+Completed AGA rack scaling: user approved512GPUs,A496:F16,batches4–7 after no complete
+576GPU domain was available. One FFN per each of16racks,31local attention senders.
+Reusable rack mapper and sequence domain guard added; CPU preparation passed,
+GPU39892 completed batch4 but failed batch5 control-port allocation. GPU39894
+completed5–7 using explicit low control ports. CPU39896 verified all8Nsight traces
+and4rack maps; all4timings rejected by unchanged10%stability gate. Alljobs terminal.
+User then authorized downloading the8traces: retained locally with provenance.
+Timings show an early fast stretch then a step-up around decode5–8; late-window
+means30–47%higher, with partial B7recovery. Plot/trace links in the rack-scaling doc.
+Follow-up CPU/GPU trace correlation identifies coordinator throughput/serial
+dispatch as the main long-wait cause: B6late dispatch41.36ms versusFFNgraph31.88ms;
+launch arrives8.15ms after previousFFNend (5.43ms before worker prep+2.72ms prep).
+Initial command lead drains; all496attention commands precede16FFNcommands.
+No evidence of broken ready tickets; first-MegaMoE EP skew remains partly open.
+Reusable `analyze_afd_cpu_dispatch.py`; this diagnosis used CPU jobs.
+Subsequent one-rack QKV resource study and fix completed: one reusable
+`bench_qkv_fanout.py` covers CPU build, resource sweeps and model comparison.
+Direct per-destination CTAs reduce A31 publication36/60/60→17.5/17.5/18.9µs
+for2/3/4rows, with unchanged payload/readiness semantics. Registers52→32;
+34,560checked publications passed across A3/A7/A15/A31. Default optimization
+applies to grouped Qwen3 small-row shapes with≥7destinations; A3 keeps original.
+Full-model A7:F1EP4B4 comparison40561/40562 passed15/15samples in both runs:
+QKV12.947→10.453µs,graph21.333→19.895ms (one control/candidate pair,6.74%lower).
+The entire graph gain is not isolated to QKV; coordinator scaling remains open.
+Code/docs synced to AGA only; no bulk scratch transfer or512GPU rerun.
+The subsequent Lamport LL128 study prioritized preservingbest
+latency while minimizingparticipatingSMs, fullyusingeachSM's resources; stopbroad
+parametersearches. Pollingcontention/prepackingwere ruledout asdominantcosts.
+FixedgeometryLL128 measured4.15/4.60/5.59µs (2/3/4rows), but matchingevent-control
+runfailed onnewmeasurementprobe's remote-device streamselection; corrected.
+40650/40651/40652 confirmedCUDAevents inflatekernel timings; validLL128
+reference4.18/4.64/5.68µs. Initial16/8/4SMpools aretoo slow.40658/40659/40660
+and40665/40666/40667 passed aligned packing and balanced-row comparisons;
+16SM push still slower than reference, so no reduced-SM winner selected.
+Final unprofiled timing40677/40678 then warmed-graph40679 passed all checks.
+Publisher-clock start before push/end after all receiver ACKs; parallel ACK
+observer replaces serial scanning. Pooled warmed completion bounds9.44/10.18/11.33µs
+(2/3/4rows),16SM9.47/10.50/11.81. Sender-only4–6µs does not establish goal.
+Warming the captured graph removes first-replay0.3–0.4ms event discrepancy;
+outer event/device spans differ only12–28µs over8–13ms. All jobs terminal.
+Default production transport remains the measured direct-edge version. The LL128
+path is now opt-in in the real model, validated by the A17 run above; other
+protocol/resource variants remain benchmark-only.
+See [rack scaling](CODEX_PROJECT_aga_bringup.md#rack-scaling-and-communication).
+
+AGA promotion complete: checkpoint `2be271e` plus scorer import fix; code/docs only,
+no scratch transfer. One-rack Qwen3 A3:F1 EP8 batch4 perf128K:17.848781ms,
+168.078709tokens/s/GPU,15/15samples. Actual8K alignment:1629/1632top10,3misses
+passes agreed≤4 gate,strict zero-miss fails. [AGA results](CODEX_PROJECT_aga_bringup.md#qwen3-promotion)
+record placement,jobs,full-score audit and the required `--propagate=NONE` setting.
+
 Selected target: **Qwen3 A3:F1 EP8 batch4, early PDL + ahead8 vector reset +
 normalization weight preload**. Pull remains default; reproduction settings and
 invariants are in [MegaMoE optimization](CODEX_PROJECT_megamoe_optimization.md).
