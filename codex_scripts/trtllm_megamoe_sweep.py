@@ -28,7 +28,9 @@ def workload(root, case_id, mode):
 
     manifest = json.loads((root / "manifest.json").read_text())
     case = next(c for c in manifest["cases"] if c["case_id"] == case_id)
-    contract = manifest["contract"]
+    contract = dict(manifest["contract"], **case.get("capture_contract", {}))
+    iterations = manifest.get("ordinary_iterations", 3) if mode == "normal" else 3
+    warmups = manifest.get("ordinary_warmups", 1)
     rank, local_rank = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_LOCALID"])
     ep = case["ep"]
     torch.cuda.set_device(local_rank)
@@ -90,14 +92,15 @@ def workload(root, case_id, mode):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    graph.replay()
+    for _ in range(warmups):
+        graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
     if mode == "normal" and rank == 0:
         torch.cuda.profiler.start()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(3):
+    for _ in range(iterations):
         graph.replay()
     end.record()
     end.synchronize()
@@ -105,13 +108,13 @@ def workload(root, case_id, mode):
         torch.cuda.profiler.stop()
     expected = torch.load(reference, map_location="cuda", weights_only=True)
     assert torch.equal(y.view(torch.int16), expected.view(torch.int16)), "replay output differs"
-    elapsed = torch.tensor([start.elapsed_time(end) * 1000 / 3], dtype=torch.float64, device="cuda")
+    elapsed = torch.tensor([start.elapsed_time(end) * 1000 / iterations], dtype=torch.float64, device="cuda")
     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
     if rank == 0:
         write(case_root / (mode + ".json"), dict(status="ok", case=case,
               kernel="official TRT-LLM DeepGEMM FP8xFP4", prepared_routes=False,
-              correctness="all ranks byte exact against ordinary output; replay exact",
-              graph_mean_max_rank_us=float(elapsed[0]), iterations=3))
+              correctness="all ranks finite; replay byte exact against first ordinary output",
+              graph_mean_max_rank_us=float(elapsed[0]), iterations=iterations))
         print(f"CASE_{mode.upper()}_OK {case_id}", flush=True)
     dist.barrier()
     buffer.destroy()
@@ -120,6 +123,18 @@ def workload(root, case_id, mode):
 
 def analyze(root, ep):
     manifest = json.loads((root / "manifest.json").read_text())
+    if manifest.get("ordinary_only"):
+        for case in (c for c in manifest["cases"] if c["ep"] == ep):
+            path = root / "cases" / case["case_id"]
+            result = json.loads((path / "normal.json").read_text())
+            assert result["status"] == "ok" and result["case"] == case
+            assert result["iterations"] == manifest["ordinary_iterations"]
+            report = path / "nsys/megamoe.nsys-rep"
+            out = subprocess.check_output(["nsys", "stats", "--force-export=true",
+                "--report", "cuda_gpu_kern_sum", "--format", "csv", str(report)], text=True)
+            (path / "nsys/kernel_summary.csv").write_text(out)
+        write(root / f"ep{ep}/complete.json", dict(ep=ep, status="ok", ordinary_only=True))
+        return
     samples = []
     for case in (c for c in manifest["cases"] if c["ep"] == ep):
         path = root / "cases" / case["case_id"]
@@ -185,6 +200,35 @@ def collect(root):
     keeping dispatch-to-compute gaps separate from the dispatch phase itself.
     """
     manifest = json.loads((root / "manifest.json").read_text())
+    if manifest.get("ordinary_only"):
+        records = []
+        iterations = manifest["ordinary_iterations"]
+        for case in manifest["cases"]:
+            folder = root / "cases" / case["case_id"]
+            result = json.loads((folder / "normal.json").read_text())
+            assert result["status"] == "ok" and result["case"] == case
+            assert result["iterations"] == iterations and result["prepared_routes"] is False
+            assert not (folder / "profile.json").exists()
+            stats = folder / "nsys/kernel_summary.csv"
+            lines = stats.read_text().splitlines()
+            start = next(i for i, line in enumerate(lines) if "Med (ns)" in line and "Instances" in line)
+            kernels = [r for r in csv.DictReader(lines[start:]) if "sm100_fp8_fp4_mega_moe_impl" in r["Name"]]
+            assert len(kernels) == 1 and int(kernels[0]["Instances"]) == iterations
+            value = float(kernels[0]["Med (ns)"]) / 1000
+            assert math.isfinite(value) and value > 0
+            records.append(dict(case_id=case["case_id"], ep=case["ep"],
+                global_tokens=case["global_tokens"], rows_per_rank=case["rows_per_rank"],
+                nsys_kernel_median_us=value, ordinary_samples=iterations,
+                artifact=str(stats.relative_to(root))))
+        with (root / "ordinary.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(records[0]))
+            writer.writeheader()
+            writer.writerows(records)
+        write(root / "ordinary_audit.json", dict(complete=True, missing=[],
+            artifact_contracts_checked=len(records), ordinary_samples=iterations,
+            rank=0, metric="nsys_kernel_median_us", instrumented=False,
+            sample_policy="Unfiltered ordinary kernel medians", backend="official TRT-LLM image"))
+        return
     sequence = json.loads((root / "sequence.json").read_text())
     assert sequence["status"] == "complete"
     eps = manifest["contract"]["eps"]

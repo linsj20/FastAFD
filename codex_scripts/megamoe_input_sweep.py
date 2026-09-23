@@ -13,10 +13,39 @@ from pathlib import Path
 
 
 def plan(output: Path, model: str = "qwen3", batch_max: int = 7,
-         capacity: Path | None = None) -> None:
+         capacity: Path | None = None, max_global_tokens: int | None = None) -> None:
     qwen35 = model == "qwen35"
     experts, intermediate, top_k = (512, 1024, 10) if qwen35 else (128, 1536, 8)
     eps = (4, 8, 16, 32, 64) if qwen35 else (2, 4, 8, 16, 32, 64)
+    if max_global_tokens is not None:
+        if capacity or max_global_tokens < max(eps) or max_global_tokens & (max_global_tokens - 1):
+            raise ValueError("Token sweep requires a power-of-two maximum >=64 and no capacity basis")
+        cases = []
+        for ep in eps:
+            tokens = ep
+            while tokens <= max_global_tokens:
+                rows = tokens // ep
+                # Reserve source rows plus all expert rows, padded to the
+                # selected all-push kernel's maximum 32-row tile.
+                expert_rows = (tokens * top_k + experts - 1) // experts
+                needed = rows + ((expert_rows + 31) // 32 * 32) * (experts // ep)
+                bucket = max(3840, (needed + 383) // 384 * 384)
+                cases.append(dict(case_id=f"ep{ep}_tokens{tokens}", ep=ep,
+                                  rows_per_rank=rows, global_tokens=tokens,
+                                  capture_contract={"bucket": bucket}))
+                tokens *= 2
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps({
+            "contract": dict(model="Qwen3.5-397B-A17B" if qwen35 else "Qwen3-235B-A22B",
+                             experts=experts, hidden=4096, intermediate=intermediate,
+                             top_k=top_k, num_sms=150, bucket=3840, eps=list(eps),
+                             activation_dtype="fp8", weight_dtype="fp4",
+                             routing="integer-balanced rank-interleaved expert sequence"),
+            "token_sweep": dict(minimum="EP", maximum=max_global_tokens, multiplier=2),
+            "cases": cases,
+        }, indent=2) + "\n")
+        print(json.dumps({"manifest": str(output), "unique_cases": len(cases)}))
+        return
     capacity_basis = None
     if capacity:
         capacity_basis = json.loads(capacity.read_text())
@@ -85,6 +114,51 @@ def plan(output: Path, model: str = "qwen3", batch_max: int = 7,
                       "batch_max": batch_max,
                       "equivalent_inputs": sum(len(c["equivalent_inputs"]) for c in cases),
                       "per_ep": {str(ep): sum(c["ep"] == ep for c in cases) for ep in eps}}))
+
+
+def collect_ordinary(manifest_path: Path, root: Path, iterations: int) -> None:
+    """Audit ordinary-only rank-zero captures without fabricating phase data."""
+    manifest = json.loads(manifest_path.read_text())
+    records = []
+    for case in manifest["cases"]:
+        paths = list((root / case["case_id"]).glob("*/baseline.json"))
+        if len(paths) != 1:
+            raise ValueError(f"Expected one ordinary result: {case['case_id']}")
+        result = json.loads(paths[0].read_text())
+        info, = result["exact_qwen"].values()
+        assert result["status"] == "ok" and result["expert_weight_dtype"] == "fp4"
+        assert (info["ep_size"], info["global_tokens"], info["rows_per_rank"]) == (
+            case["ep"], case["global_tokens"], case["rows_per_rank"])
+        contract = dict(manifest["contract"], **case.get("capture_contract", {}))
+        assert info["model_dimensions"] == {k: contract[k] for k in (
+            "hidden", "intermediate", "experts", "top_k")}
+        assert info["payload_mode"] == contract.get("payload_mode", "all_push")
+        assert info["timing_iterations"] == iterations
+        assert info["routing"] == "fixed_global_sequence_rank_interleaved_balance"
+        assert case["ep"] != 64 or info["combine_exact_checked"]
+        assert not (paths[0].parent / "profiled.json").exists()
+        stats = paths[0].parent / "ranks/rank-0/nsys/megamoe-rank0.cuda_gpu_kern_sum.csv"
+        lines = stats.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if "Med (ns)" in line and "Instances" in line)
+        kernels = [r for r in csv.DictReader(lines[start:])
+                   if "sm100_fp8_fp4_mega_moe_impl" in r["Name"]]
+        assert len(kernels) == 1 and int(kernels[0]["Instances"]) == iterations
+        median = float(kernels[0]["Med (ns)"]) / 1000
+        assert math.isfinite(median) and median > 0
+        records.append(dict(case_id=case["case_id"], ep=case["ep"],
+                            global_tokens=case["global_tokens"], rows_per_rank=case["rows_per_rank"],
+                            nsys_kernel_median_us=median, ordinary_samples=iterations,
+                            artifact=str(stats.relative_to(root))))
+    assert records and len({r["case_id"] for r in records}) == len(records)
+    with (root / "ordinary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(records[0]))
+        writer.writeheader()
+        writer.writerows(records)
+    audit = dict(complete=True, missing=[], artifact_contracts_checked=len(records),
+                 ordinary_samples=iterations, rank=0, metric="nsys_kernel_median_us",
+                 sample_policy="Unfiltered ordinary kernel medians", instrumented=False)
+    (root / "ordinary_audit.json").write_text(json.dumps(audit, indent=2) + "\n")
+    print(json.dumps(audit))
 
 
 def collect(manifest_path: Path, root: Path) -> None:
@@ -361,9 +435,13 @@ if __name__ == "__main__":
     p.add_argument("--model", choices=("qwen3", "qwen35"), default="qwen3")
     p.add_argument("--batch-max", type=int, default=7)
     p.add_argument("--capacity", type=Path, help="Capacity basis JSON; calculates batch maximum")
+    p.add_argument("--max-global-tokens", type=int,
+                   help="Plan power-of-two total tokens from EP through this maximum")
     p = sub.add_parser("collect")
     p.add_argument("manifest", type=Path)
     p.add_argument("root", type=Path)
+    p.add_argument("--ordinary-only", action="store_true")
+    p.add_argument("--iterations", type=int, default=1000)
     p = sub.add_parser("audit")
     p.add_argument("manifest", type=Path)
     p.add_argument("root", type=Path)
@@ -377,9 +455,12 @@ if __name__ == "__main__":
     p.add_argument("--host", default="oci-hsg")
     args = parser.parse_args()
     if args.command == "plan":
-        plan(args.output, args.model, args.batch_max, args.capacity)
+        plan(args.output, args.model, args.batch_max, args.capacity, args.max_global_tokens)
     elif args.command == "collect":
-        collect(args.manifest, args.root)
+        if args.ordinary_only:
+            collect_ordinary(args.manifest, args.root, args.iterations)
+        else:
+            collect(args.manifest, args.root)
     elif args.command == "files":
         artifact_files(args.manifest, args.root)
     elif args.command == "fetch":

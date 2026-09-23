@@ -15,6 +15,7 @@ export TRT_SWEEP_ROOT=$root
 export TRT_IKET_INCLUDE=$user_root/FastAFD/source/iket/include
 export FASTAFD_IKET_PYTHON_DEPS=$user_root/FastAFD/source/iket-smodel
 export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
+ordinary_only=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("ordinary_only",False)))' "$root/manifest.json")
 if [[ $mode == prepare ]]; then
     exec srun --container-image="$image" --container-mount-home --container-mounts=/lustre:/lustre \
         --no-container-remap-root bash "$script" prepare-container "$root"
@@ -23,12 +24,16 @@ if [[ $mode == prepare-container ]]; then
     export TMPDIR=$root/preparation/tmp
     mkdir -p "$TMPDIR"
     # Verify the kernel is the original bundled implementation, not the local port.
-    cmp "$root/source/sm100_fp8_fp4_mega_moe.cuh" \
+    if [[ $ordinary_only != 1 ]]; then
+      cmp "$root/source/sm100_fp8_fp4_mega_moe.cuh" \
         /usr/local/lib/python3.12/dist-packages/tensorrt_llm/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+    fi
     /usr/bin/python3 -c 'import ast; from pathlib import Path; p=Path("/usr/local/lib/python3.12/dist-packages/tensorrt_llm/deep_gemm/mega/__init__.py"); names={n.name for n in ast.parse(p.read_text()).body if isinstance(n,ast.FunctionDef)}; assert {"fp8_fp4_mega_moe","get_symm_buffer_for_mega_moe","transform_weights_for_mega_moe"} <= names; print("ORIGINAL_DEEPGEMM_SOURCE_API_OK")'
-    /usr/bin/python3 -c 'import os,sys; sys.path.insert(0,os.environ["FASTAFD_IKET_PYTHON_DEPS"]); import iket, smodel; print("IKET_IMPORT_OK")'
+    if [[ $ordinary_only != 1 ]]; then
+      /usr/bin/python3 -c 'import os,sys; sys.path.insert(0,os.environ["FASTAFD_IKET_PYTHON_DEPS"]); import iket, smodel; print("IKET_IMPORT_OK")'
+      command -v run-iket
+    fi
     command -v nsys
-    command -v run-iket
     touch "$root/preparation/complete"
     exit
 fi
@@ -67,6 +72,10 @@ while read -r case_id; do
             /usr/bin/python3 "$workload" workload "$root" "$case_id" normal </dev/null
     else
         /usr/bin/python3 "$workload" workload "$root" "$case_id" normal </dev/null
+    fi
+    if [[ $ordinary_only == 1 ]]; then
+        [[ $rank != 0 ]] || echo "CASE_CAPTURE_COMPLETE $case_id"
+        continue
     fi
     export DG_JIT_CACHE_DIR=$root/cache/ep$ep/marked-rank$rank
     export DG_JIT_NVCC_COMPILER=$root/control/trtllm_megamoe_iket_nvcc.sh

@@ -270,7 +270,7 @@ static void sm100_fp8_mega_moe_impl(
     };
 
     if (all_push) {
-        DG_HOST_ASSERT(num_tokens <= 1024);
+        DG_HOST_ASSERT(num_tokens <= 8192);
         DG_HOST_ASSERT(num_topk > 0 && num_topk <= 32);
         DG_HOST_ASSERT(hidden > 1024 && hidden % 512 == 0);
         DG_HOST_ASSERT(config.block_m <= 32 && config.num_epilogue_threads >= 256);

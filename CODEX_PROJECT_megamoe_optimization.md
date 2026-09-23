@@ -6,6 +6,103 @@ and remaining ideas. Current work is tracked first; historical queued/running
 checkpoints do not authorize new work. The completed cleanup validation below covers
 the requested source, documentation and workflow scope.
 
+September22 sweep checkpoint: ordinary-only planning/preparation/collection for
+all-push, pull and original TRT-LLM; host row-limit extension; fixed-token plots
+and throughput TODO. Completed remote validation covers339 cases/339,000 ordinary
+rank0 calls and32 EP64 exact-combine checks across all-push/pull. All three plots
+passed data/anchor and visual checks. Generated evidence stays in ignored scratch;
+tracked sources/docs are synced to HSG. No new skill or AGENTS guidance is needed.
+
+## TODO — fix all_push kernel throughput at high total tokens
+
+September22 ordinary sweeps show all-push slower than metadata-push/payload-pull/
+combine-push at every tested EP for Qwen3 totals≥1K and Qwen3.5 totals≥4K.
+At8K, latency ratios are2.00–3.69× (Qwen3) and1.33–2.61× (Qwen3.5).
+Investigate the32-row tile cap and single expert wave versus pull's192-row tiles
+and adaptive expert grouping at8K; these are hypotheses, not isolated causes.
+Confirm with same-allocation comparisons and preserve small-decode gains/exactness.
+Evidence: `scratch/megamoe/{ordinary_sweep_8k_20260922,pull_original_sweep_8k_20260922}`;
+current comparisons use1000-call unfiltered rank0 medians from separate allocations.
+
+## Original TRT-LLM / pull-payload ordinary sweeps — complete September22
+
+User requested the same EP/token ranges for original installed TRT-LLM and best
+metadata-push/payload-pull/combine-push. Campaign
+`scratch/megamoe/pull_original_sweep_8k_20260922`, matching remote artifacts.
+Six EP allocations ran pull then original; each variant covers113 cases
+(Qwen3 EP2–64, Qwen3.5 EP4–64; powers-of-two totals from EP through8192).
+All226 cases captured1000 ordinary calls; no IKET or filtering. Monitored every300s.
+CPU7363778 prepared pull kernels in6m48s; original used the untouched pinned image.
+Script-only extensions support pull preparation/collection and ordinary-only original
+capture/collection. No new CUDA kernel changes.
+
+| EP | Job | Cases, both versions | Elapsed |
+|---|---|---:|---|
+|2|7363782|26|11m40s|
+|4|7363783|48|25m27s|
+|8|7363784|44|23m02s|
+|16|7363785|40|21m16s|
+|32|7363786|36|21m09s|
+|64|7363787|32|21m57s|
+
+All GPU jobs completed0:0. CPU7363791 exported17 independent groups with4workers,
+then audited all226,000 rank0 instances in1m04s. All16 pull EP64 exact-combine checks
+pass; original checks finite output and byte-exact graph replay. One Slurm-query
+timeout restarted only the analysis watcher. Original EP32/64 teardown emitted UCX
+peer-reset messages; captures/replay checks and both jobs completed successfully.
+
+Collected compact results, ordinary CSVs/audits and Nsight summaries locally;
+raw traces remain HSG. Two HTMLs beside the existing all-push plot:
+`ep-scaling-fixed-tokens-original-trtllm.html` and
+`ep-scaling-fixed-tokens-pull-payload.html`. Each has23 labeled curves/111 points;
+two single-EP totals omitted, same left grey-bold labels and both-panel y ticks.
+Data/anchor checks and PNG visual review pass; `plot_validation.json` records them.
+Original includes routing inside MegaMoE; optimized pull has external metadata
+preparation. This boundary is in plot provenance; no causal paired speedup claim.
+
+## Ordinary power-of-two sweep — complete September22
+
+User requested Qwen3 EP2/4/8/16/32/64 and Qwen3.5 EP4/8/16/32/64,
+total tokens EP,2×EP,...,8192; one GPU job per EP, ordinary only, five-minute
+monitoring until completion. Initial CPU7360150 hit the existing1024-row limit;
+all six dependent jobs cancelled before allocation. User then explicitly authorized
+raising the limit to8192. Only the two host assertions changed (CPU generation and
+actual launch); device kernel code is unchanged. Maximum exercised rows/rank is4096,
+so this sweep does not validate8192 rows/rank despite permitting that ceiling.
+
+Recovery campaign: `scratch/megamoe/ordinary_sweep_8k_20260922` and matching
+`R/artifacts/ordinary_sweep_8k_20260922`. CPU7361586 passed5m43s (44 ordinary
+specializations, all plans). GPU jobs all completed0:0:
+
+| EP | Job | Cases | Elapsed |
+|---|---|---:|---|
+|2|7361595|13|5m13s|
+|4|7361596|24|10m24s|
+|8|7361597|22|9m29s|
+|16|7361598|20|9m22s|
+|32|7361599|18|10m45s|
+|64|7361601|16|12m07s|
+
+All113 baseline JSONs pass shape/mode/sample checks; all16 EP64 exact-combine
+checks pass. CPU analysis7362548 passed4m22s and audited113,000 rank0 ordinary
+kernel instances (1000/case), with no IKET captures or sample filtering.
+An initial analysis submission referenced expired completed dependencies and was
+rejected without a job; submission after verified GPU completion succeeded.
+`{qwen3,qwen35}/ordinary.csv` and `ordinary_audit.json` contain63/50 audited cases.
+Reusable collector and EP plot loader now explicitly support ordinary-only data.
+
+Requested existing `all_push_joined_decomposition_20260921/plots/ep-scaling-fixed-tokens.html`
+updated with23 curves/111 points, unfiltered rank0 kernel medians and anchored ideal
+scaling. Two single-EP totals are excluded from curves. All point values/anchors
+checked and PNG visually reviewed. Previous plot/comparison preserved in recovery
+campaign `previous_plot/`. Baseline graph times include preparation and routing;
+the plot uses isolated main-kernel Nsight medians. Raw traces stay on HSG.
+Plot follow-up labels all23 curves to the left of their leftmost measured points
+with small grey bold token counts and leader lines. Labels are spaced in display coordinates
+to avoid overlap; y tick labels appear on both panels. Reduced the added left
+padding to roughly one-third (x-limit factor1.4→1.22), with a4pt label gap. Regenerated
+existing HTML/preview and visually checked; measured data unchanged.
+
 ## Combined normalization preload — selected September22
 
 User requested normalization preload on and local Nsight traces. GPU7356961 passed
@@ -499,7 +596,8 @@ Final reports, relative to campaign:
 - `qwen3/results/qwen3-final-all-push-megamoe-comparisons.html`
 - `qwen35/results/qwen35-final-all-push-megamoe-comparisons.html`
 
-September22 fixed-token scaling report: `plots/ep-scaling-fixed-tokens.html`, same
+Earlier September22 fixed-token scaling report (superseded above; archived in
+the new campaign's `previous_plot/`): `plots/ep-scaling-fixed-tokens.html`, same
 format as September12 pull report, 15 curves/62 points using unfiltered rank0
 30-call ordinary medians. Reusable `plot_megamoe_ep_scaling.py` now accepts
 `--report-subdir results`, `--label`, `--baseline-roots` and optional `--preview`;

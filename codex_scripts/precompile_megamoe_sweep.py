@@ -19,6 +19,9 @@ def main():
     p.add_argument("--router-source", type=Path, help="Explicit router source for the overlay")
     p.add_argument("--router-wrapper", default="GateTopkAllPushKernel")
     p.add_argument("--iket-include", required=True)
+    p.add_argument("--ordinary-only", action="store_true",
+                   help="Prepare only ordinary kernels, without IKET variants")
+    p.add_argument("--payload-mode", choices=("all_push", "pull"), default="all_push")
     p.add_argument("--preparation-inputs", nargs="*", type=Path, default=[],
                    help="Saved kernel.cu specializations used by untimed weight/input preparation")
     p.add_argument("--arch", default="100f")
@@ -57,23 +60,27 @@ def main():
             for inband, rank_gated in ([(True, True), (False, False)]
                                        if case["ep"] == 64 else [(True, True)]):
                 code, config, block_m, wave = deepgemm.generate_megamoe_kernel(
-                    *inputs, True, inband, rank_gated)
-                assert block_m <= 32 and wave == c["experts"] // case["ep"]
+                    *inputs, args.payload_mode == "all_push", inband, rank_gated)
+                if args.payload_mode == "all_push":
+                    assert block_m <= 32 and wave == c["experts"] // case["ep"]
                 q, r = divmod(case["global_tokens"] * c["top_k"], c["experts"])
                 padded = sum(((q + int(e * case["ep"] < r) + block_m - 1) // block_m) * block_m
                              for e in range(c["experts"] // case["ep"]))
-                if case["rows_per_rank"] + padded > c["bucket"]:
+                if args.payload_mode == "all_push" and case["rows_per_rank"] + padded > c["bucket"]:
                     raise ValueError(f"Insufficient materialization capacity: {case['case_id']}")
                 key = f"{path.parent.name}/{case['case_id']}/{'selected' if inband else 'combine_reference'}"
                 specializations.setdefault(code, {"config": config, "cases": []})["cases"].append(key)
                 cases.append(dict(case=key, block_m=block_m, experts_per_wave=wave))
     (metadata / "configurations.json").write_text(json.dumps(cases, indent=2) + "\n")
     records = []
-    for mode, include in (("ordinary", ""), ("iket", args.iket_include)):
+    modes = [("ordinary", "")]
+    if not args.ordinary_only:
+        modes.append(("iket", args.iket_include))
+    for mode, include in modes:
         os.environ["DG_JIT_IKET_INCLUDE"] = include
         os.environ["DG_JIT_IKET_CRITICAL"] = "1"
         _jit_gate_topk_fused_module.cache_clear()
-        _jit_gate_topk_fused_module(all_push=True)
+        _jit_gate_topk_fused_module(all_push=args.payload_mode == "all_push")
         for code, info in specializations.items():
             target = deepgemm.precompile_kernel("sm100_fp8_fp4_mega_moe", code, args.arch)
             records.append(dict(mode=mode, target=target, **info))
