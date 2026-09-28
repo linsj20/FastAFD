@@ -12,12 +12,13 @@ from pathlib import Path
 from statistics import mean, median
 
 
-def audit_joined_preparation(rows, producer, selector):
+def audit_joined_preparation(rows, producer, selector, *, barrier_only=False):
     """Validate the explicit collective/reset/collective graph prefix."""
     rows = sorted(rows)
-    if (len(rows) != 4
-            or any("decomposition_collective_barrier(" not in rows[i][2] for i in (0, 3))
-            or any("at::native::FillFunctor<int>" not in rows[i][2] for i in (1, 2))
+    if (len(rows) != (2 if barrier_only else 4)
+            or any("decomposition_collective_barrier(" not in rows[i][2]
+                   for i in (0, 1 if barrier_only else 3))
+            or (not barrier_only and any("at::native::FillFunctor<int>" not in rows[i][2] for i in (1, 2)))
             or any(row[5] != producer[5] or row[0] >= row[1]
                    or row[1] > selector[0] for row in rows)
             or rows[-1][0] > producer[0]):
@@ -91,6 +92,7 @@ def summarize_rank_mean(args):
                           (args.require_graph_identity, "--require-graph-identity"),
                           (args.require_preinitialized_events, "--require-preinitialized-events"),
                           (args.joined_collective_preparation, "--joined-collective-preparation"),
+                          (args.joined_collective_barrier_only, "--joined-collective-barrier-only"),
                           (args.retain_timestamps, "--retain-timestamps")):
         if enabled:
             common.append(flag)
@@ -147,13 +149,18 @@ def main():
                         help="Reject CUDA event creation inside the measured replay window")
     parser.add_argument("--joined-collective-preparation", action="store_true",
                         help="Require collective/two resets/collective in every workload graph")
+    parser.add_argument("--joined-collective-barrier-only", action="store_true",
+                        help="Require two preparation collectives without payload resets")
     parser.add_argument("--prefix-kernel",
                         help="Also measure a required kernel before each producer, matched by name substring")
     args = parser.parse_args()
     if args.rank < 0:
         parser.error("--rank must be nonnegative")
-    if args.joined_collective_preparation and not args.require_graph_identity:
+    if ((args.joined_collective_preparation or args.joined_collective_barrier_only)
+            and not args.require_graph_identity):
         parser.error("--joined-collective-preparation requires --require-graph-identity")
+    if args.joined_collective_preparation and args.joined_collective_barrier_only:
+        parser.error("Choose reset or barrier-only preparation")
     if args.sweep and (args.flat_trials or args.job is not None):
         parser.error("--sweep cannot be combined with a job or --flat-trials")
     if not args.sweep and not args.flat_trials and args.job is None:
@@ -219,9 +226,10 @@ def main():
                     expected.append(dispatches[ordinal])
                 if args.prefix_kernel and groups["prefix"][ordinal][6:] == identity:
                     expected.append(groups["prefix"][ordinal])
-                if args.joined_collective_preparation:
+                if args.joined_collective_preparation or args.joined_collective_barrier_only:
                     preparation = [row for row in rows_by_identity[identity] if row not in expected]
-                    expected.extend(audit_joined_preparation(preparation, producer, selector))
+                    expected.extend(audit_joined_preparation(preparation, producer, selector,
+                        barrier_only=args.joined_collective_barrier_only))
                 if (any(value is None for value in identity) or identity[-2] <= 0
                         or identity[-1] <= 0 or identity in graph_calls
                         or any(row[6:] != identity for row in expected)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check a replacement library's IKET allocation using saved discovery metadata.
+"""Check IKET allocation using saved discovery metadata or a standalone cubin.
 
 CPU-only: this validates marker/resource allocation, not launch ABI, numerical
 correctness or performance. A library must contain exactly one CUDA image;
@@ -8,6 +8,7 @@ standalone cubins are accepted explicitly.
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -17,7 +18,8 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tracker", type=Path, required=True)
+    parser.add_argument("--tracker", type=Path,
+                        help="Saved discovery metadata; omit for an explicit standalone cubin check")
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--library", type=Path)
     inputs.add_argument("--cubin", type=Path, help="Explicit standalone CUDA image")
@@ -31,15 +33,10 @@ def main():
     parser.add_argument("--smodel", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.tracker is None and (args.cubin is None or args.replacement_function):
+        parser.error("Without --tracker, require --cubin and no --replacement-function")
     args.output.mkdir(parents=True, exist_ok=False)
     library = (args.library or args.cubin).resolve(strict=True)
-    tracker = json.loads(args.tracker.read_text())
-    launches = tracker["launches"]
-    ids = {x["moduleId"] for x in launches if args.kernel in x["kernelName"]}
-    if len(ids) != 1:
-        raise ValueError(f"Expected one matching module: {ids}")
-    module_id = ids.pop()
-    old_names = sorted({x["kernelName"] for x in launches if x["moduleId"] == module_id})
     if args.cubin is not None:
         shutil.copyfile(library, args.output / "replacement.cubin")
     else:
@@ -51,6 +48,27 @@ def main():
     resources = subprocess.check_output(
         ["/usr/local/cuda/bin/cuobjdump", "--dump-resource-usage", str(library)], text=True)
     names = re.findall(r"Function\s+(\S+):", resources)
+    if args.tracker:
+        tracker = json.loads(args.tracker.read_text())
+    else:
+        selected = [name for name in names if args.kernel in name and
+                    all(part in name for part in args.function_contains)]
+        if not selected:
+            raise ValueError("No matching cubin functions")
+        # This fixture only selects functions for CPU resource analysis. It is
+        # not a discovered launch, and cannot establish runtime ABI or geometry.
+        tracker = dict(modules=[dict(image=str(images[0]), size=images[0].stat().st_size,
+                                    moduleId=0, handles=[])], graphLaunches={}, launches=[
+            dict(gridDim=dict(x=1, y=1, z=1), blockDim=dict(x=1, y=1, z=1),
+                 contextId=0, functionId=i, moduleId=0, kernelName=name,
+                 driverPatchOffset=0, parametersDeviceFunction=[])
+            for i, name in enumerate(selected)])
+    launches = tracker["launches"]
+    ids = {x["moduleId"] for x in launches if args.kernel in x["kernelName"]}
+    if len(ids) != 1:
+        raise ValueError(f"Expected one matching module: {ids}")
+    module_id = ids.pop()
+    old_names = sorted({x["kernelName"] for x in launches if x["moduleId"] == module_id})
     # Match function name and template parameters, allowing the parameter list
     # to change. Discovery metadata is used only for resource selection here.
     def keys(symbols):
@@ -97,6 +115,9 @@ def main():
     fixture = args.output / "tracker.json"
     fixture.write_text(json.dumps(tracker) + "\n")
     sys.path.insert(0, str(args.smodel))
+    if os.environ.get("FASTAFD_IKET_EVENT_REGISTER_LIMITS"):
+        from iket_event_register_limits import install
+        install()
     from iket.profiler import TrackerRecord, module_select_resource
     record = TrackerRecord.parse_json(fixture)
     targets = record.make_iket_modules()
@@ -120,7 +141,9 @@ def main():
     config = module_select_resource(module, 256, None)
     (args.output / "module_config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
     result = dict(status="PASS_OFFLINE_RESOURCE_SELECTION", library=str(library),
-                  tracker=str(args.tracker), functions=sorted(module.functions), discovery_mapping=mapping,
+                  tracker=str(args.tracker) if args.tracker else None,
+                  standalone_cubin_fixture=args.tracker is None,
+                  functions=sorted(module.functions), discovery_mapping=mapping,
                   source_marker_counts=event_counts,
                   scope="CPU-only marker/resource allocation; no GPU, numerical, ABI or timing claim")
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")

@@ -12,7 +12,7 @@
 namespace deep_gemm::mega {
 
 static int get_token_alignment_for_mega_moe() {
-    return layout::kLCMCandidateBlockM;
+    return layout::kPoolTokenAlignment;
 }
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>

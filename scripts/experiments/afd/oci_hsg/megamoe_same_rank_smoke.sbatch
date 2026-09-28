@@ -11,6 +11,11 @@
 #           MEGAMOE_SMOKE_MEMCHECK (1 enables per-rank Compute Sanitizer logs),
 #           MEGAMOE_SMOKE_GPU_HEALTH (1 records nvidia-smi XML per node),
 #           MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX,
+#           MEGAMOE_SMOKE_NSYS_GPU_METRICS (1: node-local rank0 samples all GPUs),
+#           MEGAMOE_SMOKE_NSYS_GPU_METRICS_SET (optional Nsight metric-set alias),
+#           MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX, MEGAMOE_SMOKE_NCU_METRICS,
+#           MEGAMOE_SMOKE_NCU (explicit executable; all ranks must participate),
+#           MEGAMOE_SMOKE_NCU_GRAPH_PROFILING (node or graph; default node),
 #           MEGAMOE_SMOKE_DEFER_NSYS_STATS (1 exports on CPU after GPU release),
 #           MEGAMOE_SMOKE_COMBINE_MODES,
 #           MEGAMOE_SMOKE_ROUTE_READY_DISPATCH_MODES,
@@ -43,6 +48,14 @@ case "${MEGAMOE_SMOKE_DEFER_NSYS_STATS:-0}" in
     0|1) ;;
     *) echo "MEGAMOE_SMOKE_DEFER_NSYS_STATS must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${MEGAMOE_SMOKE_NSYS_GPU_METRICS:-0}" in
+    0|1) ;;
+    *) echo "MEGAMOE_SMOKE_NSYS_GPU_METRICS must be 0 or 1" >&2; exit 2 ;;
+esac
+if [[ ${MEGAMOE_SMOKE_NSYS_GPU_METRICS:-0} == 1 && -z ${MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX:-} ]]; then
+    echo "GPU metrics require an explicit Nsight output prefix" >&2
+    exit 2
+fi
 
 if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
     rank=${SLURM_PROCID:?}
@@ -60,6 +73,46 @@ if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
         "$FASTAFD_VENV/bin/python"
         "${MEGAMOE_SMOKE_TEST_SCRIPT:-$FASTAFD_SOURCE_REPO/tests/afd_megamoe_same_rank_smoke.py}"
     )
+    if [[ -n ${MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX:-} ]]; then
+        : "${MEGAMOE_SMOKE_NCU:?}" "${MEGAMOE_SMOKE_NCU_METRICS:?}" "${MASTER_ADDR:?}" "${SLURM_NTASKS:?}" "${MEGAMOE_SMOKE_DEVICE_INDEX:?}" "${MEGAMOE_SMOKE_NCU_COORDINATION_ROOT:?}"
+        [[ -x $MEGAMOE_SMOKE_NCU && -z ${MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX:-} &&
+           ${MEGAMOE_SMOKE_MEMCHECK:-0} == 0 && ${MEGAMOE_SMOKE_NSYS_GPU_METRICS:-0} == 0 &&
+           ${NV_COMPUTE_PROFILER_DISABLE_CONCURRENT_PROFILING:-0} == 0 ]] || {
+            echo 'NCU requires an executable, exclusive tool selection and concurrent device profiling' >&2; exit 2
+        }
+        graph_profiling=${MEGAMOE_SMOKE_NCU_GRAPH_PROFILING:-node}
+        graph_options=(--graph-profiling "$graph_profiling")
+        case "$graph_profiling" in
+            node) graph_options+=(--kernel-name regex:sm100_fp8_fp4_mega_moe_impl) ;;
+            graph)
+                [[ ${MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT:-separate} == joined &&
+                   ${MEGAMOE_SMOKE_GRAPH_BATCH:-1} == 1 ]] || {
+                    echo 'Whole-graph NCU requires one joined preparation/workload graph' >&2; exit 2
+                }
+                ;;
+            *) echo 'MEGAMOE_SMOKE_NCU_GRAPH_PROFILING must be node or graph' >&2; exit 2 ;;
+        esac
+        mkdir -p "$(dirname "$MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX")" "$OUTPUT_ROOT/ncu-temp"
+        export TMPDIR=$OUTPUT_ROOT/ncu-temp
+        export MEGAMOE_SMOKE_CUDA_PROFILER_RANGE=1
+        exec "$FASTAFD_VENV/bin/python" \
+            "${MEGAMOE_SMOKE_NCU_LAUNCHER:-$FASTAFD_SOURCE_REPO/codex_scripts/ncu_tcp_launcher.py}" \
+            --root "$MEGAMOE_SMOKE_NCU_COORDINATION_ROOT" \
+            --port "${MEGAMOE_SMOKE_NCU_PORT:-49217}" -- \
+            "$MEGAMOE_SMOKE_NCU" --config-file off \
+            --communicator tcp --communicator-tcp-hostname "$MASTER_ADDR" \
+            --communicator-tcp-num-peers "$SLURM_NTASKS" \
+            --communicator-tcp-port "${MEGAMOE_SMOKE_NCU_PORT:-49217}" \
+            --lockstep-kernel-launch --lockstep-nvtx-include megamoe_ncu/ \
+            --nvtx --nvtx-include megamoe_ncu/ \
+            --profile-from-start off --replay-mode kernel \
+            "${graph_options[@]}" --launch-count 1 \
+            --devices "$MEGAMOE_SMOKE_DEVICE_INDEX" \
+            --cache-control none --clock-control none \
+            --metrics "$MEGAMOE_SMOKE_NCU_METRICS" \
+            --export "$MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX-rank$rank" \
+            "${python_cmd[@]}"
+    fi
     case "${MEGAMOE_SMOKE_MEMCHECK:-0}" in
         0) ;;
         1)
@@ -91,7 +144,20 @@ if [[ ${MEGAMOE_SMOKE_RANK_MODE:-} == run ]]; then
         export TMPDIR=/dev/shm/fastafd-megamoe-nsys-$SLURM_JOB_ID-$rank
         export MEGAMOE_SMOKE_CUDA_PROFILER_RANGE=1
         report_prefix=$MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX-rank$rank
-        "$nsys" profile --trace="${MEGAMOE_SMOKE_NSYS_TRACE:-cuda}" --sample=none --cpuctxsw=none \
+        metrics_args=()
+        if [[ ${MEGAMOE_SMOKE_NSYS_GPU_METRICS:-0} == 1 && ${SLURM_LOCALID:?} == 0 ]]; then
+            # Exactly one collector per node; other ranks retain CUDA timelines.
+            metrics_args=(--gpu-metrics-devices=all --gpu-metrics-frequency=20000)
+            if [[ -n ${MEGAMOE_SMOKE_NSYS_GPU_METRICS_SET:-} ]]; then
+                metrics_args+=(--gpu-metrics-set="$MEGAMOE_SMOKE_NSYS_GPU_METRICS_SET")
+            fi
+            "$nsys" --version > "$report_prefix.metrics-config.txt"
+            "$nsys" profile --gpu-metrics-devices=help >> "$report_prefix.metrics-config.txt"
+            "$nsys" profile --gpu-metrics-devices=all --gpu-metrics-set=help \
+                >> "$report_prefix.metrics-config.txt"
+            printf '%s\n' "${metrics_args[@]}" >> "$report_prefix.metrics-config.txt"
+        fi
+        "$nsys" profile "${metrics_args[@]}" --trace="${MEGAMOE_SMOKE_NSYS_TRACE:-cuda}" --sample=none --cpuctxsw=none \
             --cuda-graph-trace="${MEGAMOE_SMOKE_NSYS_GRAPH_TRACE:-node}" --cuda-event-trace=false \
             --capture-range=cudaProfilerApi --capture-range-end=stop \
             --force-overwrite=true --output="$report_prefix" \

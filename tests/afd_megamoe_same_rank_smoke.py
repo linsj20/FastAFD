@@ -86,9 +86,12 @@ def _signed_zero_input(like):
 
 def _dispatch_preparation(get_buffer, rows):
     setting = os.environ.get("MEGAMOE_SMOKE_RESET_DISPATCH_PAYLOAD", "0")
+    barrier_only = os.environ.get("MEGAMOE_SMOKE_PREPARE_BARRIER_ONLY", "0")
     if setting not in ("0", "1"):
         raise ValueError("MEGAMOE_SMOKE_RESET_DISPATCH_PAYLOAD must be 0 or 1")
-    if setting == "0":
+    if barrier_only not in ("0", "1") or (setting == "1" and barrier_only == "1"):
+        raise ValueError("Choose payload reset or barrier-only preparation")
+    if setting == "0" and barrier_only == "0":
         return None
 
     barrier_mode = os.environ.get("MEGAMOE_SMOKE_PREPARE_BARRIER", "symmetric")
@@ -123,7 +126,8 @@ def _dispatch_preparation(get_buffer, rows):
     def prepare():
         buffer = get_buffer()
         barrier(buffer)
-        buffer.reset_dispatch_payload(rows)
+        if setting == "1":
+            buffer.reset_dispatch_payload(rows)
         barrier(buffer)
 
     return prepare
@@ -170,6 +174,9 @@ def _time_prepared_graph(run_stage, prepare_stage, output, *, warmups, iteration
         torch.cuda.profiler.start()
     # Every rank finishes profiler initialization before timed work can begin.
     dist.barrier()
+    ncu_range = bool(os.environ.get("MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX"))
+    if ncu_range:
+        torch.cuda.nvtx.range_push("megamoe_ncu")
     for start, end in pairs:
         if preparation is not None:
             preparation.replay()
@@ -177,6 +184,8 @@ def _time_prepared_graph(run_stage, prepare_stage, output, *, warmups, iteration
         graph.replay()
         end.record()
     pairs[-1][1].synchronize()
+    if ncu_range:
+        torch.cuda.nvtx.range_pop()
     sample_ms = [start.elapsed_time(end) for start, end in pairs]
     total_ms = sum(sample_ms)
     if profile:
@@ -229,6 +238,9 @@ def _time_graph(
         raise RuntimeError("MEGAMOE_SMOKE_CUDA_PROFILER_RANGE must be 0 or 1")
     if profiler_range:
         torch.cuda.profiler.start()
+    ncu_range = bool(os.environ.get("MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX"))
+    if ncu_range:
+        torch.cuda.nvtx.range_push("megamoe_ncu")
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -236,6 +248,8 @@ def _time_graph(
         graph.replay()
     end.record()
     end.synchronize()
+    if ncu_range:
+        torch.cuda.nvtx.range_pop()
     if profiler_range:
         torch.cuda.profiler.stop()
     elapsed = torch.tensor(

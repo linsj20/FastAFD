@@ -8,7 +8,7 @@ from pathlib import Path
 from statistics import mean, median
 
 
-def average_rank_summaries(results, raw_inputs):
+def average_rank_summaries(results, raw_inputs, *, kernel_origin=False):
     """Average one arm's local phase intervals after complete rank/call validation."""
     by_rank, raw_by_rank, contracts = {}, {}, []
     for name, result in results.items():
@@ -42,8 +42,9 @@ def average_rank_summaries(results, raw_inputs):
         return {key for key, value in sample.items()
                 if key.endswith("_us") and isinstance(value, (int, float))}
     keys = scalar_keys(by_rank[0][0])
-    required = {"first_issue_from_metadata_us", "compute_end_from_metadata_us",
-                "issue_to_compute_end_us", "kernel_end_from_metadata_us"}
+    origin_name = "kernel" if kernel_origin else "metadata"
+    required = {f"first_issue_from_{origin_name}_us", f"compute_end_from_{origin_name}_us",
+                "issue_to_compute_end_us", f"kernel_end_from_{origin_name}_us"}
     if not required <= keys:
         raise ValueError("Missing core rank-local phase metrics")
     for samples in by_rank.values():
@@ -69,7 +70,7 @@ def average_rank_summaries(results, raw_inputs):
         for key in phase_keys}} for ordinal in ordinals]
     return {
         "scope": "Arithmetic means of corresponding rank-local phase intervals and "
-                 "metadata-relative milestones; no absolute cross-rank timestamps averaged. "
+                 f"{origin_name}-relative milestones; no absolute cross-rank timestamps averaged. "
                  "Instrumented phases remain separate from ordinary E2E timing.",
         "rank_count": world_size, "samples_per_rank": len(ordinals),
         "calls": calls, "means": {key: mean(call[key] for call in calls) for key in sorted(keys)},
@@ -345,7 +346,7 @@ def first_fc1_epilogue_observations(markers, origin):
     return result
 
 
-def summarize(data):
+def summarize(data, *, kernel_origin=False):
     metadata_materialized = data.get("interpretation", {}).get("receiver_metadata_materialized", True)
     if not isinstance(metadata_materialized, bool):
         raise ValueError("receiver_metadata_materialized must be boolean")
@@ -358,7 +359,7 @@ def summarize(data):
     samples = []
     for sample in data["samples"]:
         markers = sample["source_markers"]
-        origin = sample["metadata_transfer_start_us"]
+        origin = 0.0 if kernel_origin else sample["metadata_transfer_start_us"]
         issue = [m for m in markers if m["name"] == "MegaMmaIssue"]
         actual = bool(issue)
         if not actual:
@@ -459,7 +460,7 @@ def summarize(data):
                          if p["rank"] == sample["rank"] and
                          p["measured_ordinal"] == sample["measured_ordinal"]), None)
         producer_bounds, sf_early_ctas = {}, 0
-        if producer:
+        if producer and not kernel_origin:
             events = producer["markers"]
             metadata_ns = min(m["timestamp_ns"] for m in events
                               if m["name"] == "RouteMetadataTransferStart")
@@ -508,7 +509,8 @@ def summarize(data):
             kernel_entry_from_metadata_us=-origin,
             first_issue_from_kernel_us=first["time_us"],
             first_issue_from_metadata_us=first["time_us"] - origin,
-            first_issue_from_selector_us=first["time_us"] + sample["producer_entry_to_megamoe_entry_us"],
+            first_issue_from_selector_us=(None if kernel_origin else
+                first["time_us"] + sample["producer_entry_to_megamoe_entry_us"]),
             compute_end_from_metadata_us=sample["compute_end_us"] - origin,
             issue_to_compute_end_us=sample["compute_end_us"] - first["time_us"],
             pair_issue_to_compute_end_us=bounds([p["issue_to_compute_end_us"] for p in pair_spans]),
@@ -533,7 +535,8 @@ def summarize(data):
             producer_from_metadata_us=producer_bounds,
             operation_markers_from_metadata_us=operation_markers,
             producer_sf_issued_before_metadata_issued_cta_count=sf_early_ctas,
-            kernel_end_from_metadata_us=sample["metadata_start_to_megamoe_end_us"],
+            kernel_end_from_metadata_us=(sample["kernel_envelope_us"] if kernel_origin else
+                                         sample["metadata_start_to_megamoe_end_us"]),
             critical_pair_from_metadata_us=startup_markers(markers, cta, origin),
             epilogue_wait_us=waits,
             genphase_from_metadata_us={
@@ -542,6 +545,21 @@ def summarize(data):
                 for name, event in (sample["genphase_markers_relative_to_megamoe"] or {}).items()
             },
         ))
+    if kernel_origin:
+        # Explicit kernel-only mode never substitutes kernel entry for a missing
+        # producer timestamp under a metadata-relative label.
+        def rename(value):
+            if isinstance(value, dict):
+                return {key.replace("_from_metadata_us", "_from_kernel_us"): rename(item)
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [rename(item) for item in value]
+            return value
+        for sample in samples:
+            for key in ("first_issue_from_selector_us", "producer_from_metadata_us",
+                        "producer_sf_issued_before_metadata_issued_cta_count"):
+                sample.pop(key)
+        samples = rename(samples)
     return dict(kernel_us=data["nsys_kernel_us"], samples=samples)
 
 
@@ -860,7 +878,11 @@ def main():
                         help="Named start/end markers and exact CTA/warp coverage with a scope statement")
     parser.add_argument("--rank-mean-output", type=Path,
                         help="Also average one arm's complete per-rank phase traces; retain all inputs")
+    parser.add_argument("--kernel-origin", action="store_true",
+                        help="Compare kernel-relative phases without requiring producer markers")
     args = parser.parse_args()
+    if args.kernel_origin and (args.markdown_output or args.readiness_map or args.interval_map):
+        parser.error("--kernel-origin supports JSON phase summaries only")
     if args.ordinary_input and not args.markdown_output:
         parser.error("--ordinary-input requires --markdown-output")
     result, notes, raw_inputs = {}, {}, {}
@@ -870,7 +892,7 @@ def main():
             raise ValueError(f"Duplicate arm: {name}")
         data = json.loads(Path(path).read_text())
         raw_inputs[name] = data
-        result[name] = summarize(data)
+        result[name] = summarize(data, kernel_origin=args.kernel_origin)
         notes[name] = data.get("interpretation", {})
         result[name]["source"] = path
     mapped = set()
@@ -888,7 +910,8 @@ def main():
         attach_marker_intervals(result[name], raw_inputs[name], json.loads(Path(path).read_text()))
         mapped.add(name)
     ordinary = read_ordinary_passes(args.ordinary_input, result) if args.ordinary_input else None
-    rank_mean = average_rank_summaries(result, raw_inputs) if args.rank_mean_output else None
+    rank_mean = (average_rank_summaries(result, raw_inputs, kernel_origin=args.kernel_origin)
+                 if args.rank_mean_output else None)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     if args.rank_mean_output:
         args.rank_mean_output.write_text(json.dumps(rank_mean, indent=2) + "\n")

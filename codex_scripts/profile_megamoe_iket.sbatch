@@ -6,6 +6,7 @@
 #                     FASTAFD_IKET_ARTIFACT_ROOT FASTAFD_IKET_DEEPGEMM_CACHE_ROOT
 #                     DG_JIT_CACHE_DIR
 #                     FASTAFD_IKET_CAPTURE_ONLY (1: analyze later on a CPU allocation)
+#                     FASTAFD_IKET_SAVE_WEIGHTS (0: skip caches for ordinary-only runs)
 #                     FASTAFD_IKET_VERIFY_SOURCE (0 for archive-authoritative sources)
 #                     MEGAMOE_IKET_EP MEGAMOE_IKET_GLOBAL_TOKENS
 #                     MEGAMOE_IKET_DISPATCH_DETAIL (diagnostic source required)
@@ -89,6 +90,14 @@ export FASTAFD_IKET_INCLUDE FASTAFD_IKET_PYTHON_DEPS
 export MEGAMOE_BASELINE_ITERATIONS MEGAMOE_IKET_WARMUPS
 export MEGAMOE_IKET_ITERATIONS MEGAMOE_IKET_PROFILE_RANK
 
+case ${FASTAFD_IKET_SAVE_WEIGHTS:-1} in
+    1) ;;
+    0) [[ ${FASTAFD_IKET_CAPTURE_PHASE:-all} == normal ]] || {
+        echo 'Skipping weight caches requires ordinary-only capture' >&2; exit 2;
+    } ;;
+    *) echo 'FASTAFD_IKET_SAVE_WEIGHTS must be 0 or 1' >&2; exit 2 ;;
+esac
+
 if [[ ${FASTAFD_IKET_RANK_MODE:-} == normal || \
       ${FASTAFD_IKET_RANK_MODE:-} == profile ]]; then
     # A recorded ordinary result is also the reference for instrumented replay.
@@ -104,14 +113,27 @@ if [[ ${FASTAFD_IKET_RANK_MODE:-} == normal || \
     export TMPDIR=/dev/shm/fastafd-megamoe-iket-$SLURM_JOB_ID-$rank
     # Each rank retains its own weights for the subsequent IKET processes.
     if [[ $FASTAFD_IKET_RANK_MODE == normal ]]; then
-        export MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT=$rank_root/profile-rank-weights.pt
+        if [[ ${FASTAFD_IKET_SAVE_WEIGHTS:-1} == 1 ]]; then
+            export MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT=$rank_root/profile-rank-weights.pt
+        else
+            unset MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT
+        fi
         export OUTPUT_ROOT=$rank_root
-        export MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX=$rank_root/nsys/megamoe
+        if [[ -n ${MEGAMOE_SMOKE_NCU_METRICS:-} ]]; then
+            [[ ${FASTAFD_IKET_CAPTURE_PHASE:-all} == normal && ${FASTAFD_IKET_CAPTURE_ONLY:-0} == 1 ]] || {
+                echo 'NCU requires ordinary capture-only mode' >&2; exit 2
+            }
+            export MEGAMOE_SMOKE_NCU_OUTPUT_PREFIX=$rank_root/ncu/megamoe
+            export MEGAMOE_SMOKE_NCU_COORDINATION_ROOT=$FASTAFD_IKET_RUN_ROOT/ncu-startup
+            unset MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX MEGAMOE_SMOKE_WEIGHT_CACHE_OUTPUT
+        else
+            export MEGAMOE_SMOKE_NSYS_OUTPUT_PREFIX=$rank_root/nsys/megamoe
+        fi
         export MEGAMOE_SMOKE_NSYS_PROFILE_RANK=$rank
         export MEGAMOE_SMOKE_RANK_MODE=run
         export MEGAMOE_SMOKE_NSYS_TRACE=cuda-sw
         export MEGAMOE_SMOKE_NSYS_GRAPH_TRACE=node:host-only
-        exec bash "$FASTAFD_SOURCE_REPO/scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch"
+        exec bash "${MEGAMOE_SMOKE_JOB_SCRIPT:-$FASTAFD_SOURCE_REPO/scripts/experiments/afd/oci_hsg/megamoe_same_rank_smoke.sbatch}"
     fi
     export MEGAMOE_SMOKE_WEIGHT_CACHE_INPUT=$rank_root/profile-rank-weights.pt
     # Every rank runs both IKET discovery and capture with its own output root.
@@ -525,6 +547,7 @@ for rank_dir in rank_dirs:
             raise SystemExit("invalid three-window readiness contract")
         three_window = window_mode == "1"
         middle_end = int(os.environ["MEGAMOE_IKET_MIDDLE_WINDOW_END"]) if three_window else None
+        first_end = int(os.environ.get("MEGAMOE_IKET_FIRST_WINDOW_END", "1024")) if three_window else None
         decoded_source_markers = [
             {"name": indexed_value(trace["stringTable"], m["markerNameIdx"]),
              "location": lifetime_location(m, trace["locationTable"]),
@@ -532,38 +555,149 @@ for rank_dir in rank_dirs:
             for m in launch.get("markers", [])]
         readiness_windows = None
         role_contract = os.environ.get("MEGAMOE_IKET_ROLE_CONTRACT", "legacy")
-        if role_contract not in ("legacy", "all_push_sweep"):
+        if role_contract not in ("legacy", "all_push_sweep", "all_push_pipeline"):
             raise SystemExit("unknown dispatch role contract")
+        if os.environ.get("DG_MEGAMOE_ALL_PUSH_NARROW_SF", "0") != "0" and role_contract != "all_push_pipeline":
+            raise SystemExit("narrow SF requires the all_push_pipeline role contract")
         sweep_roles = None
-        if role_contract == "all_push_sweep":
+        unified_tma, dedicated_dispatch, narrow_sf = False, False, 0
+        if role_contract in ("all_push_sweep", "all_push_pipeline"):
             # The compiled specialization establishes tile and scheduling geometry.
             # Balanced routing determines active workers independently of markers.
             parameters = [int(x) for x in re.findall(r"Lj(\d+)E", name)]
             if (not balance_ranks or len(parameters) < 20 or
                     parameters[:5] != [bucket, hidden, intermediate, experts, top_k] or
-                    parameters[5] != experts // ep_size or parameters[6] not in (16, 32) or
+                    not 0 < parameters[5] <= experts // ep_size or (experts // ep_size) % parameters[5] or
+                    parameters[6] not in (16, 32, 64, 96, 128, 160, 192, 256) or
                     parameters[7:9] != [128, 128] or parameters[15:20] != [128, 128, 256, num_sms, ep_size]):
-                raise SystemExit("all-push role contract requires the recorded one-wave specialization")
+                raise SystemExit("all-push role contract requires valid recorded tile and expert-wave geometry")
+            if three_window:
+                expected_middle_end = (int(os.environ.get("DG_MEGAMOE_ALL_PUSH_MIDDLE_WINDOW_END", "2048"))
+                                       if parameters[6] > 32 else 2048)
+                if len(parameters) < 37 or parameters[36] != expected_middle_end or middle_end != expected_middle_end:
+                    raise SystemExit("compiled middle-window endpoint differs from the recorded byte windows")
+                expected_first_end = (int(os.environ.get("DG_MEGAMOE_ALL_PUSH_FIRST_WINDOW_END", "1024"))
+                                      if parameters[6] > 32 else 1024)
+                # Older specializations implicitly use a 1024-byte prefix.
+                if (first_end != expected_first_end or first_end not in (512, 1024)
+                        or ("DG_MEGAMOE_ALL_PUSH_FIRST_WINDOW_END" in os.environ
+                            and (len(parameters) < 39 or parameters[38] != first_end))):
+                    raise SystemExit("compiled first-window endpoint differs from the recorded byte windows")
+            half_warp = int(os.environ.get("DG_MEGAMOE_ALL_PUSH_HALF_WARP", "0")) if parameters[6] > 32 else 0
+            if half_warp not in (0, 1) or (half_warp and (len(parameters) < 38 or parameters[37] != half_warp)):
+                raise SystemExit("compiled half-warp validator differs from the recorded contract")
+            if role_contract == "all_push_pipeline":
+                expected = [int(os.environ.get(key, default)) for key, default in (
+                    ("DG_MEGAMOE_ALL_PUSH_UNIFIED_TMA", "0"),
+                    ("DG_MEGAMOE_ALL_PUSH_DEDICATED_DISPATCH", "0"),
+                    ("DG_MEGAMOE_ALL_PUSH_ACCUM_STAGES", "2"))] if parameters[6] > 32 else [0, 0, 2]
+                if (len(parameters) < 29 or parameters[26:29] != expected
+                        or expected[0] not in (0, 1) or expected[1] not in (0, 1)
+                        or expected[1] > expected[0] or expected[2] not in (1, 2, 3)):
+                    raise SystemExit("compiled issuer/dispatch/accumulator roles differ from the recorded contract")
+                unified_tma, dedicated_dispatch = map(bool, expected[:2])
+                sf_setting = os.environ.get("DG_MEGAMOE_ALL_PUSH_NARROW_SF", "0")
+                if sf_setting not in ("0", "1", "2", "3"):
+                    raise SystemExit("invalid narrow-SF role setting")
+                narrow_sf = int(sf_setting) if parameters[6] > 32 else 0
+                # Older kernels have shape parameters at index32. Only inspect
+                # this new option when it is explicitly requested.
+                if narrow_sf and (len(parameters) < 33 or parameters[32] != narrow_sf):
+                    raise SystemExit("compiled narrow-SF role differs from the recorded contract")
+            elif os.environ.get("DG_MEGAMOE_ALL_PUSH_UNIFIED_TMA", "0") != "0":
+                raise SystemExit("unified TMA requires the all_push_pipeline role contract")
             owners = min(experts // ep_size, 2 * ep_size)
+            if "MEGAMOE_IKET_EXPERT_CTAS" in os.environ and parameters[6] > 32:
+                owners = int(os.environ["MEGAMOE_IKET_EXPERT_CTAS"])
+                if len(parameters) < 23 or parameters[22] != owners or owners <= 0:
+                    raise SystemExit("compiled receiver count differs from the recorded role contract")
+            row_partitions = (int(os.environ.get("DG_MEGAMOE_ALL_PUSH_METADATA_ROW_PARTITIONS", "1"))
+                              if parameters[6] > 32 else 1)
+            local_experts = experts // ep_size
+            if (not 1 <= row_partitions <= 8 or owners % row_partitions
+                    or (row_partitions != 1 and (len(parameters) <= 60 or parameters[60] != row_partitions))):
+                raise SystemExit("compiled row partitions differ from the recorded role contract")
+            tile_workers = owners // row_partitions
+            if tile_workers > local_experts and tile_workers % local_experts:
+                raise SystemExit("receiver tile workers require complete expert groups")
             total_routes = global_tokens * top_k
             quotient, remainder = divmod(total_routes, experts)
             expert_counts = [quotient + int(e * ep_size + rank < remainder)
                              for e in range(experts // ep_size)]
-            active_sf = sorted({e % owners for e, count in enumerate(expert_counts) if count})
-            l1_tiles = sum((count + parameters[6] - 1) // parameters[6]
-                           for count in expert_counts) * (2 * intermediate // parameters[7])
+            active_sf = sorted({
+                (e % tile_workers if tile_workers <= len(expert_counts)
+                 else e + tile * len(expert_counts)) * row_partitions + partition
+                for e, count in enumerate(expert_counts)
+                for tile in range(min((count + parameters[6] - 1) // parameters[6],
+                                      max(1, tile_workers // len(expert_counts))))
+                for partition in range(row_partitions)})
+            l1_ranges, cursor = [], 0
+            for first_expert in range(0, len(expert_counts), parameters[5]):
+                tiles = sum((count + parameters[6] - 1) // parameters[6]
+                            for count in expert_counts[first_expert:first_expert + parameters[5]])
+                l1_ranges.append((cursor, cursor + tiles * (2 * intermediate // parameters[7])))
+                cursor += tiles * ((2 * intermediate + hidden) // parameters[7])
             pushers = min((bucket + 127) // 128, 8)
-            sweep_roles = dict(active_index_ctas=active_sf,
+            if "MEGAMOE_IKET_PUSHER_CTAS" in os.environ and parameters[6] > 32:
+                pushers = int(os.environ["MEGAMOE_IKET_PUSHER_CTAS"])
+                if len(parameters) < 22 or parameters[21] != pushers or not 0 < pushers <= num_sms - 2 * owners - 1:
+                    raise SystemExit("compiled sender count differs from the recorded role contract")
+            compute_offset = 0
+            if os.environ.get("DG_MEGAMOE_ALL_PUSH_ROTATE_COMPUTE", "0") == "1" and parameters[6] > 32:
+                compute_offset = num_sms - 2 * owners
+                if len(parameters) < 24 or parameters[23] != compute_offset or compute_offset % 2:
+                    raise SystemExit("compiled compute rotation differs from the recorded role contract")
+            first_blocks = [(x + compute_offset) % num_sms for x in range(num_sms)]
+            initial_counts, initial_stride = [0] * num_sms, num_sms
+            warmup = int(os.environ.get("DG_MEGAMOE_ALL_PUSH_COMPUTE_WARMUP_ROUNDS", "0")) if parameters[6] > 32 else 0
+            if warmup:
+                if (len(parameters) < 25 or parameters[24] != warmup or not 0 < warmup <= 8
+                        or compute_offset or owners % 2):
+                    raise SystemExit("compiled startup assignment differs from the recorded role contract")
+                active = (experts // ep_size) * ((rows_per_rank * ep_size * top_k + experts * parameters[6] - 1)
+                                                // (experts * parameters[6]))
+                active = min(owners, (active + 1) // 2 * 2)
+                busy_senders = ((pushers + 2) // 2 * 2
+                                if os.environ.get("DG_MEGAMOE_ALL_PUSH_COMPUTE_BUSY_SENDERS", "0") == "1" else 0)
+                if busy_senders and (len(parameters) < 26 or parameters[25] != busy_senders
+                                     or num_sms <= 2 * owners + busy_senders):
+                    raise SystemExit("compiled sender assignment differs from the recorded role contract")
+                fast = num_sms - 2 * active - busy_senders
+                initial_stride = fast
+                first_blocks = []
+                for x in range(num_sms):
+                    logical = (fast + x if x < active else x - active if x < owners
+                               else fast + active + x - owners if x < owners + active
+                               else x - 2 * active if x < 2 * owners
+                               else fast + 2 * active + x - 2 * owners if x < 2 * owners + busy_senders
+                               else x - 2 * active - busy_senders)
+                    first_blocks.append(logical + (warmup * fast if logical >= fast else 0))
+                    initial_counts[x] = warmup if logical < fast else 0
+            active_issuers = []
+            for x, first in enumerate(first_blocks):
+                prefix = [first + i * initial_stride for i in range(initial_counts[x])]
+                regular = first + initial_counts[x] * initial_stride
+                # A CTA may skip FC1 in one wave but own it in a later wave.
+                if any(any(lo <= b < hi for b in prefix)
+                       or regular + max(0, (lo - regular + num_sms - 1) // num_sms) * num_sms < hi
+                       for lo, hi in l1_ranges):
+                    active_issuers.append(x)
+            sweep_roles = dict(metadata_ctas=2 * owners, index_ctas=owners, validation_ctas=owners,
+                row_partitions=row_partitions, tile_workers=tile_workers,
+                active_index_ctas=active_sf,
                 active_validation_ctas=[owners + e for e in active_sf],
-                active_issuer_ctas=list(range(min(num_sms, l1_tiles))),
+                active_issuer_ctas=active_issuers,
                 allocated_pushers=pushers, active_pushers=min(pushers, (rows_per_rank + 3) // 4))
         if three_window:
             sys.path.insert(0, os.environ["MEGAMOE_IKET_WINDOW_DECODER_ROOT"])
             from decode_megamoe_readiness_windows import decode_readiness_windows
             decoded_source_markers, readiness_windows = decode_readiness_windows(
                 decoded_source_markers, hidden=hidden, num_sms=num_sms,
-                validation_ctas=int(os.environ["MEGAMOE_IKET_METADATA_PAYLOAD_CTAS"]),
-                index_ctas=int(os.environ["MEGAMOE_IKET_METADATA_INDEX_CTAS"]), middle_end=middle_end,
+                validation_ctas=(sweep_roles["validation_ctas"] if sweep_roles is not None
+                                 else int(os.environ["MEGAMOE_IKET_METADATA_PAYLOAD_CTAS"])),
+                index_ctas=(sweep_roles["index_ctas"] if sweep_roles is not None
+                            else int(os.environ["MEGAMOE_IKET_METADATA_INDEX_CTAS"])), middle_end=middle_end, first_end=first_end,
+                unified_tma=unified_tma, dedicated_dispatch=dedicated_dispatch, narrow_sf=narrow_sf,
                 **({k: sweep_roles[k] for k in ("active_index_ctas", "active_validation_ctas", "active_issuer_ctas")}
                    if sweep_roles is not None else {}))
         elif any(m["name"] in {"GenphaseWindowValidateStart", "GenphaseWindowPayloadIssue",
@@ -711,6 +845,10 @@ for rank_dir in rank_dirs:
             metadata_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_CTAS", ep_size))
             index_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_INDEX_CTAS", metadata_ctas))
             validation_ctas = int(os.environ.get("MEGAMOE_IKET_METADATA_PAYLOAD_CTAS", metadata_ctas))
+            if sweep_roles is not None:
+                metadata_ctas = sweep_roles["metadata_ctas"]
+                index_ctas = sweep_roles["index_ctas"]
+                validation_ctas = sweep_roles["validation_ctas"]
             if not 0 < index_ctas <= metadata_ctas or not 0 < validation_ctas <= metadata_ctas:
                 raise SystemExit("invalid metadata role CTA counts")
             if index_release in ("FullPayloadIssue", "MiddlePayloadIssue") and "GenphaseIndexReady" in events_present:
@@ -896,7 +1034,10 @@ for rank_dir in rank_dirs:
         remainder_warps = int(os.environ.get("MEGAMOE_IKET_REMAINDER_WARPS_PER_CTA", "0"))
         if remainder_warps:
             issuer_ctas = sweep_roles["active_issuer_ctas"] if sweep_roles is not None else range(num_sms)
-            expected = {(x, 0, 0, w) for x in issuer_ctas for w in range(remainder_warps)}
+            if unified_tma and remainder_warps != 1:
+                raise SystemExit("unified TMA has one activation issuer warp")
+            expected = {(x, 0, 0, w + (4 if unified_tma else 0))
+                        for x in issuer_ctas for w in range(remainder_warps)}
             remainder = {}
             for event in ("MegaRemainderWaitStart", "MegaRemainderReady"):
                 observed = {}
@@ -1026,6 +1167,11 @@ result = {
         "preparation_in_cuda_event_span": os.environ.get("MEGAMOE_SMOKE_PREPARED_GRAPH_LAYOUT") == "joined",
         "route_producer_in_timed_region": baseline_record["timed_scope"] == "route_producer_and_megamoe",
         "warp_summary_selects_megamoe_only": True,
+        "all_push_warp_roles": (dict(activation_issuer=4 if unified_tma else 0,
+            count_publisher=7 if dedicated_dispatch else 0,
+            prefix_tail_validator=0 if dedicated_dispatch else 8,
+            middle_validator=(0 if dedicated_dispatch else 8) +
+                (narrow_sf or (0 if dedicated_dispatch else 4))) if sweep_roles is not None else None),
         "genphase_dispatch": bool(genphase),
         "three_window_ready": os.environ.get("MEGAMOE_IKET_THREE_WINDOW_READY", "0") == "1",
         "genphase_direct_sf_gather": bool(genphase and "IndexScatter" in genphase),

@@ -39,6 +39,17 @@ def main():
     sys.path.insert(0, str(args.source.resolve() / "python"))
     import torch
     from minisgl.kernel import deepgemm
+    if not args.header_root:
+        expected_source = args.source.resolve() / "python/minisgl/kernel/csrc/deepgemm"
+        if not deepgemm._source_root().samefile(expected_source):
+            raise ValueError(
+                "DeepGEMM binding resolves outside the requested source. "
+                "Create the source overlay with --own-native "
+                "or explicitly configure --header-root.")
+        if any(p.is_symlink() for p in (expected_source / "csrc").rglob("*")):
+            raise ValueError(
+                "Native C++ source contains symlinks that can select base headers. "
+                "Create the source overlay with --own-native.")
     if args.header_root:
         os.environ['MEGAMOE_HEADER_ROOT'] = str(args.header_root.resolve(strict=True))
         if args.router_source:
@@ -62,7 +73,7 @@ def main():
                 code, config, block_m, wave = deepgemm.generate_megamoe_kernel(
                     *inputs, args.payload_mode == "all_push", inband, rank_gated)
                 if args.payload_mode == "all_push":
-                    assert block_m <= 32 and wave == c["experts"] // case["ep"]
+                    assert block_m <= 256 and wave > 0 and (c["experts"] // case["ep"]) % wave == 0
                 q, r = divmod(case["global_tokens"] * c["top_k"], c["experts"])
                 padded = sum(((q + int(e * case["ep"] < r) + block_m - 1) // block_m) * block_m
                              for e in range(c["experts"] // case["ep"]))
@@ -106,6 +117,7 @@ def main():
     if torch.cuda.is_initialized():
         raise RuntimeError("CPU preparation initialized CUDA")
     (metadata / "manifest.json").write_text(json.dumps(dict(source=str(args.source),
+        header_root=str(args.header_root.resolve()) if args.header_root else None,
         cuda_initialized=False, configurations=cases, specializations=records,
         preparation_kernels=preparation), indent=2) + "\n")
     print(f"SWEEP_CPU_READY cases={len(cases)} builds={len(records)}", flush=True)

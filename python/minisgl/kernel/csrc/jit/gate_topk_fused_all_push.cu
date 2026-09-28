@@ -365,7 +365,8 @@ __device__ __forceinline__ deep_gemm::layout::Workspace make_route_workspace(
 }
 
 template <int kExperts, int kTopK, typename IndexT, typename MapT, bool kPrepareMegaMoERoutes,
-          bool kRankReadyRoutePublish, bool kPerfectBalance, bool kAllPush>
+          bool kRankReadyRoutePublish, bool kPerfectBalance, bool kAllPush, bool kProducerPrefix,
+          bool kPreparePriority, bool kSfVector64>
 __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
     const float* __restrict__ logits_gmem,
     float* __restrict__ topk_weights,
@@ -382,7 +383,11 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
     const int num_tokens, const bool defer_route_dependent_launch,
     const uint8_t* __restrict__ source_sf, const int hidden_size,
     const int reset_rows, uint64_t* reset_timings,
-    void* ahead_workspace, const int64_t* ahead_peers) {
+    void* ahead_workspace, const int64_t* ahead_peers,
+    const uint8_t* __restrict__ source_xq) {
+  static_assert(!kProducerPrefix || (kAllPush && kRankReadyRoutePublish));
+  static_assert(!kPreparePriority || (kAllPush && kRankReadyRoutePublish && !kProducerPrefix));
+  static_assert(!kSfVector64 || (kAllPush && kRankReadyRoutePublish));
   static_assert(kExperts <= kMaxExperts && kExperts % kWarpSize == 0);
   static_assert(kTopK > 0 && kTopK <= kWarpSize);
   const int token = static_cast<int>(blockIdx.x);
@@ -624,14 +629,67 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
             static_cast<int>(topk_ids[static_cast<size_t>(token) * kTopK + lane]) : -1;
         const int peer = expert >= 0 && expert < kExperts ?
             static_cast<uint32_t>(expert) * static_cast<uint32_t>(route_num_ranks) / kExperts : -1;
+        if constexpr (kPreparePriority) {
+          // SF warp1 already has mapped IDs and peers; keep key preparation
+          // independent of the routing warp's slot claims and normalization.
+          if (warp == 1) {
+            const uint32_t key = __reduce_min_sync(0xffffffffu, peer >= 0 ?
+                static_cast<uint32_t>(expert) - peer * workspace.num_experts_per_rank :
+                workspace.num_experts_per_rank);
+            if (lane == 0)
+              workspace.get_gather_index_ptr((2 + workspace.metadata_slot) * route_bucket)[token] = key;
+          }
+        }
         const uint64_t source_rows = 2ull * route_num_ranks * route_bucket;
         const uint64_t row = workspace.get_source_l1_row(route_rank, token);
         const auto sf_offset = reinterpret_cast<uintptr_t>(
             workspace.get_compact_frame_base_ptr(hidden_size, kTopK)) -
             reinterpret_cast<uintptr_t>(route_workspace) +
             source_rows * hidden_size + row * (hidden_size / 32);
+        uint4 prefix[2];
+        uint32_t epoch = 0;
+        if constexpr (kProducerPrefix) {
+          if (reset_rows)
+            epoch = deep_gemm::ptx::ld_acq(workspace.get_nvl_barrier_counter_ptr());
+          const auto* src = reinterpret_cast<const uint4*>(
+              source_xq + static_cast<size_t>(token) * hidden_size);
+          #pragma unroll
+          for (int v = 0; v < 2; ++v) {
+            auto value = src[lane + v * kWarpSize];
+            value.x = value.x == 0x80000000u ? 0 : value.x;
+            value.y = value.y == 0x80000000u ? 0 : value.y;
+            value.z = value.z == 0x80000000u ? 0 : value.z;
+            value.w = value.w == 0x80000000u ? 0 : value.w;
+            prefix[v] = value;
+          }
+        }
         for (int dst = warp - 1; dst < route_num_ranks; dst += kTPB / kWarpSize - 1) {
           if (__any_sync(0xffffffffu, peer == dst)) {
+            if constexpr (kProducerPrefix) {
+              // Recycled banks require a destination acquire before any write.
+              // Never wait CountsReady here: this CTA contributes to that count.
+              // Nonrecycled calls retain their external preparation contract.
+              if (reset_rows) {
+                const auto ready_offset = reinterpret_cast<uintptr_t>(workspace.get_payload_ready_ptr()) -
+                                          reinterpret_cast<uintptr_t>(route_workspace);
+                const auto* ready = reinterpret_cast<const uint32_t*>(
+                    static_cast<uintptr_t>(route_buffer_ptrs[dst]) + ready_offset);
+                if (lane == 0)
+                  while ((deep_gemm::ptx::ld_acq_sys(ready) - epoch) & 0x80000000u);
+                __syncwarp();
+              }
+              const auto data_offset = reinterpret_cast<uintptr_t>(
+                  workspace.get_compact_frame_base_ptr(hidden_size, kTopK)) -
+                  reinterpret_cast<uintptr_t>(route_workspace) + row * hidden_size;
+              #pragma unroll
+              for (int v = 0; v < 2; ++v) {
+                const auto address = static_cast<uintptr_t>(route_buffer_ptrs[dst]) +
+                    data_offset + (lane + v * kWarpSize) * sizeof(uint4);
+                const auto value = prefix[v];
+                asm volatile("st.relaxed.sys.global.v4.u32 [%0], {%1, %2, %3, %4};" ::
+                    "l"(address), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w) : "memory");
+              }
+            }
             // SF is never cleared. Auxiliary CTAs publish destination payload
             // readiness separately into the sender's input-ready counter.
 
@@ -640,15 +698,28 @@ __launch_bounds__(kTPB) __global__ void gate_topk_select_cta_kernel(
                 source_sf + static_cast<size_t>(token) * (hidden_size / 32));
             auto* out = reinterpret_cast<uint32_t*>(
                 static_cast<uintptr_t>(route_buffer_ptrs[dst]) + sf_offset);
-            for (int word = lane; word < hidden_size / 128; word += kWarpSize)
-              out[word] = src[word];
+            if constexpr (kSfVector64) {
+              const auto* src64 = reinterpret_cast<const uint64_t*>(src);
+              auto* out64 = reinterpret_cast<uint64_t*>(out);
+              #pragma unroll 1
+              for (int pair = lane; pair < hidden_size / 256; pair += kWarpSize)
+                out64[pair] = src64[pair];
+            } else {
+              for (int word = lane; word < hidden_size / 128; word += kWarpSize)
+                out[word] = src[word];
+            }
             ROUTE_IKET_MARK(RouteSfTransferIssued);
           }
         }
+      } else if constexpr (kPreparePriority) {
+        // Invalid physical rows also overwrite their bank entry before CountsReady.
+        if (tid == kWarpSize)
+          workspace.get_gather_index_ptr((2 + workspace.metadata_slot) * route_bucket)[token] =
+              workspace.num_experts_per_rank;
       }
     }
     // Existing last-CTA acqrel ticket and system route-ready publication
-    // transitively cover both route descriptors and the SF stores above.
+    // transitively cover route descriptors, SF and optional prefix stores.
     __syncthreads();
     if constexpr (kAllPush) {
       if (threadIdx.x == 0)
@@ -794,6 +865,35 @@ struct GateTopkAllPushKernel {
     const auto experts = static_cast<int>(num_experts.unwrap());
     const auto hsize = static_cast<int>(hidden_size.unwrap());
     const auto topk_value = static_cast<int>(topk.unwrap());
+    const char* prefix_env = std::getenv("DG_MEGAMOE_ALL_PUSH_PRODUCER_PREFIX");
+    RuntimeCheck(!prefix_env || std::string(prefix_env) == "0" || std::string(prefix_env) == "1",
+                 "DG_MEGAMOE_ALL_PUSH_PRODUCER_PREFIX must be 0 or 1");
+    const char* wide_env = std::getenv("DG_MEGAMOE_ALL_PUSH_WIDE");
+    const char* sf_vector_env = std::getenv("DG_MEGAMOE_ALL_PUSH_SF_VECTOR");
+    RuntimeCheck(!sf_vector_env || std::string(sf_vector_env) == "0" ||
+                 std::string(sf_vector_env) == "1",
+                 "DG_MEGAMOE_ALL_PUSH_SF_VECTOR must be 0 or 1");
+    const bool sf_vector = all_push && sf_vector_env && std::string(sf_vector_env) == "1" &&
+        wide_env && std::atoi(wide_env) != 0 &&
+        static_cast<float>(rows) * route_num_ranks * topk_value / experts > 32.5f;
+    const char* priority_env = std::getenv("DG_MEGAMOE_ALL_PUSH_CACHE_PRIORITY");
+    RuntimeCheck(!priority_env || std::string(priority_env) == "0" ||
+                 std::string(priority_env) == "1" || std::string(priority_env) == "2" ||
+                 std::string(priority_env) == "3" || std::string(priority_env) == "4",
+                 "DG_MEGAMOE_ALL_PUSH_CACHE_PRIORITY must be 0, 1, 2, 3 or 4");
+    const bool prepare_priority = all_push && priority_env && std::string(priority_env) == "3" &&
+        wide_env && std::atoi(wide_env) != 0 &&
+        static_cast<float>(rows) * route_num_ranks * topk_value / experts > 32.5f;
+    const bool producer_prefix = all_push && prefix_env && std::string(prefix_env) == "1" &&
+        wide_env && std::atoi(wide_env) != 0 &&
+        static_cast<float>(rows) * route_num_ranks * topk_value / experts > 32.5f;
+    RuntimeCheck(!producer_prefix || hsize == 4096, "Producer prefix requires hidden_size=4096");
+    RuntimeCheck(!prepare_priority || !producer_prefix,
+                 "Prepared priority keys require producer prefix disabled");
+    RuntimeCheck(!sf_vector || (!prepare_priority && !producer_prefix && renormalize &&
+                 route_rank_ready && ((experts == 128 && topk_value == 8) ||
+                                      (experts == 512 && topk_value == 10))),
+                 "Vector SF requires supported rank-ready routing without prefix or prepared keys");
     if (rows == 0) return;
     RuntimeCheck(hsize % (kKChunk * (kTPB / kWarpSize)) == 0, "hidden_size must be divisible by 512");
     RuntimeCheck(experts % 8 == 0 && experts <= kMaxExperts,
@@ -877,6 +977,9 @@ struct GateTopkAllPushKernel {
                    "route num_sms must be positive");
       const auto workspace = deep_gemm::layout::Workspace(
           nullptr, route_num_ranks, experts, route_bucket, topk_value);
+      RuntimeCheck(!prepare_priority ||
+                   uint64_t(workspace.num_max_pool_tokens) >= 4ull * route_bucket,
+                   "Prepared priority key banks exceed gather-index capacity");
       route_layout = {workspace.num_experts_per_rank,
                       workspace.num_max_recv_tokens_per_expert,
                       workspace.num_max_pool_tokens, workspace.num_max_pool_blocks};
@@ -914,6 +1017,10 @@ struct GateTopkAllPushKernel {
       x_q_ptr = static_cast<uint8_t*>(x_q.value().data_ptr());
       x_sf_ptr = static_cast<uint8_t*>(x_sf.value().data_ptr());
     }
+    RuntimeCheck(!sf_vector || (prepare_routes && x_sf_ptr && hsize % 256 == 0 &&
+                 reinterpret_cast<uintptr_t>(x_sf_ptr) % 8 == 0 &&
+                 reinterpret_cast<uintptr_t>(route_workspace.value().data_ptr()) % 8 == 0),
+                 "Vector SF requires aligned source and symmetric workspace");
     if (w_stage.has_value())
       w_stage_ptr = static_cast<float*>(w_stage.value().data_ptr());
     gate_topk_fused_tc_kernel<<<num_mtiles * num_expert_splits, kTPB, kSmemBytes, stream>>>(
@@ -955,9 +1062,12 @@ struct GateTopkAllPushKernel {
           const auto launch_cta = [&](auto experts_tag, auto topk_tag) {
             constexpr int kExperts = decltype(experts_tag)::value;
             constexpr int kTopK = decltype(topk_tag)::value;
-            const auto kernel = gate_topk_select_cta_kernel<
-                kExperts, kTopK, IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect, kAllPush>;
-            LaunchKernel(rows + (kAllPush && reset_rows ? deep_gemm::kMegaMoERecycleCTAs : 0),
+            const auto launch_prefix = [&](auto prefix_tag, auto priority_tag, auto sf_vector_tag) {
+              const auto kernel = gate_topk_select_cta_kernel<
+                  kExperts, kTopK, IndexT, MapT, kPrepareRoutes, kRankReady, kPerfect,
+                  kAllPush, decltype(prefix_tag)::value, decltype(priority_tag)::value,
+                  decltype(sf_vector_tag)::value>;
+              LaunchKernel(rows + (kAllPush && reset_rows ? deep_gemm::kMegaMoERecycleCTAs : 0),
                          kTPB, stream).with_attr(true)(kernel,
                 static_cast<const float*>(partials.data_ptr()),
                 static_cast<float*>(topk_weights.data_ptr()),
@@ -967,7 +1077,26 @@ struct GateTopkAllPushKernel {
                 route_rank, route_num_ranks, route_bucket, route_num_sms,
                 rows, defer_route_dependent_launch, x_sf_ptr, hsize, reset_rows, reset_timings_ptr,
                 ahead_workspace.has_value() ? ahead_workspace.value().data_ptr() : nullptr,
-                ahead_peers.has_value() ? static_cast<const int64_t*>(ahead_peers.value().data_ptr()) : nullptr);
+                ahead_peers.has_value() ? static_cast<const int64_t*>(ahead_peers.value().data_ptr()) : nullptr,
+                x_q_ptr);
+            };
+            if constexpr (kAllPush) {
+              if (producer_prefix) {
+                launch_prefix(std::true_type{}, std::false_type{}, std::false_type{});
+                return;
+              }
+              if (prepare_priority) {
+                launch_prefix(std::false_type{}, std::true_type{}, std::false_type{});
+                return;
+              }
+              if constexpr (kRankReady) {
+                if (sf_vector) {
+                  launch_prefix(std::false_type{}, std::false_type{}, std::true_type{});
+                  return;
+                }
+              }
+            }
+            launch_prefix(std::false_type{}, std::false_type{}, std::false_type{});
           };
           if (experts == 128 && topk_value == 8) {
             launch_cta(std::integral_constant<int, 128>{}, std::integral_constant<int, 8>{});

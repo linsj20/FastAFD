@@ -44,7 +44,7 @@ public:
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormap
-        CUtensorMap tensor_map_l1_acts;
+        layout::TmaDescriptors<CUtensorMap, 16> tensor_map_l1_acts;
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;
         CUtensorMap tensor_map_l1_weights_sf;
@@ -59,6 +59,7 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        DG_HOST_ASSERT(args.config.all_push_metadata_row_partitions == 1 || args.reset_rows == 0);
         return fmt::format(R"(
 #include <deep_gemm/impls/{}>
 
@@ -113,7 +114,47 @@ static void __instantiate_kernel() {{
     args.rank_ready_route_publish ? "true" : "false",
     args.inband_combine ? "true" : "false",
     args.all_push ? "true" : "false",
-    args.all_push ? fmt::format(", {}", args.reset_rows) : "");
+    args.all_push ? fmt::format(", {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}", args.reset_rows, args.config.num_dispatch_push_ctas,
+                               args.config.all_push_full_tma ? "true" : "false",
+                               args.config.num_dispatch_expert_ctas,
+                               args.config.all_push_prioritize_experts ? "true" : "false",
+                               args.config.compute_cta_offset, args.config.compute_warmup_rounds,
+                               args.config.compute_busy_sender_ctas,
+                               args.config.all_push_unified_tma ? 1 : 0,
+                               args.config.all_push_dedicated_dispatch ? 1 : 0,
+                               args.config.num_epilogue_stages,
+                               args.config.all_push_linear_source ? 1 : 0,
+                               args.config.all_push_cache_destinations ? 1 : 0,
+                               args.config.all_push_interleave_m ? 1 : 0,
+                               args.config.all_push_narrow_sf,
+                               args.config.all_push_coalesced_sf,
+                               args.config.all_push_prefetch_send ? 1 : 0,
+                               args.config.all_push_middle_window_end,
+                               args.config.all_push_half_warp ? 1 : 0,
+                               args.config.all_push_first_window_end,
+                               args.config.all_push_sticky_validation ? 1 : 0,
+                               args.config.all_push_full_row_combine,
+                               args.config.all_push_weight_cache ? 1 : 0,
+                               args.config.all_push_warp_combine,
+                               args.config.all_push_prefix_sweep ? 1 : 0,
+                               args.config.all_push_producer_prefix ? 1 : 0,
+                               args.config.all_push_sender_ldg,
+                               args.config.all_push_prefix_wide ? 1 : 0,
+                               args.config.all_push_cache_priority,
+                               args.config.all_push_group_priority,
+                               args.config.all_push_return_wide,
+                               args.config.all_push_return_wg_sync ? 1 : 0,
+                               args.config.all_push_balance_epilogue ? 1 : 0,
+                               args.config.all_push_extent_tma,
+                               args.config.all_push_late_count_lane ? 1 : 0,
+                               args.config.all_push_fc2_stage_ready ? 1 : 0,
+                               args.config.all_push_activation_issuers,
+                               args.config.all_push_metadata_row_partitions,
+                               args.config.all_push_weight_stages,
+                               args.config.all_push_activation_credit_limit,
+                               args.config.all_push_fc2_credit_only ? 1 : 0,
+                               args.config.all_push_relaxed_poll,
+                               args.config.all_push_send_middle_first) : "");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -168,14 +209,26 @@ static void sm100_fp8_mega_moe_impl(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden, num_padded_sf_pool_tokens,
         /* num_dispatch_pull_stages */ 1, all_push);
+    DG_HOST_ASSERT(config.all_push_full_row_combine != 4 ||
+                   reinterpret_cast<uintptr_t>(y.data_ptr()) % 32 == 0);
+    if (config.all_push_return_wide) {
+        DG_HOST_ASSERT(inband_combine);
+        for (const auto ptr : sym_buffer_ptrs)
+            DG_HOST_ASSERT(static_cast<uint64_t>(ptr) % 32 == 0);
+    }
 
     // Make tensormap
     constexpr int kGranK = 32;
-    const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, all_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
-                                                     config.block_k, all_push ? 8 : config.load_block_m,
-                                                     static_cast<int>(l1_acts.stride(-2)),
-                                                     config.swizzle_acts_mode);
+    layout::TmaDescriptors<CUtensorMap, 16> tensor_map_l1_acts{};
+    const int num_activation_maps = config.all_push_extent_tma ? config.block_m / 16 : 1;
+    DG_HOST_ASSERT(num_activation_maps > 0 && num_activation_maps <= 16);
+    for (int i = 0; i < num_activation_maps; ++i) {
+        const int rows = config.all_push_extent_tma ? 8 * (i + 1)
+            : all_push && !config.all_push_full_tma ? 8 : config.load_block_m;
+        tensor_map_l1_acts.maps[i] = make_tma_2d_desc(l1_acts,
+            hidden, all_push ? 2 * num_ranks * num_max_tokens_per_rank : static_cast<int>(l1_acts.size(0)),
+            config.block_k, rows, static_cast<int>(l1_acts.stride(-2)), config.swizzle_acts_mode);
+    }
     // Genphase stores all SF atoms of a pool block together, so refinement can
     // bulk-store contiguous atom runs instead of striding across the full pool.
     const auto tensor_map_l1_acts_sf = all_push ? make_tma_2d_desc(l1_acts_sf,
@@ -273,10 +326,10 @@ static void sm100_fp8_mega_moe_impl(
         DG_HOST_ASSERT(num_tokens <= 8192);
         DG_HOST_ASSERT(num_topk > 0 && num_topk <= 32);
         DG_HOST_ASSERT(hidden > 1024 && hidden % 512 == 0);
-        DG_HOST_ASSERT(config.block_m <= 32 && config.num_epilogue_threads >= 256);
-        DG_HOST_ASSERT(config.num_experts_per_wave == num_experts_per_rank);
-        const int metadata_ctas = 2 * std::min(num_experts_per_rank, 2 * num_ranks);
-        const int pushers = layout::Workspace::genphase_pusher_ctas(num_max_tokens_per_rank);
+        DG_HOST_ASSERT(config.block_m <= 256 && config.num_epilogue_threads >= 256);
+        DG_HOST_ASSERT(config.num_experts_per_wave > 0 && num_experts_per_rank % config.num_experts_per_wave == 0);
+        const int metadata_ctas = 2 * config.num_dispatch_expert_ctas;
+        const int pushers = config.num_dispatch_push_ctas;
         DG_HOST_ASSERT(num_sms >= metadata_ctas + 1 + pushers);
         // Device static assertions cover disjoint scratch and TMA transaction sizes.
         // Actual padded materialization capacity is checked by the receiver.

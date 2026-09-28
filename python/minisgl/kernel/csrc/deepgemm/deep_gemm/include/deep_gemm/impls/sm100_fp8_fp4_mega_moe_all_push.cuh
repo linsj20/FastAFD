@@ -52,6 +52,28 @@ CREATE_IKET_MARKER(MegaMmaIssue);
 
 namespace deep_gemm {
 
+// Keep the ready fast path acquiring. Only unsuccessful spins use relaxed
+// loads; an acquire must observe readiness before any consumer may proceed.
+template <typename T, bool kExact = false>
+CUTLASS_DEVICE T wait_ready_mask_relaxed(const T* ptr, const T mask) {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8);
+    const auto ready = [=](T value) { return kExact ? value == mask : (value & mask) == mask; };
+    T value;
+    while (true) {
+        if constexpr (sizeof(T) == 4)
+            value = ptx::ld_acq(ptr);
+        else
+            value = ptx::ld_acq_gpu(ptr);
+        if (ready(value)) return value;
+        do {
+            if constexpr (sizeof(T) == 4)
+                asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(value) : "l"(ptr) : "memory");
+            else
+                asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+        } while (!ready(value));
+    }
+}
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -77,6 +99,48 @@ template <
     bool kInbandCombine = false,
     bool kAllPush = false,
     uint32_t kResetRows = 0,
+    uint32_t kNumDispatchPushCTAs = layout::Workspace::genphase_pusher_ctas(kNumMaxTokensPerRank),
+    bool kFullActivationTMA = false,
+    uint32_t kNumDispatchExpertCTAs = (kNumExperts / kNumRanks < 2 * kNumRanks ? kNumExperts / kNumRanks : 2 * kNumRanks),
+    bool kPrioritizeExperts = false,
+    uint32_t kComputeCTAOffset = 0,
+    uint32_t kComputeWarmupRounds = 0,
+    uint32_t kComputeBusySenderCTAs = 0,
+    uint32_t kUnifiedTMA = 0,
+    uint32_t kDedicatedDispatch = 0,
+    uint32_t kNumEpilogueStages = 2,
+    uint32_t kLinearSource = 0,
+    uint32_t kCacheDestinations = 0,
+    uint32_t kInterleaveM = 0,
+    uint32_t kNarrowSf = 0,
+    uint32_t kCoalescedSf = 0,
+    uint32_t kPrefetchSend = 0,
+    uint32_t kMiddlePayloadWindowEnd = 2048,
+    uint32_t kHalfWarp = 0,
+    uint32_t kFirstReadinessWindowBytes = 1024,
+    uint32_t kStickyValidation = 0,
+    uint32_t kFullRowCombine = 0,
+    uint32_t kWeightCache = 0,
+    uint32_t kWarpCombine = 0,
+    uint32_t kPrefixSweep = 0,
+    uint32_t kProducerPrefix = 0,
+    uint32_t kSenderLdg = 0,
+    uint32_t kPrefixWide = 0,
+    uint32_t kCachePriority = 0,
+    uint32_t kGroupPriority = 0,
+    uint32_t kReturnWide = 0,
+    uint32_t kReturnWarpgroupSync = 0,
+    uint32_t kBalanceEpilogue = 0,
+    uint32_t kExtentActivationTMA = 0,
+    uint32_t kLateCountLane = 0,
+    uint32_t kFC2StageReady = 0,
+    uint32_t kActivationIssuers = 1,
+    uint32_t kMetadataRowPartitions = 1,
+    uint32_t kWeightStages = 0,
+    uint32_t kActivationCreditLimit = 0,
+    uint32_t kFC2CreditOnly = 0,
+    uint32_t kRelaxedPoll = 0,
+    uint32_t kSendMiddleFirst = 0,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -94,7 +158,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             unsigned long long* debug_timings,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+                            const __grid_constant__ std::conditional_t<(kExtentActivationTMA != 0),
+                                layout::TmaDescriptors<cute::TmaDescriptor, BLOCK_M / 16>,
+                                cute::TmaDescriptor> tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights_sf,
@@ -105,8 +171,74 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights_sf) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     DG_STATIC_ASSERT(kAllPush, "This implementation requires all-push storage");
+    DG_STATIC_ASSERT(kLinearSource <= 1, "Invalid source decoding choice");
+    DG_STATIC_ASSERT(kInterleaveM <= 1, "Invalid tile order choice");
+    DG_STATIC_ASSERT(kNarrowSf <= 3, "Invalid SF worker split");
+    DG_STATIC_ASSERT(kCoalescedSf <= 2, "Invalid SF packing order");
+    DG_STATIC_ASSERT(kPrefetchSend <= 1, "Invalid sender prefetch setting");
+    DG_STATIC_ASSERT(kHalfWarp <= 1, "Invalid validator row ownership");
+    DG_STATIC_ASSERT(kStickyValidation <= 1, "Invalid sticky validation option");
+    DG_STATIC_ASSERT(kFullRowCombine <= 4, "Invalid combine row option");
+    DG_STATIC_ASSERT(kWeightCache <= 1, "Invalid weight cache option");
+    DG_STATIC_ASSERT(kReturnWarpgroupSync <= 1, "Invalid return synchronization option");
+    DG_STATIC_ASSERT(kBalanceEpilogue <= 1, "Invalid epilogue balance option");
+    DG_STATIC_ASSERT(kLateCountLane <= 1, "Invalid count lane option");
+    DG_STATIC_ASSERT(kFC2StageReady <= 1, "Invalid FC2 readiness option");
+    DG_STATIC_ASSERT((kActivationIssuers == 1 || kActivationIssuers == 2 || kActivationIssuers == 4) &&
+                     kActivationIssuers <= kNumDispatchWarps && kActivationIssuers <= kNumStages &&
+                     (kActivationIssuers == 1 || (kFullActivationTMA && !kUnifiedTMA)),
+                     "Activation issuers require existing dispatch warps and separate full-box loads");
+#ifdef IKET_BUILD_ENABLED
+    DG_STATIC_ASSERT(kActivationIssuers == 1, "Multiple activation issuers need a separate profile marker contract");
+#endif
+    DG_STATIC_ASSERT(kExtentActivationTMA <= 2 && (!kExtentActivationTMA ||
+                     (kFullActivationTMA && BLOCK_M % 16 == 0 && BLOCK_K == 128)),
+                     "Extent TMA requires full boxes and one FP8 inner atom");
+    const auto l1_activation_map = [&](const uint32_t aligned_rows) -> const cute::TmaDescriptor* {
+        if constexpr (kExtentActivationTMA)
+            return &tensor_map_l1_acts.maps[aligned_rows / 16 - 1];
+        else
+            return &tensor_map_l1_acts;
+    };
+    DG_STATIC_ASSERT(kPrefixSweep <= 1 && (!kPrefixSweep || !kPrefetchSend),
+                     "Prefix sweep requires ordinary sender retirement");
+    DG_STATIC_ASSERT(kProducerPrefix <= 1 && (!kProducerPrefix ||
+                     (kHidden == 4096 && kFirstReadinessWindowBytes == 1024 &&
+                      !kPrefixSweep && !kPrefetchSend)),
+                     "Invalid producer prefix option");
+    DG_STATIC_ASSERT(kSenderLdg <= 2 && (!kSenderLdg ||
+                     (kHidden == 4096 && !kProducerPrefix && !kPrefixSweep && !kPrefetchSend)),
+                     "Direct sender loads require ordinary full-row retirement");
+    DG_STATIC_ASSERT(kSenderLdg != 2 || (kNumMaxTokensPerRank % 8 == 0 && kFirstReadinessWindowBytes == 1024),
+                     "Wide sender vectors require aligned rows and a 1KB first window");
+    DG_STATIC_ASSERT(kPrefixWide <= 1 && (!kPrefixWide || (kHidden == 4096 &&
+                     kNumMaxTokensPerRank % 8 == 0 && kFirstReadinessWindowBytes == 1024)),
+                     "Wide prefix validation requires aligned rows and a 1KB first window");
+    DG_STATIC_ASSERT(kCachePriority <= 4 && (!kCachePriority || kPrioritizeExperts) &&
+                     ((kCachePriority != 1 && kCachePriority != 3) ||
+                      kNumMaxPoolTokens >= 4ull * kNumMaxTokensPerRank),
+                     "Invalid priority cache mode or global key capacity");
+    DG_STATIC_ASSERT(kCachePriority != 4 || (kNumTopk % 4 == 0 && kHidden % 1024 == 0), "Priority vector alignment");
+    DG_STATIC_ASSERT(kGroupPriority <= 2 && (!kGroupPriority || kPrioritizeExperts),
+                     "Grouped priority atomics require prioritized queues");
+    DG_STATIC_ASSERT(kWarpCombine <= 4 && (!kWarpCombine || kInbandCombine) &&
+                     (kWarpCombine < 2 || kFullRowCombine != 0),
+                     "Warp-local combine requires in-band payloads");
+    DG_STATIC_ASSERT((kFirstReadinessWindowBytes == 512 || kFirstReadinessWindowBytes == 1024) &&
+                     kFirstReadinessWindowBytes % BLOCK_K == 0, "Invalid first readiness window");
+    DG_STATIC_ASSERT(kCacheDestinations <= 1 && (!kCacheDestinations || kInbandCombine),
+                     "Destination cache requires banked in-band combine");
+    DG_STATIC_ASSERT(kReturnWide <= 1 && (!kReturnWide || kInbandCombine) && (kReturnWide != 1 || (
+                     STORE_BLOCK_M % 16 == 0 && kHidden % 1024 == 0 &&
+                     kIntermediateHidden % 128 == 0 && kNumPaddedSFPoolTokens % 32 == 0 && kNumMaxTokensPerRank % 8 == 0)),
+                     "Wide return requires aligned in-band rows and sixteen-row staging");
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
+    constexpr bool kSplitPipeline = kWeightStages != 0;
+    constexpr uint32_t kNumWeightStages = kSplitPipeline ? kWeightStages : kNumStages;
+    DG_STATIC_ASSERT(!kSplitPipeline || (kFullActivationTMA &&
+                     kNumStages >= 2 && kNumWeightStages >= 2 && kNumWeightStages <= 32),
+                     "Separate weight stages require complete activation boxes and operand barriers");
 
     DG_STATIC_ASSERT(kRoutesPrepared && kRouteReadyDispatch && kRankReadyRoutePublish,
                      "All-push requires prepared rank-ready routes");
@@ -115,8 +247,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         static_cast<uint64_t>(kNumRanks) * kNumMaxTokensPerRank * kNumTopk <= 0xffffffffu,
         "Dense source descriptor exceeds uint32");
 
-    constexpr uint32_t kMetadataExpertCTAs = kNumExpertsPerRank < 2 * kNumRanks ? kNumExpertsPerRank : 2 * kNumRanks;
+    constexpr uint32_t kMetadataExpertCTAs = kNumDispatchExpertCTAs;
     constexpr uint32_t kMetadataCTAs = 2 * kMetadataExpertCTAs;
+    DG_STATIC_ASSERT(kMetadataRowPartitions == 1 || (kFullActivationTMA &&
+                     !kResetRows && !kCoalescedSf && !kComputeWarmupRounds),
+                     "Row partitions require ordinary full-activation materialization");
+    constexpr uint32_t kSfReadyMask = dispatch_ready_mask<kMetadataRowPartitions>(kDispatchSfReady);
+    constexpr uint32_t kFirstAReadyMask = dispatch_ready_mask<kMetadataRowPartitions>(kDispatchFirstAReady);
+    constexpr uint32_t kMiddleAReadyMask = dispatch_ready_mask<kMetadataRowPartitions>(kDispatchMiddleAReady);
+    constexpr uint32_t kTailAReadyMask = dispatch_ready_mask<kMetadataRowPartitions>(kDispatchTailAReady);
     constexpr uint64_t kSourceL1Tokens = 2ull * kNumRanks * kNumMaxTokensPerRank;
     constexpr uint64_t kSourceStorageRows = (kSourceL1Tokens * (kHidden + kHidden / 32) + kHidden - 1) / kHidden;
     constexpr uint64_t kFinalL1Tokens = kSourceStorageRows > kNumMaxPoolTokens ?
@@ -130,9 +269,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     DG_STATIC_ASSERT(not kInbandCombine or kRankGatedCombine,
                      "In-band combine requires rank-ready routes and ordered arena invocations");
+    DG_STATIC_ASSERT(!kDedicatedDispatch || (kUnifiedTMA && kFullActivationTMA &&
+                     !kComputeWarmupRounds && !kComputeBusySenderCTAs && !kComputeCTAOffset),
+                     "Dedicated dispatch requires unified TMA and uniform compute scheduling");
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const uint32_t sm_idx = blockIdx.x;
+    DG_STATIC_ASSERT(kComputeCTAOffset < kNumSMs && kComputeCTAOffset % 2 == 0,
+                     "Compute rotation must preserve adjacent CTA pairs");
+    const uint32_t compute_sm_idx = kComputeCTAOffset == 0 ? sm_idx : (sm_idx + kComputeCTAOffset) % kNumSMs;
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx = ptx::get_lane_idx();
@@ -141,7 +286,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Let a compute warp prefetch while dispatch starts its routing exchange.
     if (warp_idx == kNumDispatchWarps) {
-        cute::prefetch_tma_descriptor(&tensor_map_l1_acts);
+        if constexpr (kExtentActivationTMA == 1) {
+            #pragma unroll
+            for (uint32_t rows = 16; rows <= BLOCK_M; rows += 16)
+                cute::prefetch_tma_descriptor(l1_activation_map(rows));
+        } else if constexpr (kExtentActivationTMA == 0) {
+            cute::prefetch_tma_descriptor(l1_activation_map(BLOCK_M));
+        }
+        // Mode 2 leaves extent descriptors to demand fetch, avoiding startup
+        // prefetches for row extents that this CTA may never use.
 
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights_sf);
@@ -254,7 +407,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(BLOCK_N % kSwizzleCDMode == 0, "Invalid block N");
 
     // Epilogue configs
-    constexpr uint32_t kNumEpilogueStages = 2;
+    DG_STATIC_ASSERT(kNumEpilogueStages >= 1 && kNumEpilogueStages <= 3, "Invalid accumulator depth");
     constexpr uint32_t kNumTMAStoreStages = 2;
 
     // Shared memory
@@ -279,7 +432,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_L1_SIZE > SMEM_CD_L2_SIZE ? SMEM_CD_L1_SIZE : SMEM_CD_L2_SIZE;
     constexpr uint32_t SMEM_CD_L1_SIZE_PER_STAGE = SMEM_CD_L1_SIZE / kNumTMAStoreStages;
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
-        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+        SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
+        kNumStages * SMEM_A_SIZE_PER_STAGE + kNumWeightStages * SMEM_B_SIZE_PER_STAGE;
     DG_STATIC_ASSERT(SMEM_CD_SIZE % kSharedMemoryAlignment == 0 and
                      SMEM_A_SIZE_PER_STAGE % kSharedMemoryAlignment == 0 and
                      SMEM_B_SIZE_PER_STAGE % kSharedMemoryAlignment == 0,
@@ -320,7 +474,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // SF shared memory: SFA and SFB per pipeline stage
     auto sf_start_ptr = math::advance_ptr<uint8_t>(smem_gemm_base,
-        SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE));
+        SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + kNumWeightStages * SMEM_B_SIZE_PER_STAGE);
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<uint32_t*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
@@ -329,7 +483,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     });
 
     // Epilogue amax reduction shared memory
-    auto smem_amax_reduction = reinterpret_cast<float2*>(smem_sfb[kNumStages]);
+    auto smem_amax_reduction = reinterpret_cast<float2*>(smem_sfb[kNumWeightStages]);
 
     // CTA combine uses one barrier per selected expert. Some Qwen3.5
     // geometries have four epilogue warps but ten selected experts.
@@ -345,7 +499,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     auto tmem_full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + i); });
     auto tmem_empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages + i); });
     auto combine_barriers       = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + i); });
-    auto tmem_ptr_in_smem       = reinterpret_cast<uint32_t*>(barrier_start_ptr + kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumCombineBarriers);
+    auto weight_barrier_start = barrier_start_ptr +
+        (kNumDispatchWarps + kNumStages * 2 + kNumEpilogueStages * 2 + kNumCombineBarriers);
+    auto weight_full_barriers = utils::PatternVisitor([=](const uint32_t& i) {
+        return kSplitPipeline ? weight_barrier_start + i : full_barriers[i];
+    });
+    auto weight_empty_barriers = utils::PatternVisitor([=](const uint32_t& i) {
+        return kSplitPipeline ? weight_barrier_start + kNumWeightStages + i : empty_barriers[i];
+    });
+    auto tmem_ptr_in_smem = reinterpret_cast<uint32_t*>(weight_barrier_start +
+        (kSplitPipeline ? 2 * kNumWeightStages : 0));
 
     // A cluster sync is essential for 2CTA tensor memory allocation
     comm::cluster_sync_with_relaxed_arrive();
@@ -363,8 +526,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = 0; i < kNumStages; ++ i) {
                 // Arrive at all CTAs
-                full_barriers[i]->init(2 * 2);
+                // A multiwave activation issuer must participate even in FC2;
+                // observing empty phases alone allows the other warps to lap it.
+                full_barriers[i]->init((kNumExpertsPerWave == kNumExpertsPerRank || kUnifiedTMA ? 4 : 6) -
+                    (kSplitPipeline ? 2 : 0));
                 empty_barriers[i]->init(1);
+            }
+            if constexpr (kSplitPipeline) {
+                #pragma unroll
+                for (uint32_t i = 0; i < kNumWeightStages; ++i) {
+                    weight_full_barriers[i]->init(2);  // One weight producer in each CTA.
+                    weight_empty_barriers[i]->init(1);
+                }
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
@@ -382,30 +555,48 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, tmem_ptr_in_smem);
     }
+    // Adjust registers
+    constexpr uint32_t kNumNonEpilogueRegisters = 40;
+    constexpr uint32_t kNumEpilogueRegisters = kDedicatedDispatch ? 168 : 208;
+    constexpr uint32_t kNumDispatchRegisters = kDedicatedDispatch ? 128 : 48;
+    DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
+                     kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
+                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
+                     "Too many registers");
+
+    // Set the dispatch register budget before transport so epilogue allocation can overlap it.
+    if constexpr (kDedicatedDispatch) {
+        if (warp_idx < kNumDispatchWarps)
+            cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+    }
     // NOTES: Using `.relaxed` is allowed here since `fence_barrier_init` is `.release.cluster`,
     // and `barrier.cluster.wait.aligned` is by default `.acquire`
     // Startup uses disjoint scratch and can overlap other warps' initialization.
     cute::cluster_arrive_relaxed();
 
     {
-        constexpr uint32_t kRefiners = layout::Workspace::genphase_pusher_ctas(kNumMaxTokensPerRank);
-        constexpr uint32_t kWorkerThread = kNumDispatchThreads + kNumNonEpilogueThreads;
+        constexpr uint32_t kRefiners = kNumDispatchPushCTAs;
+        constexpr uint32_t kWorkerThread = kDedicatedDispatch ? 0 : kNumDispatchThreads + kNumNonEpilogueThreads;
         constexpr uint32_t kScratchOffset = math::constexpr_align<uint32_t>(kNumExpertsPerRank * sizeof(uint32_t), 128u);
         constexpr uint32_t kScratchBytes = 128 + 4 * (kHidden + kHidden / 32);
         DG_STATIC_ASSERT(kNumDispatchThreads == 128 && kNumEpilogueThreads >= 256,
                          "Wide metadata requires two complete epilogue warpgroups");
-        DG_STATIC_ASSERT(kNumSMs >= kMetadataCTAs + 1 + kRefiners, "Insufficient dispatch participants");
+        DG_STATIC_ASSERT(kRefiners > 0 && kNumSMs >= kMetadataCTAs + 1 + kRefiners,
+                         "Invalid dispatch participant count");
         DG_STATIC_ASSERT(kScratchOffset + kScratchBytes <= SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE,
                          "Concurrent dispatch scratch overlaps GEMM storage");
-        // Epilogue has no accumulator yet: both warpgroups validate metadata
-        // payloads; sender/helper CTAs use only the first. Scratch stays disjoint.
-        // Dispatch overlaps the final initialization rendezvous in disjoint scratch.
-        const uint32_t worker_threads = sm_idx < kMetadataCTAs ? 256 : 128;
+        // Unified TMA frees dispatch warps for transport; the original path
+        // borrows epilogue warps until startup completes. Scratch stays disjoint.
+        const uint32_t worker_threads = !kDedicatedDispatch && sm_idx < kMetadataCTAs ? 256 : 128;
         if (sm_idx < kMetadataCTAs + 1 + kRefiners &&
             thread_idx >= kWorkerThread && thread_idx < kWorkerThread + worker_threads) {
             mega_moe_dispatch<kNumMaxTokensPerRank, kHidden, kNumExperts,
-                kNumTopk, kNumRanks, BLOCK_M, kNumPaddedSFPoolTokens, kRefiners, (kResetRows != 0)>(
-                    num_tokens, sym_buffer, smem_buffer + kScratchOffset, thread_idx - kWorkerThread);
+                kNumTopk, kNumRanks, BLOCK_M, kNumPaddedSFPoolTokens, kRefiners, kMetadataExpertCTAs,
+                (kResetRows != 0), kPrioritizeExperts, (kDedicatedDispatch != 0), (kLinearSource != 0),
+                (kCacheDestinations != 0), kNarrowSf, kCoalescedSf,
+                (kPrefetchSend != 0), kMiddlePayloadWindowEnd, (kHalfWarp != 0), kFirstReadinessWindowBytes, (kStickyValidation != 0), (kPrefixSweep != 0), (kProducerPrefix != 0), kSenderLdg, (kPrefixWide != 0), kCachePriority, kGroupPriority, kMetadataRowPartitions, (kSendMiddleFirst != 0)>(
+                    num_tokens, sym_buffer, smem_buffer + kScratchOffset, thread_idx - kWorkerThread,
+                    combine_token_buffer);
             if (thread_idx / 32 == kWorkerThread / 32)
                 MEGAMOE_IKET_MARK(MegaDispatchEnd);
         }
@@ -422,34 +613,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Aggregate each local expert once per CTA, then share exact totals with
     // every scheduler role through the existing expert-count shared memory.
     {
-        if (warp_idx == 0) {
+        // An idle compute warp publishes counts while dispatch performs transport.
+        constexpr uint32_t kCountWarp = kDedicatedDispatch ? kNumDispatchWarps + 3 : 0;
+        if (warp_idx == kCountWarp) {
             MEGAMOE_IKET_DETAIL_MARK(MegaMetadataStart);
             // The producer's all-rank SYS release already finalizes dense counts.
             // Acquire it directly, as pull does; no local SizesReady relay is
             // needed before this warp reads those same immutable counters.
             while (ptx::ld_acq_sys(workspace.get_route_ready_count_ptr()) != kNumRanks);
             MEGAMOE_IKET_MARK(MegaMetadataAcquired);
-            for (uint32_t local_expert_idx = lane_idx;
+            uint32_t count_lane = lane_idx;
+            // Producer/transport changes can extend this address across register
+            // changes. Recompute it at its actual use.
+            if constexpr (kLateCountLane)
+                asm volatile("mov.u32 %0, %%laneid;" : "=r"(count_lane));
+            for (uint32_t local_expert_idx = count_lane;
                  local_expert_idx < kNumExpertsPerRank;
                  local_expert_idx += 32) {
-                {
-                    // The existing all-rank acquire orders descriptor allocation and stores.
-                    smem_expert_count[local_expert_idx] = static_cast<uint32_t>(
-                        ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(local_expert_idx)));
-                }
+                // The existing all-rank acquire orders descriptor allocation and stores.
+                smem_expert_count[local_expert_idx] = static_cast<uint32_t>(
+                    ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(local_expert_idx)));
             }
         }
-        {
-            // One release arrival from each metadata-writing lane. Consumers
-            // acquire the count stores without waiting for startup workers.
-            // CUTLASS's inline PTX wrappers omit compiler memory clobbers.
-            // Keep the generic shared stores/loads on the ordered side too.
-            asm volatile("" ::: "memory");
-            if (warp_idx == 0)
-                dispatch_barriers[0]->arrive();
-            dispatch_barriers[0]->wait(0);
-            asm volatile("" ::: "memory");
-        }
+        // One release arrival from each metadata-writing lane. Consumers
+        // acquire the count stores without waiting for startup workers.
+        // CUTLASS's inline PTX wrappers omit compiler memory clobbers.
+        // Keep the generic shared stores/loads on the ordered side too.
+        asm volatile("" ::: "memory");
+        if (warp_idx == kCountWarp)
+            dispatch_barriers[0]->arrive();
+        dispatch_barriers[0]->wait(0);
+        asm volatile("" ::: "memory");
     }
 
     // Task scheduler
@@ -462,16 +656,72 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSMs, kNumRanks,
         /* kRecvCountHighTarget = */ kNumSMs * kNumRanks,
         /* kAcquireRecvCounts = */ kRouteReadyDispatch,
-        /* kRankReadyRecvCounts = */ kRankReadyRoutePublish>(workspace, smem_expert_count);
+        /* kRankReadyRecvCounts = */ kRankReadyRoutePublish,
+        layout::Workspace, (kComputeWarmupRounds != 0), (kInterleaveM != 0),
+        (kLateCountLane != 0)>(workspace, smem_expert_count);
+    // Put the shorter tail assignments on receivers without moving dispatch,
+    // combine or cleanup ownership. Every role in a CTA uses the same rotation.
+    scheduler.block_idx = compute_sm_idx;
+    if constexpr (kComputeWarmupRounds != 0) {
+        DG_STATIC_ASSERT(kComputeCTAOffset == 0 && kMetadataExpertCTAs % 2 == 0,
+                         "Startup assignment requires even receiver groups and no separate rotation");
+        // Estimate busy receiver pairs; a routing imbalance changes the load
+        // balance, never tile ownership. Optionally include the helper/sender
+        // pairs, whose epilogue warps remain occupied by dispatch.
+        DG_STATIC_ASSERT(kComputeBusySenderCTAs == 0 ||
+            (kComputeBusySenderCTAs == math::constexpr_align(kNumDispatchPushCTAs + 1, 2u) &&
+             kNumSMs > 2 * kMetadataExpertCTAs + kComputeBusySenderCTAs),
+            "Busy senders require complete CTA pairs and remaining fast CTAs");
+        const uint32_t active_workers = cute::min(kMetadataExpertCTAs, math::align<uint32_t>(
+            kNumExpertsPerRank * math::ceil_div(num_tokens * kNumRanks * kNumTopk, kNumExperts * BLOCK_M), 2u));
+        const uint32_t fast_ctas = kNumSMs - 2 * active_workers - kComputeBusySenderCTAs;
+        const uint32_t logical_idx = sm_idx < active_workers ? fast_ctas + sm_idx
+            : sm_idx < kMetadataExpertCTAs ? sm_idx - active_workers
+            : sm_idx < kMetadataExpertCTAs + active_workers
+                ? fast_ctas + active_workers + sm_idx - kMetadataExpertCTAs
+            : sm_idx < 2 * kMetadataExpertCTAs ? sm_idx - 2 * active_workers
+            : sm_idx < 2 * kMetadataExpertCTAs + kComputeBusySenderCTAs
+                ? fast_ctas + 2 * active_workers + sm_idx - 2 * kMetadataExpertCTAs
+                : sm_idx - 2 * active_workers - kComputeBusySenderCTAs;
+        const bool busy = logical_idx >= fast_ctas;
+        scheduler.block_idx = logical_idx + (busy ? kComputeWarmupRounds * fast_ctas : 0);
+        scheduler.initial_stride = fast_ctas;
+        scheduler.initial_blocks = busy ? 0 : kComputeWarmupRounds;
+    }
 
     // MMA pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0;
+    uint32_t weight_stage_idx = 0, weight_phase = 0;
+    DG_STATIC_ASSERT(kActivationCreditLimit == 0 ||
+                     (kActivationCreditLimit >= 2 && kActivationCreditLimit <= kNumStages),
+                     "Activation credit limit must fit the physical ring");
+    DG_STATIC_ASSERT(kFC2CreditOnly <= 1 && (!kFC2CreditOnly || kActivationCreditLimit),
+                     "FC2 credit scope requires an activation credit limit");
+    auto limit_activation_lookahead = [&](const sched::BlockPhase& block_phase) {
+        if constexpr (kActivationCreditLimit != 0 && kActivationCreditLimit < kNumStages) {
+            if (!kFC2CreditOnly || block_phase == sched::BlockPhase::Linear2) {
+                // Wait for stage t-limit, retaining the original physical-slot wait.
+                const bool previous_cycle = stage_idx < kActivationCreditLimit;
+                const uint32_t credit_idx = previous_cycle
+                    ? stage_idx + kNumStages - kActivationCreditLimit
+                    : stage_idx - kActivationCreditLimit;
+                empty_barriers[credit_idx]->wait(phase ^ static_cast<uint32_t>(previous_cycle));
+            }
+        }
+    };
     auto advance_pipeline = [&](uint32_t& k_block_idx) {
         ++ k_block_idx;
 
         // Flip phases only if reach the next first stage
         stage_idx = stage_idx == kNumStages - 1 ? 0 : stage_idx + 1;
         phase ^= stage_idx == 0;
+        if constexpr (kSplitPipeline) {
+            weight_stage_idx = weight_stage_idx == kNumWeightStages - 1 ? 0 : weight_stage_idx + 1;
+            weight_phase ^= weight_stage_idx == 0;
+        } else {
+            weight_stage_idx = stage_idx;
+            weight_phase = phase;
+        }
     };
 
     // Intra-SM Barrier indices
@@ -485,15 +735,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kBeforeCombineReduceBarrierTag = 2;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 3;
 
-    // Adjust registers
-    constexpr uint32_t kNumNonEpilogueRegisters = 40;
-    constexpr uint32_t kNumEpilogueRegisters = 208;
-    constexpr uint32_t kNumDispatchRegisters = 48;
-    DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
-                     kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
-                     "Too many registers");
-
     // Grid sync index assignments (dispatch and epilogue use separate counters to avoid conflicts)
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
@@ -501,82 +742,118 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
     // Different warp roles
     if (warp_idx < kNumDispatchWarps) {
-        // Adjust registers
-        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+        if constexpr (!kDedicatedDispatch)
+            cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
         // Only the legacy NVLink barriers share a signal phase.
         if constexpr (not kRankGatedCombine)
             ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
         uint32_t expert_pool_block_offset = 0;
-        {
-            // SF is packed once by the tile's worker. Keep regular activation
-            // TMA independent; the coordinator continues to issue SF TMA.
-            DG_STATIC_ASSERT(LOAD_BLOCK_M * 2 == BLOCK_M && LOAD_BLOCK_M % 8 == 0, "Eight-row TMA boxes must fit the owned tile");
-            DG_STATIC_ASSERT(kNumExpertsPerWave == kNumExpertsPerRank,
-                             "Independent activation TMA requires one expert wave");
-            MEGAMOE_IKET_FIRST(first_gather);
-            MEGAMOE_IKET_FIRST(first_remainder);
-            MEGAMOE_IKET_FIRST(first_tail);
-            scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
-                                         const uint32_t&, const uint32_t& num_k_blocks,
-                                         const uint32_t& m_block_idx, const uint32_t&) {
-                const uint32_t pool_block = scheduler.get_current_pool_block_offset() + m_block_idx;
-                const bool issues_activation = warp_idx == 0;
-                const uint32_t rows = scheduler.template get_valid_m<true>() / 2;
-                uint32_t materialized_row = 0;
-                if (block_phase == sched::BlockPhase::Linear1 && issues_activation) {
-                    // Eight-row boxes cover exactly the aligned MMA extent.
-                    // Acquire the first window; later windows are acquired at their K boundaries.
-                    MEGAMOE_IKET_ONCE(MegaIndicesReady, first_gather);
-                    const uint32_t peer_offset = is_leader_cta ? 0 : scheduler.template get_valid_m<true>() / 2;
-                    materialized_row = static_cast<uint32_t>(workspace.get_source_l1_row(sym_buffer.rank_idx, num_tokens) +
-                                                             pool_block * BLOCK_M + peer_offset);
-                    while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kDispatchFirstAReady) == 0);
+        // SF is packed once by the tile's worker. Keep regular activation
+        // TMA independent; the coordinator continues to issue SF TMA.
+        DG_STATIC_ASSERT(LOAD_BLOCK_M * 2 == BLOCK_M && LOAD_BLOCK_M % 8 == 0, "Eight-row TMA boxes must fit the owned tile");
+        MEGAMOE_IKET_FIRST(first_gather);
+        MEGAMOE_IKET_FIRST(first_remainder);
+        MEGAMOE_IKET_FIRST(first_tail);
+        scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
+                                     const uint32_t& local_expert_idx, const uint32_t& num_k_blocks,
+                                     const uint32_t& m_block_idx, const uint32_t&) {
+            const uint32_t pool_block = scheduler.get_current_pool_block_offset() + m_block_idx;
+            const bool issues_activation = warp_idx < kActivationIssuers && !kUnifiedTMA;
+            const uint32_t rows = scheduler.template get_valid_m<true>() / 2;
+            uint32_t materialized_row = 0;
+            uint32_t acquired_windows = 0;
+            if (block_phase == sched::BlockPhase::Linear1 && issues_activation) {
+                // Both box shapes cover the aligned MMA extent.
+                // Acquire the first window; later windows are acquired at their K boundaries.
+                MEGAMOE_IKET_ONCE(MegaIndicesReady, first_gather);
+                const uint32_t peer_offset = is_leader_cta ? 0 : scheduler.template get_valid_m<true>() / 2;
+                materialized_row = static_cast<uint32_t>(workspace.get_source_l1_row(sym_buffer.rank_idx, num_tokens) +
+                                                         pool_block * BLOCK_M + peer_offset);
+                if constexpr (kRelaxedPoll & 1)
+                    wait_ready_mask_relaxed<uint32_t>(workspace.get_l1_arrival_count_ptr(pool_block), kFirstAReadyMask);
+                else
+                    while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kFirstAReadyMask) != kFirstAReadyMask);
+                __syncwarp();
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                MEGAMOE_IKET_ONCE(MegaPayloadReady, first_gather);
+            }
+            for (uint32_t k = 0; k < num_k_blocks; advance_pipeline(k)) {
+                if (!issues_activation) continue;
+                // A physical slot keeps its owner through every phase and
+                // FC1/FC2 wave. Its producer cannot be lapped on slot reuse.
+                if constexpr (kActivationIssuers > 1)
+                    if (stage_idx % kActivationIssuers != warp_idx) continue;
+                if (block_phase != sched::BlockPhase::Linear1) {
+                    // Coordinator owns FC2 loads. Arrival credit prevents
+                    // phase reuse before this issuer advances to the next wave.
+                    if constexpr (kNumExpertsPerWave != kNumExpertsPerRank) {
+                        empty_barriers[stage_idx]->wait(phase ^ 1);
+                        limit_activation_lookahead(block_phase);
+                        if (cute::elect_one_sync()) full_barriers[stage_idx]->arrive(0u);
+                        __syncwarp();
+                    }
+                    continue;
+                }
+                DG_STATIC_ASSERT(BLOCK_K <= kFirstReadinessWindowBytes && kFirstReadinessWindowBytes % BLOCK_K == 0,
+                                 "Readiness window must contain complete TMA stages");
+                if (kActivationIssuers == 1 ? k == kFirstReadinessWindowBytes / BLOCK_K :
+                    k >= kFirstReadinessWindowBytes / BLOCK_K && !(acquired_windows & kMiddleAReadyMask)) {
+                    MEGAMOE_IKET_ONCE(MegaWindowWaitStart, first_remainder);
+                    if constexpr (kRelaxedPoll & 1)
+                        wait_ready_mask_relaxed<uint32_t>(workspace.get_l1_arrival_count_ptr(pool_block), kMiddleAReadyMask);
+                    else
+                        while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kMiddleAReadyMask) != kMiddleAReadyMask);
                     __syncwarp();
                     asm volatile("fence.proxy.async.global;" ::: "memory");
-                    MEGAMOE_IKET_ONCE(MegaPayloadReady, first_gather);
+                    MEGAMOE_IKET_ONCE(MegaWindowReady, first_remainder);
+                    MEGAMOE_IKET_DONE(first_remainder);
+                    if constexpr (kActivationIssuers > 1) acquired_windows |= kMiddleAReadyMask;
                 }
-                for (uint32_t k = 0; k < num_k_blocks; advance_pipeline(k)) {
-                    if (block_phase != sched::BlockPhase::Linear1 || !issues_activation) continue;
-                    DG_STATIC_ASSERT(BLOCK_K <= kFirstPayloadWindowBytes && kFirstPayloadWindowBytes % BLOCK_K == 0,
-                                     "Readiness window must contain complete TMA stages");
-                    if (k == kFirstPayloadWindowBytes / BLOCK_K) {
-                        MEGAMOE_IKET_ONCE(MegaWindowWaitStart, first_remainder);
-                        while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kDispatchMiddleAReady) == 0);
+                if constexpr (kHidden > kMiddlePayloadWindowEnd) {
+                    DG_STATIC_ASSERT(kMiddlePayloadWindowEnd % BLOCK_K == 0,
+                                     "Tail readiness must align with complete TMA stages");
+                    if (kActivationIssuers == 1 ? k == kMiddlePayloadWindowEnd / BLOCK_K :
+                        k >= kMiddlePayloadWindowEnd / BLOCK_K && !(acquired_windows & kTailAReadyMask)) {
+                        MEGAMOE_IKET_ONCE(MegaWindowWaitStart, first_tail);
+                        if constexpr (kRelaxedPoll & 1)
+                            wait_ready_mask_relaxed<uint32_t>(workspace.get_l1_arrival_count_ptr(pool_block), kTailAReadyMask);
+                        else
+                            while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kTailAReadyMask) != kTailAReadyMask);
                         __syncwarp();
                         asm volatile("fence.proxy.async.global;" ::: "memory");
-                        MEGAMOE_IKET_ONCE(MegaWindowReady, first_remainder);
-                        MEGAMOE_IKET_DONE(first_remainder);
+                        MEGAMOE_IKET_ONCE(MegaWindowReady, first_tail);
+                        MEGAMOE_IKET_DONE(first_tail);
+                        if constexpr (kActivationIssuers > 1) acquired_windows |= kTailAReadyMask;
                     }
-                    if constexpr (kHidden > kMiddlePayloadWindowEnd) {
-                        DG_STATIC_ASSERT(kMiddlePayloadWindowEnd % BLOCK_K == 0,
-                                         "Tail readiness must align with complete TMA stages");
-                        if (k == kMiddlePayloadWindowEnd / BLOCK_K) {
-                            MEGAMOE_IKET_ONCE(MegaWindowWaitStart, first_tail);
-                            while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block)) & kDispatchTailAReady) == 0);
-                            __syncwarp();
-                            asm volatile("fence.proxy.async.global;" ::: "memory");
-                            MEGAMOE_IKET_ONCE(MegaWindowReady, first_tail);
-                            MEGAMOE_IKET_DONE(first_tail);
-                        }
-                    }
-                    empty_barriers[stage_idx]->wait(phase ^ 1);
-                    if (cute::elect_one_sync()) {
+                }
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+                limit_activation_lookahead(block_phase);
+                if (cute::elect_one_sync()) {
+                    if constexpr (kFullActivationTMA) {
+                        // One issue; the extent descriptor omits rows beyond
+                        // the aligned MMA extent while retaining physical staging.
+                        tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
+                            l1_activation_map(rows * 2), full_barriers[stage_idx], smem_a[stage_idx],
+                            k * BLOCK_K, materialized_row, 2);
+                    } else {
                         #pragma unroll
                         for (uint32_t row = 0; row < LOAD_BLOCK_M; row += 8) {
                             if (row < rows)
                                 tma::copy<BLOCK_K, 8, kSwizzleAMode, a_dtype_t>(
-                                    &tensor_map_l1_acts, full_barriers[stage_idx], smem_a[stage_idx] + row * BLOCK_K,
+                                    l1_activation_map(rows * 2), full_barriers[stage_idx], smem_a[stage_idx] + row * BLOCK_K,
                                     k * BLOCK_K, materialized_row + row, 2);
                         }
                     }
-                    __syncwarp();
-                    MEGAMOE_IKET_ONCE(MegaGatherIssued, first_gather);
-                    MEGAMOE_IKET_DONE(first_gather);
+                    if constexpr (kNumExpertsPerWave != kNumExpertsPerRank)
+                        full_barriers[stage_idx]->arrive(0u);
                 }
-            });
-        }
+                __syncwarp();
+                MEGAMOE_IKET_ONCE(MegaGatherIssued, first_gather);
+                MEGAMOE_IKET_DONE(first_gather);
+            }
+        });
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -712,15 +989,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        DG_STATIC_ASSERT(kUnifiedTMA <= 1 && (!kUnifiedTMA || kFullActivationTMA),
+                         "Unified TMA requires full activation boxes");
 
         // GEMM TMA load warp for tokens with SFA
         MEGAMOE_IKET_FIRST(first_tile);
+        MEGAMOE_IKET_FIRST(first_gather);
+        MEGAMOE_IKET_FIRST(first_remainder);
+        MEGAMOE_IKET_FIRST(first_tail);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
             const auto tensor_map_a_ptr = block_phase == sched::BlockPhase::Linear2
-                ? &tensor_map_l2_acts : &tensor_map_l1_acts;
+                ? &tensor_map_l2_acts : l1_activation_map(scheduler.template get_valid_m<true>());
             const auto tensor_map_sfa_ptr = block_phase == sched::BlockPhase::Linear2
                 ? &tensor_map_l2_acts_sf : &tensor_map_l1_acts_sf;
 
@@ -731,21 +1013,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Wait the entire token arrival for linear 1
             if (block_phase == sched::BlockPhase::Linear1) {
+                if constexpr (kUnifiedTMA)
+                    MEGAMOE_IKET_ONCE(MegaIndicesReady, first_tile);
                 const auto ptr = workspace.get_l1_arrival_count_ptr(pool_block_idx);
                 const auto expected = scheduler.template get_valid_m<false>();
                 {
                     // SF/index has its own bit; A publication is independent.
-                    while ((ptx::ld_acq(ptr) & kDispatchSfReady) == 0);
+                    constexpr uint32_t ready = kSfReadyMask | (kUnifiedTMA ? kFirstAReadyMask : 0u);
+                    if constexpr (kRelaxedPoll & 1)
+                        wait_ready_mask_relaxed<uint32_t>(ptr, ready);
+                    else
+                        while ((ptx::ld_acq(ptr) & ready) != ready);
                 }
                 {
                     __syncwarp();
                     asm volatile("fence.proxy.async.global;" ::: "memory");
+                    if constexpr (kUnifiedTMA)
+                        MEGAMOE_IKET_ONCE(MegaPayloadReady, first_tile);
                     // Packed-SF-ready observation, not a per-stage SMEM store.
                     MEGAMOE_IKET_ONCE(MegaGatherSfReady, first_tile);
                 }
                 MEGAMOE_IKET_DONE(first_tile);
 
-            } else {
+            } else if constexpr (!kFC2StageReady) {
                 // The L1 output's block N is halved into `BLOCK_K / 2`, so we have to wait 2x L1 blocks' arrival
                 // NOTES: Originally we wait blocks on-demand to overlap L1 calculation
                 // with L2, but this optimization is negative when `num_experts_per_wave`
@@ -757,13 +1047,62 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // NOTES: Equivalent to `(1ull << (2 * num_k_blocks)) - 1`, but split into two shifts
                 // to avoid undefined behavior when `num_k_blocks == 32`
                 const uint64_t expected = ((1ull << num_k_blocks) << num_k_blocks) - 1;
-                while (ptx::ld_acq_gpu(ptr) != expected);
+                if constexpr (kRelaxedPoll & 2)
+                    wait_ready_mask_relaxed<uint64_t, true>(ptr, expected);
+                else
+                    while (ptx::ld_acq_gpu(ptr) != expected);
 
             }
 
+            // Each released bit covers one FC1 output block and its scales.
+            // Cache acquired arrivals: bits only accumulate until every CTA retires.
+            uint64_t l2_arrivals = 0;
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                if constexpr (kFC2StageReady) {
+                    if (block_phase == sched::BlockPhase::Linear2) {
+                        DG_STATIC_ASSERT(BLOCK_K == BLOCK_N && L2_SHAPE_K / BLOCK_K <= 32,
+                                         "Each FC2 slice needs two FC1 arrival bits");
+                        const uint64_t needed = 3ull << (2 * k_block_idx);
+                        if constexpr (kRelaxedPoll & 2) {
+                            if ((l2_arrivals & needed) != needed)
+                                l2_arrivals = wait_ready_mask_relaxed<uint64_t>(
+                                    workspace.get_l2_arrival_mask_ptr(pool_block_idx), needed);
+                        } else {
+                        while ((l2_arrivals & needed) != needed)
+                            l2_arrivals = ptx::ld_acq_gpu(workspace.get_l2_arrival_mask_ptr(pool_block_idx));
+                        }
+                    }
+                }
+                if constexpr (kUnifiedTMA) {
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        // The real producer owns every stage in both FC1 and FC2;
+                        // no separate activation observer can be lapped on wrap.
+                        const uint32_t bit = k_block_idx == kFirstReadinessWindowBytes / BLOCK_K
+                            ? kMiddleAReadyMask
+                            : k_block_idx == kMiddlePayloadWindowEnd / BLOCK_K && kHidden > kMiddlePayloadWindowEnd
+                                ? kTailAReadyMask : 0u;
+                        if (bit) {
+                            MEGAMOE_IKET_ONCE(MegaWindowWaitStart,
+                                bit == kMiddleAReadyMask ? first_remainder : first_tail);
+                            if constexpr (kRelaxedPoll & 1)
+                                wait_ready_mask_relaxed<uint32_t>(workspace.get_l1_arrival_count_ptr(pool_block_idx), bit);
+                            else
+                                while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block_idx)) & bit) != bit);
+                            __syncwarp();
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
+                            MEGAMOE_IKET_ONCE(MegaWindowReady,
+                                bit == kMiddleAReadyMask ? first_remainder : first_tail);
+                            if (bit == kMiddleAReadyMask) {
+                                MEGAMOE_IKET_DONE(first_remainder);
+                            } else {
+                                MEGAMOE_IKET_DONE(first_tail);
+                            }
+                        }
+                    }
+                }
                 // Wait consumer release
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                limit_activation_lookahead(block_phase);
 
                 // Compute token offset from pool block index
                 uint32_t m_idx = pool_block_idx * BLOCK_M;
@@ -773,6 +1112,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Add 2 CTA offsets for non-leader CTA
                 if (not is_leader_cta)
                     m_idx += scheduler.template get_valid_m<true>() / 2;
+                if constexpr (kUnifiedTMA) {
+                    if (block_phase == sched::BlockPhase::Linear1)
+                        m_idx += static_cast<uint32_t>(workspace.get_source_l1_row(sym_buffer.rank_idx, num_tokens));
+                }
 
                 {
                     if (block_phase == sched::BlockPhase::Linear1) {
@@ -781,15 +1124,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 if (cute::elect_one_sync()) {
-                    if (block_phase != sched::BlockPhase::Linear1)
+                    if (block_phase != sched::BlockPhase::Linear1 || kUnifiedTMA)
                         tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                             tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx], k_idx, m_idx, 2);
                     tma::copy<SF_BLOCK_M, 1, 0>(
-                        tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
+                        tensor_map_sfa_ptr, full_barriers[stage_idx],
+                        smem_sfa[stage_idx], sfa_m_idx, sfa_k_idx, 2);
                     if (is_leader_cta) {
-                        // Compact FC1 issues eight-row boxes only for the aligned
-                        // MMA extent; FC2 and pull keep their original full boxes.
-                        const uint32_t activation_bytes = block_phase == sched::BlockPhase::Linear1 ?
+                        // Both CTA boxes and the expected bytes use the same extent.
+                        const uint32_t activation_bytes = block_phase == sched::BlockPhase::Linear1 && (!kFullActivationTMA || kExtentActivationTMA) ?
                             scheduler.template get_valid_m<true>() * BLOCK_K * sizeof(a_dtype_t) : SMEM_A_SIZE_PER_STAGE * 2;
                         full_barriers[stage_idx]->arrive_and_expect_tx(activation_bytes + SF_BLOCK_M * sizeof(uint32_t) * 2);
                     } else {
@@ -797,6 +1140,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
                 __syncwarp();
+                if constexpr (kUnifiedTMA) {
+                    if (block_phase == sched::BlockPhase::Linear1) {
+                        MEGAMOE_IKET_ONCE(MegaGatherIssued, first_gather);
+                        MEGAMOE_IKET_DONE(first_gather);
+                    }
+                }
             }
         });
 
@@ -805,6 +1154,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         // GEMM TMA load warp for weights with SF
+        constexpr auto kWeightCacheHint = static_cast<uint64_t>(kWeightCache
+            ? cute::TMA::CacheHintSm100::EVICT_LAST : cute::TMA::CacheHintSm100::EVICT_NORMAL);
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -820,7 +1171,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
-                empty_barriers[stage_idx]->wait(phase ^ 1);
+                weight_empty_barriers[weight_stage_idx]->wait(weight_phase ^ 1);
 
                 // Compute weight offset
                 uint32_t n_idx = local_expert_idx * shape_n + n_block_idx * BLOCK_N;
@@ -830,17 +1181,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 // TMA copy weights with SF
                 if (cute::elect_one_sync()) {
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t>(
-                        tensor_map_b_ptr, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_idx, 2);
-                    tma::copy<BLOCK_N, 1, 0>(
-                        tensor_map_sfb_ptr, full_barriers[stage_idx], smem_sfb[stage_idx], sfb_n_idx, sfb_k_idx, 2);
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, false, kWeightCacheHint>(
+                        tensor_map_b_ptr, weight_full_barriers[weight_stage_idx], smem_b[weight_stage_idx], k_idx, n_idx, 2);
+                    tma::copy<BLOCK_N, 1, 0, uint32_t, false, kWeightCacheHint>(
+                        tensor_map_sfb_ptr, weight_full_barriers[weight_stage_idx],
+                        smem_sfb[weight_stage_idx], sfb_n_idx, sfb_k_idx, 2);
                     if (is_leader_cta) {
                         constexpr uint32_t kBArrivalBytes =
                             kUseFP8Weights ? SMEM_B_SIZE_PER_STAGE * 2 : SMEM_B_SIZE_PER_STAGE;
-                        full_barriers[stage_idx]->arrive_and_expect_tx(
+                        weight_full_barriers[weight_stage_idx]->arrive_and_expect_tx(
                             kBArrivalBytes + BLOCK_N * sizeof(uint32_t) * 2);
                     } else {
-                        full_barriers[stage_idx]->arrive(0u);
+                        weight_full_barriers[weight_stage_idx]->arrive(0u);
                     }
                 }
                 __syncwarp();
@@ -878,8 +1230,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              (kNumUTCCPAlignedElems * sizeof(uint32_t)) % 16 == 0,
                              "SF descriptor offsets require whole 16-byte units");
             DG_STATIC_ASSERT(static_cast<uint64_t>(SMEM_BEFORE_BARRIER_SIZE) +
-                             static_cast<uint64_t>(kNumStages) *
-                                 (SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE) < (1ull << 32),
+                             static_cast<uint64_t>(kNumStages) * SMEM_SFA_SIZE_PER_STAGE +
+                             static_cast<uint64_t>(kNumWeightStages) * SMEM_SFB_SIZE_PER_STAGE < (1ull << 32),
                              "SF address arithmetic must not wrap before scaling");
 
             DG_STATIC_ASSERT(kNumStages <= 32, "Too many stages");
@@ -892,7 +1244,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             DG_STATIC_ASSERT(SMEM_A_SIZE_PER_STAGE % 16 == 0 && SMEM_B_SIZE_PER_STAGE % 16 == 0,
                              "Descriptor stage strides must be in whole 16-byte units");
             DG_STATIC_ASSERT(static_cast<uint64_t>(kNumStages) * SMEM_A_SIZE_PER_STAGE <= 0xffffffffull &&
-                             static_cast<uint64_t>(kNumStages) * SMEM_B_SIZE_PER_STAGE <= 0xffffffffull,
+                             static_cast<uint64_t>(kNumWeightStages) * SMEM_B_SIZE_PER_STAGE <= 0xffffffffull,
                              "Byte-stride multiplication must not overflow before scaling");
 
             // Checks for MMA instructions
@@ -924,6 +1276,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         cutlass::arch::umma_arrive_multicast_2x1SM(barrier, kCTAMask);
                     };
                     umma_arrive(reinterpret_cast<uint64_t*>(empty_barriers[stage_idx]));
+                    if constexpr (kSplitPipeline)
+                        umma_arrive(reinterpret_cast<uint64_t*>(weight_empty_barriers[weight_stage_idx]));
 
                     // NOTES: the tensor memory accumulator pipeline has nothing to do with multicasting
                     if (do_tmem_full_arrive)
@@ -937,10 +1291,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // Descriptor words are immutable addresses; select the current
                     // stage while operand completion can still be in flight.
                     const uint32_t a_desc_base_lo = a_desc_stage0_lo + stage_idx * (SMEM_A_SIZE_PER_STAGE / 16);
-                    const uint32_t b_desc_base_lo = b_desc_stage0_lo + stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
+                    const uint32_t b_desc_base_lo = b_desc_stage0_lo + weight_stage_idx * (SMEM_B_SIZE_PER_STAGE / 16);
 
-                    // Wait TMA load completion
+                    // Operands and scales share the stage completion barrier.
                     full_barriers[stage_idx]->wait(phase);
+                    if constexpr (kSplitPipeline)
+                        weight_full_barriers[weight_stage_idx]->wait(weight_phase);
 
                     ptx::tcgen05_after_thread_sync();
 
@@ -957,11 +1313,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         #pragma unroll
                         for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i) {
                             sf_desc.start_address_ = static_cast<uint16_t>(
-                                sfb_base_units + stage_idx * (SMEM_SFB_SIZE_PER_STAGE / 16) +
+                                sfb_base_units + weight_stage_idx * (SMEM_SFB_SIZE_PER_STAGE / 16) +
                                 i * (kNumUTCCPAlignedElems * sizeof(uint32_t) / 16));
                             cute_utccp_t::copy(sf_desc, kTmemStartColOfSFB + i * 4);
                         }
-
                         // Issue UMMA
                         #pragma unroll
                         for (uint32_t k = 0; k < BLOCK_K / UMMA_K; ++ k) {
@@ -1026,9 +1381,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_STATIC_ASSERT((kNumDispatchWarps + kNumMMANonEpilogueWarps) % 4 == 0 and
                          kNumEpilogueWarps % 4 == 0, "Invalid epilogue warps");
 
-        // TODO: support effective block M
         // NOTES:
-        //  - 2 warpgroups divide the whole BM into BM / 2
+        //  - each warpgroup owns BM / 2 rows, contiguous or store-block interleaved
         //  - 4 warps divide the whole BN into BN / 4
         //  - BM / 2 is further divided into stored blocks, i.e. with `STORE_BLOCK_M` size
         //  - `STORE_BLOCK_M` in further divided into `ATOM_M`
@@ -1036,10 +1390,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         constexpr uint32_t ATOM_M = 8;
         constexpr uint32_t kNumBankGroupBytes = 16u;
         constexpr uint32_t kNumAtomsPerStore = STORE_BLOCK_M / ATOM_M;
+        constexpr uint32_t kReturnVectors = kReturnWide == 1 ? 2 : 1;
+        constexpr uint32_t kReturnLanesPerRow = 16 / kReturnVectors;
+        constexpr uint32_t kReturnRowsPerWarp = 2 * kReturnVectors;
+        constexpr uint32_t kReturnRowsPerRound = 8 * kReturnVectors;
         DG_STATIC_ASSERT(BLOCK_M % kNumEpilogueWarpgroups == 0, "Invalid block M");
         DG_STATIC_ASSERT(WG_BLOCK_M % STORE_BLOCK_M == 0, "Invalid warpgroup block M");
         DG_STATIC_ASSERT(STORE_BLOCK_M % ATOM_M == 0, "Invalid store block M");
         DG_STATIC_ASSERT(BLOCK_N == 128, "Invalid block N");
+
+        // Round-robin store blocks balance a valid row prefix without changing
+        // the MMA tile or the physical warpgroup's private shared staging.
+        const auto store_row = [&](const uint32_t s) {
+            if constexpr (kBalanceEpilogue)
+                return (s * kNumEpilogueWarpgroups + epilogue_wg_idx) * STORE_BLOCK_M;
+            else
+                return epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M;
+        };
 
         // Match the dispatch-side ordering of legacy NVLink barriers.
         if constexpr (not kRankGatedCombine)
@@ -1048,6 +1415,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Persistently schedule over blocks
 
         uint32_t current_iter_idx = 0;
+        bool previous_return = false;
 #if defined(IKET_BUILD_ENABLED) && defined(MEGAMOE_IKET_CRITICAL)
         // Round-robin scheduling carries its index across experts and both GEMMs.
         // Count this CTA's work once; mark only its final accumulator readiness.
@@ -1057,8 +1425,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             for (uint32_t e = 0; e < kNumExpertsPerRank; ++e)
                 iket_num_blocks += math::ceil_div(smem_expert_count[e], BLOCK_M) *
                     ((L1_SHAPE_N + L2_SHAPE_N) / BLOCK_N);
-            iket_num_blocks = iket_num_blocks > sm_idx
-                ? math::ceil_div(iket_num_blocks - sm_idx, kNumSMs) : 0;
+            iket_num_blocks = scheduler.get_num_blocks(iket_num_blocks);
         }
 #endif
         scheduler.for_each_block([&](const sched::BlockPhase& block_phase,
@@ -1067,6 +1434,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                      const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
             // Producer metadata is already ordered by the route-ready acquire
             // and shared-count handoff. Prefetch it while MMA is independent.
+            if constexpr (kReturnWarpgroupSync) {
+                // FC2 regions are disjoint by warpgroup. FC1 reuses their storage
+                // with a different layout, so join both groups at that transition.
+                if (previous_return && block_phase == sched::BlockPhase::Linear1)
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                previous_return = block_phase == sched::BlockPhase::Linear2;
+            }
             // Compute offsets
             // NOTES: use shuffle here to let NVCC know warp divergence won't happen
             const uint32_t valid_m = ptx::exchange(scheduler.template get_valid_m<false>(), 0);
@@ -1074,52 +1448,72 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             uint32_t m_idx = pool_block_idx * BLOCK_M;
             uint32_t n_idx = n_block_idx * BLOCK_N;
 
-            float producer_weight = 0;
-            float4* producer_destinations[WG_BLOCK_M / STORE_BLOCK_M][STORE_BLOCK_M / 8];
+            float producer_weights[math::constexpr_ceil_div(WG_BLOCK_M, 32u)] = {};
+            float4* producer_destinations[WG_BLOCK_M / STORE_BLOCK_M][STORE_BLOCK_M / kReturnRowsPerRound];
             {
-                DG_STATIC_ASSERT(BLOCK_M <= 32 && WG_BLOCK_M <= 32,
-                                 "Direct metadata requires dense producer lists and one score cache per lane");
                 // Bank g stays live until every rank completes g; starting g+2
                 // requires all-rank route-ready g+1 and therefore that retirement.
                 if (block_phase == sched::BlockPhase::Linear1) {
-                    const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + lane_idx;
-                    if (lane_idx < WG_BLOCK_M && row < valid_m) {
-                        const auto* source = workspace.get_src_token_topk_idx_ptr(
-                            local_expert_idx, kNumRanks == 1 ? 0 : workspace.metadata_slot,
-                            m_block_idx * BLOCK_M + row);
-                        uint32_t descriptor;
-                        asm volatile("ld.global.u32 %0, [%1];"
-                                     : "=r"(descriptor) : "l"(source) : "memory");
-                        const uint32_t rank = descriptor / (kNumMaxTokensPerRank * kNumTopk);
-                        const uint32_t route = descriptor % (kNumMaxTokensPerRank * kNumTopk);
-                        asm volatile("ld.global.f32 %0, [%1];"
-                                     : "=f"(producer_weight)
-                                     : "l"(workspace.get_score_inbox_ptr(rank) + route) : "memory");
+                    #pragma unroll
+                    for (uint32_t chunk = 0; chunk < math::constexpr_ceil_div(WG_BLOCK_M, 32u); ++chunk) {
+                        const uint32_t row_in_wg = chunk * 32 + lane_idx;
+                        const uint32_t row = store_row(row_in_wg / STORE_BLOCK_M) + row_in_wg % STORE_BLOCK_M;
+                        if (row_in_wg < WG_BLOCK_M && row < valid_m) {
+                            const auto* source = workspace.get_src_token_topk_idx_ptr(
+                                local_expert_idx, kNumRanks == 1 ? 0 : workspace.metadata_slot,
+                                m_block_idx * BLOCK_M + row);
+                            uint32_t descriptor;
+                            asm volatile("ld.global.u32 %0, [%1];"
+                                         : "=r"(descriptor) : "l"(source) : "memory");
+                            const uint32_t rank = descriptor / (kNumMaxTokensPerRank * kNumTopk);
+                            const uint32_t route = descriptor % (kNumMaxTokensPerRank * kNumTopk);
+                            asm volatile("ld.global.f32 %0, [%1];"
+                                         : "=f"(producer_weights[chunk])
+                                         : "l"(workspace.get_score_inbox_ptr(rank) + route) : "memory");
+                        }
                     }
                 } else {
+                    if constexpr (kCacheDestinations) {
+                        // SF workers write the address cache before their tile release.
+                        // Producer route readiness alone does not cover those writes.
+                        if constexpr (kRelaxedPoll & 1)
+                            wait_ready_mask_relaxed<uint32_t>(workspace.get_l1_arrival_count_ptr(pool_block_idx), kSfReadyMask);
+                        else
+                            while ((ptx::ld_acq(workspace.get_l1_arrival_count_ptr(pool_block_idx)) &
+                                    kSfReadyMask) != kSfReadyMask);
+                        __syncwarp();
+                    }
                     #pragma unroll
                     for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++s) {
                         #pragma unroll
-                        for (uint32_t j = 0; j < STORE_BLOCK_M / 8; ++j) {
-                            const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M +
-                                j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
+                        for (uint32_t j = 0; j < STORE_BLOCK_M / kReturnRowsPerRound; ++j) {
+                            const uint32_t row = store_row(s) +
+                                j * kReturnRowsPerRound + warp_idx_in_wg * kReturnRowsPerWarp + lane_idx / kReturnLanesPerRow;
                             if (row < valid_m) {
-                                const auto* source = workspace.get_src_token_topk_idx_ptr(
-                                    local_expert_idx, kNumRanks == 1 ? 0 : workspace.metadata_slot,
-                                    m_block_idx * BLOCK_M + row);
-                                uint32_t descriptor;
-                                asm volatile("ld.global.u32 %0, [%1];"
-                                             : "=r"(descriptor) : "l"(source) : "memory");
-                                // The route generation is already acquired. Resolve
-                                // the peer base and output address while MMA runs.
-                                const uint32_t rank = descriptor / (kNumMaxTokensPerRank * kNumTopk);
-                                const uint32_t route = descriptor % (kNumMaxTokensPerRank * kNumTopk);
-                                const auto token = combine_token_buffer
-                                    .get_rank_buffer(combine_slot * kNumTopk + route % kNumTopk)
-                                    .get_data_buffer(route / kNumTopk);
-                                producer_destinations[s][j] = sym_buffer.map(math::advance_ptr<float4>(
-                                    token.get_base_ptr(), n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
-                                    (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4))), rank);
+                                if constexpr (kCacheDestinations) {
+                                    const uint64_t destination = workspace.get_cached_destinations_ptr()[m_idx + row];
+                                    producer_destinations[s][j] = math::advance_ptr<float4>(
+                                        reinterpret_cast<void*>(destination),
+                                        n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
+                                        (lane_idx % kReturnLanesPerRow) * static_cast<uint32_t>(sizeof(float4) * kReturnVectors));
+                                } else {
+                                    const auto* source = workspace.get_src_token_topk_idx_ptr(
+                                        local_expert_idx, kNumRanks == 1 ? 0 : workspace.metadata_slot,
+                                        m_block_idx * BLOCK_M + row);
+                                    uint32_t descriptor;
+                                    asm volatile("ld.global.u32 %0, [%1];"
+                                                 : "=r"(descriptor) : "l"(source) : "memory");
+                                    // The route generation is already acquired. Resolve
+                                    // the peer base and output address while MMA runs.
+                                    const uint32_t rank = descriptor / (kNumMaxTokensPerRank * kNumTopk);
+                                    const uint32_t route = descriptor % (kNumMaxTokensPerRank * kNumTopk);
+                                    const auto token = combine_token_buffer
+                                        .get_rank_buffer(combine_slot * kNumTopk + route % kNumTopk)
+                                        .get_data_buffer(route / kNumTopk);
+                                    producer_destinations[s][j] = sym_buffer.map(math::advance_ptr<float4>(
+                                        token.get_base_ptr(), n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
+                                        (lane_idx % kReturnLanesPerRow) * static_cast<uint32_t>(sizeof(float4) * kReturnVectors)), rank);
+                                }
                             }
                         }
                     }
@@ -1147,12 +1541,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 //   (values[0], values[2]), (values[1], values[3]),
                 //   (values[4], values[6]), (values[5], values[7])
-                float stored_cached_weight = producer_weight;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     // Early break if the entire store block is beyond the valid token range
-                    if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
+                    if (store_row(s) >= valid_m) {
                         ptx::tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         break;
@@ -1170,12 +1563,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                         // Load weights from register cache
                         const float2 weights = {
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                            ptx::exchange(producer_weights[(j * ATOM_M) / 32], (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                            ptx::exchange(producer_weights[(j * ATOM_M) / 32], (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         };
 
                         // Load from TMEM
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M;
+                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + store_row(s) + i * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
@@ -1273,14 +1666,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const uint32_t mn_stride = kNumPaddedSFPoolTokens * sizeof(uint32_t);
                             const auto sf_base_ptr = l2_sf_buffer.get_base_ptr<uint8_t>();
                             // NOTES: consecutive tokens (t, t + 1) are in the same 32-group, so `sf_idx` differs by 4
-                            // NOTES: originally there was:
-                            //   - `const uint32_t token_idx_in_expert = m_block_idx * BLOCK_M + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2
-                            //   - `scheduler.get_current_pool_block_offset() * SF_BLOCK_M + transform_sf_token_idx(token_idx_in_expert)`
-                            // We find out that
-                            //   1. `m_block_idx * BLOCK_M` mod `BLOCK_M` is 0, and `epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M + lane_idx * 2` is always < `BLOCK_M`, so we can put `m_block_idx * BLOCK_M` outside
-                            //   2. `lane_idx * 2` controls the lowest 3 bit of `token_idx_in_expert`, and `transform_sf_token_idx` is a bitwise-independent transformation if the input is less than `BLOCK_M`, so we can put `lane_idx * 2` outside
-                            // This reduce the number of computation instructions.
-                            const uint32_t token_base_idx = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                            // Each atom base is 8-row aligned and remains inside
+                            // this tile under either warpgroup mapping. The lane's
+                            // low three row bits transform independently of it.
+                            const uint32_t token_base_idx = store_row(s) + i * ATOM_M;
                             __builtin_assume(token_base_idx < BLOCK_M);
                             const auto sf_pool_token_idx = scheduler.get_current_pool_block_offset() * SF_BLOCK_M
                                 + m_block_idx * SF_BLOCK_M + transform_sf_token_idx(token_base_idx) + (lane_idx * 2) * 4;
@@ -1302,7 +1691,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             &tensor_map_l1_output,
                             smem_cd[tma_stage_idx] + epilogue_wg_idx * STORE_BLOCK_M * L1_OUT_BLOCK_N,
                             out_n_idx,
-                            m_idx + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M);
+                            m_idx + store_row(s));
                         cute::tma_store_arrive();
                     }
                     __syncwarp();
@@ -1322,7 +1711,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 __syncwarp();
             } else {
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
-                constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
+                constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / kReturnRowsPerRound;
 
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
                 // This phase includes BF16 packing, remote writes, readiness,
@@ -1339,7 +1728,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     // Early break if the entire store block is beyond the valid token range
                     // TODO: check performance
-                    if (epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M >= valid_m) {
+                    if (store_row(s) >= valid_m) {
                         ptx::tcgen05_before_thread_sync();
                         tmem_empty_barriers[accum_stage_idx]->arrive(0u);
                         break;
@@ -1349,12 +1738,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     float4* destinations[kNumRowsPerWarp];
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++j) {
-                        const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M +
-                            j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
+                        const uint32_t row = store_row(s) +
+                            j * kReturnRowsPerRound + warp_idx_in_wg * kReturnRowsPerWarp + lane_idx / kReturnLanesPerRow;
                         if (row < valid_m) {
-                            {
-                                destinations[j] = producer_destinations[s][j];
-                            }
+                            destinations[j] = producer_destinations[s][j];
                         }
                     }
 
@@ -1362,7 +1749,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < STORE_BLOCK_M / ATOM_M; ++ i) {
                         // Load from TMEM using .16x256b shape to satisfy STSM layout requirements
                         // Start from lane index 0 and 16
-                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + i * ATOM_M;
+                        uint32_t tmem_addr = accum_stage_idx * UMMA_N + store_row(s) + i * ATOM_M;
                         uint32_t values[ATOM_M];
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr,
                                                                values[0], values[1], values[2], values[3]);
@@ -1405,45 +1792,68 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
 
                     // Write into remote buffers
-                    // One warp per row, now the layout is different from shared memory storing
-                    const uint32_t row_in_atom = (warp_idx_in_wg * 2 + lane_idx / 16) % ATOM_M;
-                    const uint32_t bank_group_idx = lane_idx % 8;
+                    // Read the same swizzled staging with 16 or 8 lanes per row.
+                    const uint32_t row_in_atom = (warp_idx_in_wg * kReturnRowsPerWarp + lane_idx / kReturnLanesPerRow) % ATOM_M;
+                    const uint32_t bank_group_idx = (lane_idx % (8 / kReturnVectors)) * kReturnVectors;
 
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                        const uint32_t row_in_store = j * 8 + warp_idx_in_wg * 2 + lane_idx / 16;
-                        const uint32_t m_idx_in_block = epilogue_wg_idx * WG_BLOCK_M + s * STORE_BLOCK_M + row_in_store;
+                        const uint32_t row_in_store = j * kReturnRowsPerRound + warp_idx_in_wg * kReturnRowsPerWarp + lane_idx / kReturnLanesPerRow;
+                        const uint32_t m_idx_in_block = store_row(s) + row_in_store;
 
                         // Skip padding rows beyond the actual token count for this expert
                         if (m_idx_in_block >= valid_m)
                             break;
 
                         // Read from shared memory
-                        const auto smem_ptr = smem_cd_l2 +
+                        const auto smem_base = smem_cd_l2 +
                             epilogue_wg_idx * STORE_BLOCK_M * BLOCK_N * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
-                            (lane_idx % 16 / 8) * STORE_BLOCK_M * kSwizzleCDMode +
-                            row_in_store * kSwizzleCDMode +
-                            (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
-                        auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
-                        if constexpr (kInbandCombine) {
-                            auto* words = reinterpret_cast<uint32_t*>(&packed);
+                            (lane_idx % kReturnLanesPerRow / (8 / kReturnVectors)) * STORE_BLOCK_M * kSwizzleCDMode +
+                            row_in_store * kSwizzleCDMode;
+                        const auto smem_ptr = smem_base + (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
+                        if constexpr (kReturnWide == 1) {
+                            float4 packed[2];
                             #pragma unroll
-                            for (uint32_t i = 0; i < 4; ++i)
-                                if (words[i] == 0x80000000u) words[i] = 0;
-                        }
+                            for (uint32_t v = 0; v < 2; ++v) {
+                                packed[v] = ptx::ld_shared(reinterpret_cast<float4*>(
+                                    smem_base + ((bank_group_idx + v) ^ row_in_atom) * kNumBankGroupBytes));
+                                auto* words = reinterpret_cast<uint32_t*>(&packed[v]);
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i)
+                                    if (words[i] == 0x80000000u) words[i] = 0;
+                            }
+                            const auto* words = reinterpret_cast<const uint32_t*>(packed);
+                            asm volatile("st.global.v8.u32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" ::
+                                "l"(destinations[j]), "r"(words[0]), "r"(words[1]), "r"(words[2]), "r"(words[3]),
+                                "r"(words[4]), "r"(words[5]), "r"(words[6]), "r"(words[7]) : "memory");
+                        } else {
+                            auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
+                            if constexpr (kInbandCombine) {
+                                auto* words = reinterpret_cast<uint32_t*>(&packed);
+                                #pragma unroll
+                                for (uint32_t i = 0; i < 4; ++i)
+                                    if (words[i] == 0x80000000u) words[i] = 0;
+                            }
 
-                        *destinations[j] = packed;
+                            *destinations[j] = packed;
+                        }
                     }
                 }
 
-                // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // Protect each FC2 staging region before its next tile reuses it.
+                if constexpr (kReturnWarpgroupSync)
+                    ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
+                else
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
 
             }
         });
 
         // Deallocate tensor memory
         // NOTES: must be called by the same logical warp ID on both CTAs
+        if constexpr (kReturnWarpgroupSync)
+            if (previous_return)
+                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
         if (epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
@@ -1505,10 +1915,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         };
 
         if constexpr (kInbandCombine or ((kNumTopk == 8 or kNumTopk == 10) and kHidden == 4096)) {
-            // In-band work is a row chunk per CTA, with one vector per thread.
+            // Chunked combine uses one vector per thread. Full-row work reuses
+            // those registers for successive vectors and amortizes mask/barrier work.
             // Each inbox/output vector still has one owner and the same sum order.
             DG_STATIC_ASSERT(kNumTopk <= 32, "Combine top-k must fit in a warp");
             constexpr uint32_t kNumUint4 = kNumHiddenBytes / sizeof(uint4);
+            constexpr uint32_t kCombineVectorsPerThread = kFullRowCombine >= 2 ? 2 : 1;
+            // Modes 2/3/4 assign each row to one/two/four independent warps.
+            constexpr uint32_t kCombineThreads = kWarpCombine >= 2 ? 32u << (kWarpCombine - 2) : kNumEpilogueThreads;
+            constexpr uint32_t kCombineWorkersPerCTA = kNumEpilogueThreads / kCombineThreads;
+            constexpr uint32_t kCombineVectorStride = kFullRowCombine >= 3 ? 1 : kCombineThreads;
+            DG_STATIC_ASSERT(kNumEpilogueThreads % kCombineThreads == 0,
+                             "Combine row groups must partition epilogue warps");
+            DG_STATIC_ASSERT(kFullRowCombine < 2 ||
+                             (kInbandCombine && kNumUint4 == 2 * kNumEpilogueThreads && kNumTopk <= 16),
+                             "Paired combine requires two complete in-band vectors and a 32-bit pending mask");
             DG_STATIC_ASSERT(
                 kInbandCombine or kNumTopk <= kNumCombineBarriers,
                 "CTA combine requires one transaction barrier per top-k slot");
@@ -1520,22 +1941,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 smem_buffer + (kLastCTACleanup ? SMEM_EXPERT_COUNT_SIZE : 0));
             auto* combine_tma_buffer = reinterpret_cast<uint4*>(smem_buffer);
             constexpr uint32_t kCombineChunkVectors =
-                kInbandCombine ? kNumEpilogueThreads : kNumUint4;
+                kInbandCombine && !kFullRowCombine ? kNumEpilogueThreads : kNumUint4;
             constexpr uint32_t kCombineChunksPerToken =
                 (kNumUint4 + kCombineChunkVectors - 1) / kCombineChunkVectors;
             uint32_t combine_phase = 0;
             // Reverse the CTA-to-work permutation so the final CTAs can begin
             // row-chunk combine after their own compute work retires.
-            const uint32_t first_combine_work = kNumSMs - 1 - sm_idx;
+            const uint32_t first_combine_work = kNumSMs * kCombineWorkersPerCTA - 1 -
+                (sm_idx * kCombineWorkersPerCTA +
+                 (kWarpCombine >= 2 ? epilogue_warp_idx / (kCombineThreads / 32) : 0));
             for (uint64_t combine_work = first_combine_work;
                  combine_work < static_cast<uint64_t>(num_tokens) * kCombineChunksPerToken;
-                 combine_work += kNumSMs) {
+                 combine_work += kNumSMs * kCombineWorkersPerCTA) {
                 const uint32_t token_idx = combine_work / kCombineChunksPerToken;
                 const uint32_t vector_begin =
                     (combine_work % kCombineChunksPerToken) * kCombineChunkVectors;
                 const uint32_t vector_end =
                     min(kNumUint4, vector_begin + kCombineChunkVectors);
-                if (epilogue_warp_idx == 0) {
+                uint32_t warp_mask = 0;
+                if (kWarpCombine || epilogue_warp_idx == 0) {
                     const int stored_expert_idx = lane_idx < kNumTopk
                         ? static_cast<int>(__ldg(
                               input_topk_idx_buffer.get_base_ptr<int64_t>() +
@@ -1543,8 +1967,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         : -1;
                     const uint32_t total_mask = __ballot_sync(
                         0xffffffff, stored_expert_idx >= 0);
-                    if (lane_idx == 0)
+                    if constexpr (kWarpCombine) {
+                        // Each warp owns disjoint inbox/output vectors. Its
+                        // read-only route mask needs no shared-memory handoff.
+                        warp_mask = total_mask;
+                    } else if (lane_idx == 0) {
                         combine_masks[0] = total_mask;
+                    }
 
                     if constexpr (kRankGatedCombine and not kInbandCombine) {
                         const int expert_rank_idx = stored_expert_idx >= 0
@@ -1570,9 +1999,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                     }
                 }
-                ptx::sync_aligned(
-                    kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                const uint32_t total_mask = combine_masks[0];
+                if constexpr (!kWarpCombine)
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                const uint32_t total_mask = kWarpCombine ? warp_mask : combine_masks[0];
 
                 if constexpr (kRankGatedCombine and not kInbandCombine and kNumRanks <= 32) {
                     const uint32_t required_rank_mask = combine_masks[1];
@@ -1663,43 +2093,89 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 if (combine_work == first_combine_work)
                     MEGAMOE_IKET_MARK(MegaLocalReduceStart);
-                for (uint32_t vector_idx = vector_begin + epilogue_thread_idx;
+                for (uint32_t vector_idx = vector_begin + (kWarpCombine >= 2
+                         ? lane_idx + (epilogue_warp_idx % (kCombineThreads / 32)) * 32 : epilogue_thread_idx) *
+                         (kFullRowCombine >= 3 ? 2 : 1);
                      vector_idx < vector_end;
-                     vector_idx += kNumEpilogueThreads) {
-                    uint4 contributions[kNumTopk] = {};
+                     vector_idx += kCombineThreads * kCombineVectorsPerThread) {
+                    uint4 values[kCombineVectorsPerThread][kNumTopk] = {};
                     if constexpr (kInbandCombine) {
-                        const auto slot_ptr = [&](uint32_t slot) {
+                        const auto slot_ptr = [&](uint32_t vector, uint32_t slot) {
                             const uint64_t base =
                                 reinterpret_cast<uint64_t>(combine_token_buffer.get_base_ptr());
                             const uint64_t offset =
                                 ((static_cast<uint64_t>(combine_slot * kNumTopk + slot) *
-                                  kNumMaxTokensPerRank + token_idx) * kNumUint4 + vector_idx) * sizeof(uint4);
+                                  kNumMaxTokensPerRank + token_idx) * kNumUint4 + vector_idx +
+                                  vector * kCombineVectorStride) * sizeof(uint4);
                             uint64_t address;
                             asm volatile("add.u64 %0, %1, %2;" : "=l"(address) : "l"(base), "l"(offset));
                             return reinterpret_cast<uint4*>(address);
                         };
-                        uint32_t pending = total_mask;
+                        uint32_t pending = 0;
+                        if constexpr (kFullRowCombine >= 3) {
+                            pending = total_mask;
+                        } else {
+                            #pragma unroll
+                            for (uint32_t vector = 0; vector < kCombineVectorsPerThread; ++vector)
+                                pending |= total_mask << (vector * kNumTopk);
+                        }
                         const auto start = clock64();
                         while (pending) {
-                            // Issue independent reads first; retain and clear each
-                            // completed vector once, polling only missing slots.
-                            #pragma unroll
-                            for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
-                                if (pending & (1u << slot)) {
-                                    auto& v = contributions[slot];
-                                    asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                                        : "l"(slot_ptr(slot)) : "memory");
+                            if constexpr (kFullRowCombine >= 3) {
+                                // Adjacent vectors share a 32-byte transaction. Every
+                                // word must arrive before retiring the pair; no atomicity assumed.
+                                #pragma unroll
+                                for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                    if (pending & (1u << slot)) {
+                                        auto& a = values[0][slot];
+                                        auto& b = values[1][slot];
+                                        asm volatile("ld.volatile.global.v8.u32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                            : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w),
+                                              "=r"(b.x), "=r"(b.y), "=r"(b.z), "=r"(b.w)
+                                            : "l"(slot_ptr(0, slot)) : "memory");
+                                    }
                                 }
-                            }
-                            #pragma unroll
-                            for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
-                                const auto& v = contributions[slot];
-                                if ((pending & (1u << slot)) and v.x != 0x80000000u and
-                                    v.y != 0x80000000u and v.z != 0x80000000u and v.w != 0x80000000u) {
-                                    *slot_ptr(slot) = make_uint4(
-                                        0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u);
-                                    pending &= ~(1u << slot);
+                                #pragma unroll
+                                for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                    const auto& a = values[0][slot];
+                                    const auto& b = values[1][slot];
+                                    if ((pending & (1u << slot)) &&
+                                        a.x != 0x80000000u && a.y != 0x80000000u &&
+                                        a.z != 0x80000000u && a.w != 0x80000000u &&
+                                        b.x != 0x80000000u && b.y != 0x80000000u &&
+                                        b.z != 0x80000000u && b.w != 0x80000000u) {
+                                        asm volatile("st.global.v8.u32 [%0], {%1, %1, %1, %1, %1, %1, %1, %1};" ::
+                                            "l"(slot_ptr(0, slot)), "r"(0x80000000u) : "memory");
+                                        pending &= ~(1u << slot);
+                                    }
+                                }
+                            } else {
+                                // Issue independent reads first; retain and clear each
+                                // completed vector once, polling only missing slots.
+                                #pragma unroll
+                                for (uint32_t vector = 0; vector < kCombineVectorsPerThread; ++vector) {
+                                    #pragma unroll
+                                    for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                        if (pending & (1u << (vector * kNumTopk + slot))) {
+                                            auto& v = values[vector][slot];
+                                            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                                                : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                                                : "l"(slot_ptr(vector, slot)) : "memory");
+                                        }
+                                    }
+                                }
+                                #pragma unroll
+                                for (uint32_t vector = 0; vector < kCombineVectorsPerThread; ++vector) {
+                                    #pragma unroll
+                                    for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                        const auto& v = values[vector][slot];
+                                        if ((pending & (1u << (vector * kNumTopk + slot))) and v.x != 0x80000000u and
+                                            v.y != 0x80000000u and v.z != 0x80000000u and v.w != 0x80000000u) {
+                                            *slot_ptr(vector, slot) = make_uint4(
+                                                0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u);
+                                            pending &= ~(1u << (vector * kNumTopk + slot));
+                                        }
+                                    }
                                 }
                             }
                             if (pending and clock64() - start > 10000000000ull)
@@ -1711,68 +2187,90 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                              topk_idx < kNumTopk;
                              ++topk_idx) {
                             if ((total_mask & (1u << topk_idx)) != 0) {
-                                contributions[topk_idx] = combine_tma_buffer[
+                                values[0][topk_idx] = combine_tma_buffer[
                                     topk_idx * kNumUint4 + vector_idx];
                             }
                         }
                     }
-                    uint4 casted;
-                    auto* casted_bf16 =
-                        reinterpret_cast<nv_bfloat162*>(&casted);
-                    constexpr uint32_t kNumBF16x2 =
-                        sizeof(uint4) / sizeof(nv_bfloat162);
+                    uint4 paired_output[2];
                     #pragma unroll
-                    for (uint32_t element = 0;
-                         element < kNumBF16x2;
-                         ++element) {
-                        if constexpr (kNumTopk != 10 or kHidden != 4096) {
-                            // Match the original warp combine exactly: start at
-                            // +0 and accumulate valid slots in ascending order.
-                            float2 reduced = {};
-                            #pragma unroll
-                            for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
-                                if ((total_mask & (1u << slot)) != 0) {
-                                    ptx::accumulate(
-                                        reduced,
-                                        reinterpret_cast<const nv_bfloat162*>(
-                                            &contributions[slot])[element]);
+                    for (uint32_t vector = 0; vector < kCombineVectorsPerThread; ++vector) {
+                        const auto& contributions = values[vector];
+                        uint4 casted;
+                        auto* casted_bf16 =
+                            reinterpret_cast<nv_bfloat162*>(&casted);
+                        constexpr uint32_t kNumBF16x2 =
+                            sizeof(uint4) / sizeof(nv_bfloat162);
+                        #pragma unroll
+                        for (uint32_t element = 0;
+                             element < kNumBF16x2;
+                             ++element) {
+                            if constexpr (kNumTopk != 10 or kHidden != 4096) {
+                                // Match the original warp combine exactly: start at
+                                // +0 and accumulate valid slots in ascending order.
+                                float2 reduced = {};
+                                #pragma unroll
+                                for (uint32_t slot = 0; slot < kNumTopk; ++slot) {
+                                    if ((total_mask & (1u << slot)) != 0) {
+                                        ptx::accumulate(
+                                            reduced,
+                                            reinterpret_cast<const nv_bfloat162*>(
+                                                &contributions[slot])[element]);
+                                    }
                                 }
+                                casted_bf16[element] =
+                                    __float22bfloat162_rn(reduced);
+                            } else {
+                                float2 pair_sums[5];
+                                #pragma unroll
+                                for (uint32_t pair = 0; pair < 5; ++pair) {
+                                    const auto lhs = __bfloat1622float2(
+                                        reinterpret_cast<const nv_bfloat162*>(
+                                            &contributions[pair * 2])[element]);
+                                    const auto rhs = __bfloat1622float2(
+                                        reinterpret_cast<const nv_bfloat162*>(
+                                            &contributions[pair * 2 + 1])[element]);
+                                    pair_sums[pair] =
+                                        make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
+                                }
+                                pair_sums[0].x += pair_sums[1].x;
+                                pair_sums[0].y += pair_sums[1].y;
+                                pair_sums[2].x += pair_sums[3].x;
+                                pair_sums[2].y += pair_sums[3].y;
+                                pair_sums[0].x += pair_sums[2].x;
+                                pair_sums[0].y += pair_sums[2].y;
+                                pair_sums[0].x += pair_sums[4].x;
+                                pair_sums[0].y += pair_sums[4].y;
+                                casted_bf16[element] =
+                                    __float22bfloat162_rn(pair_sums[0]);
                             }
-                            casted_bf16[element] =
-                                __float22bfloat162_rn(reduced);
+                        }
+                        if constexpr (kFullRowCombine == 4) {
+                            paired_output[vector] = casted;
                         } else {
-                            float2 pair_sums[5];
-                            #pragma unroll
-                            for (uint32_t pair = 0; pair < 5; ++pair) {
-                                const auto lhs = __bfloat1622float2(
-                                    reinterpret_cast<const nv_bfloat162*>(
-                                        &contributions[pair * 2])[element]);
-                                const auto rhs = __bfloat1622float2(
-                                    reinterpret_cast<const nv_bfloat162*>(
-                                        &contributions[pair * 2 + 1])[element]);
-                                pair_sums[pair] =
-                                    make_float2(lhs.x + rhs.x, lhs.y + rhs.y);
-                            }
-                            pair_sums[0].x += pair_sums[1].x;
-                            pair_sums[0].y += pair_sums[1].y;
-                            pair_sums[2].x += pair_sums[3].x;
-                            pair_sums[2].y += pair_sums[3].y;
-                            pair_sums[0].x += pair_sums[2].x;
-                            pair_sums[0].y += pair_sums[2].y;
-                            pair_sums[0].x += pair_sums[4].x;
-                            pair_sums[0].y += pair_sums[4].y;
-                            casted_bf16[element] =
-                                __float22bfloat162_rn(pair_sums[0]);
+                            reinterpret_cast<uint4*>(y)[
+                                static_cast<uint64_t>(token_idx) * kNumUint4 +
+                                vector_idx + vector * kCombineVectorStride] = casted;
                         }
                     }
-                    reinterpret_cast<uint4*>(y)[
-                        static_cast<uint64_t>(token_idx) * kNumUint4 +
-                        vector_idx] = casted;
+                    if constexpr (kFullRowCombine == 4) {
+                        // Adjacent output vectors share one aligned 32-byte store.
+                        const auto dst = reinterpret_cast<uint4*>(y) +
+                            static_cast<uint64_t>(token_idx) * kNumUint4 + vector_idx;
+                        const auto& a = paired_output[0];
+                        const auto& b = paired_output[1];
+                        asm volatile("st.global.v8.u32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" ::
+                            "l"(dst), "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w),
+                            "r"(b.x), "r"(b.y), "r"(b.z), "r"(b.w) : "memory");
+                    }
                 }
                 if (combine_work == first_combine_work)
                     MEGAMOE_IKET_MARK(MegaLocalReduceEnd);
-                ptx::sync_aligned(
-                    kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // The warp-local path reuses no shared combine state between
+                // rows. Inbox retirement and reduction stay per-vector.
+                if constexpr (!kWarpCombine)
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 combine_phase ^= 1;
             }
             if constexpr (kTraceRecycling && kResetRows != 0) {

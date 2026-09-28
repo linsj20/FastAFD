@@ -18,7 +18,7 @@ static void register_apis(pybind11::module_& m) {
             int rows, int topk, int hidden, int intermediate, int sms,
             bool all_push, bool inband_combine, bool rank_gated_combine) {
         DG_HOST_ASSERT(ranks >= 2 && ranks <= 64 && experts > 0 && experts % ranks == 0);
-        DG_HOST_ASSERT(bucket > 0 && bucket % layout::kLCMCandidateBlockM == 0);
+        DG_HOST_ASSERT(bucket > 0 && bucket % layout::kPoolTokenAlignment == 0);
         DG_HOST_ASSERT(rows > 0 && rows <= bucket && sms > 0 && sms <= 160);
         DG_HOST_ASSERT(topk > 0 && topk <= 32 && hidden > 1024 && hidden % 512 == 0);
         DG_HOST_ASSERT(intermediate > 0 && intermediate % 128 == 0);
@@ -31,10 +31,10 @@ static void register_apis(pybind11::module_& m) {
         const auto config = get_mega_moe_config(ranks, experts, local_experts,
             bucket, rows, topk, hidden, intermediate, sf_pool, 1, all_push, sms);
         if (all_push) {
-            DG_HOST_ASSERT(rows <= 8192 && config.block_m <= 32 && config.num_epilogue_threads >= 256);
-            DG_HOST_ASSERT(config.num_experts_per_wave == local_experts);
+            DG_HOST_ASSERT(rows <= 8192 && config.block_m <= 256 && config.num_epilogue_threads >= 256);
+            DG_HOST_ASSERT(config.num_experts_per_wave > 0 && local_experts % config.num_experts_per_wave == 0);
             DG_HOST_ASSERT(sms >= 2 * std::min(local_experts, 2 * ranks) + 1 +
-                layout::Workspace::genphase_pusher_ctas(bucket));
+                config.num_dispatch_push_ctas);
         }
         SM100FP8FP4MegaMoERuntime::Args args{
             .launch_args = LaunchArgs(sms,

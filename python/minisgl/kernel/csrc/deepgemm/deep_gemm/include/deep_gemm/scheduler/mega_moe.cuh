@@ -26,6 +26,9 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           bool kAcquireRecvCounts = false,
           bool kRankReadyRecvCounts = false,
           typename workspace_t = layout::Workspace,
+          bool kInitialScheduling = false,
+          bool kInterleaveM = false,
+          bool kLateCountLane = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -56,6 +59,7 @@ struct MegaMoEScheduler {
     uint32_t current_num_tokens = 0;
     uint32_t current_pool_block_offset = 0;
     uint32_t block_idx = 0;
+    uint32_t initial_stride = kNumSMs, initial_blocks = 0;
     uint32_t m_block_idx = 0;
     uint32_t n_block_idx = 0;
 
@@ -110,6 +114,25 @@ struct MegaMoEScheduler {
         return current_pool_block_offset;
     }
 
+    CUTLASS_DEVICE void advance_block_idx() {
+        if constexpr (kInitialScheduling) {
+            block_idx += initial_blocks ? initial_stride : kNumSMs;
+            initial_blocks -= initial_blocks > 0;
+        } else {
+            block_idx += kNumSMs;
+        }
+    }
+
+    // Call before iteration; the optional prefix precedes regular grid strides.
+    CUTLASS_DEVICE uint32_t get_num_blocks(const uint32_t total) const {
+        if constexpr (!kInitialScheduling)
+            return total > block_idx ? math::ceil_div(total - block_idx, kNumSMs) : 0;
+        const uint32_t prefix = total > block_idx
+            ? cute::min(initial_blocks, math::ceil_div(total - block_idx, initial_stride)) : 0;
+        const uint32_t regular_start = block_idx + initial_blocks * initial_stride;
+        return prefix + (total > regular_start ? math::ceil_div(total - regular_start, kNumSMs) : 0);
+    }
+
     CUTLASS_DEVICE uint32_t get_current_num_m_blocks() const {
         return math::ceil_div(current_num_tokens, BLOCK_M);
     }
@@ -151,6 +174,23 @@ struct MegaMoEScheduler {
         return false;
     }
 
+    template <uint32_t kBlockNs>
+    CUTLASS_DEVICE void set_block_coordinates() {
+        n_block_idx = block_idx - m_block_idx * kBlockNs;
+        if constexpr (kInterleaveM) {
+            // Alternate two M tiles per N pair, retaining adjacent 2-CTA peers.
+            // Leave a final unpaired M tile in the original order. The logical
+            // block cursor and expert/wave transitions stay unchanged; tiles retain
+            // one owner each.
+            const uint32_t first_m = m_block_idx & ~1u;
+            if (first_m + 1 < get_current_num_m_blocks()) {
+                const uint32_t within = block_idx - first_m * kBlockNs;
+                m_block_idx = first_m + ((within >> 1) & 1u);
+                n_block_idx = (within >> 2) * 2 + (within & 1u);
+            }
+        }
+    }
+
     // Core state machine: assigns the next block
     CUTLASS_DEVICE cute::tuple<BlockPhase, uint32_t, uint32_t, uint32_t> get_next_block() {
         while (true) {
@@ -160,9 +200,9 @@ struct MegaMoEScheduler {
             if (next_phase == BlockPhase::Linear1) {
                 if (fetch_next_l1_block()) {
                     // Found a new L1 block
-                    n_block_idx = block_idx - m_block_idx * kNumL1BlockNs;
+                    set_block_coordinates<kNumL1BlockNs>();
                     // Jump to next block
-                    block_idx += kNumSMs;
+                    advance_block_idx();
                     return {BlockPhase::Linear1, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
                     // L1 for the current wave is complete, transition to L2
@@ -172,9 +212,9 @@ struct MegaMoEScheduler {
             } else {
                 if (fetch_next_l2_block()) {
                     // Found a new L2 block
-                    n_block_idx = block_idx - m_block_idx * kNumL2BlockNs;
+                    set_block_coordinates<kNumL2BlockNs>();
                     // Jump to next block
-                    block_idx += kNumSMs;
+                    advance_block_idx();
                     return {BlockPhase::Linear2, current_local_expert_idx, m_block_idx, n_block_idx};
                 } else {
                     // Move to L1 of the next wave
@@ -189,9 +229,14 @@ struct MegaMoEScheduler {
 
     CUTLASS_DEVICE void fetch_expert_recv_count() {
         // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+        uint32_t count_lane = ptx::get_lane_idx();
+        // Prevent count addresses from sharing a live value with barrier setup
+        // across transport and warp register-budget changes.
+        if constexpr (kLateCountLane)
+            asm volatile("mov.u32 %0, %%laneid;" : "=r"(count_lane));
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            const auto expert_idx = i * 32 + count_lane;
             uint32_t count = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 if constexpr (kRankReadyRecvCounts) {

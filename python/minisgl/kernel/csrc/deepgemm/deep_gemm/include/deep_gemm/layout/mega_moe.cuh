@@ -7,11 +7,20 @@
 
 namespace deep_gemm::layout {
 
-static constexpr int kNumCandidateBlockMs = 7;
-static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192};
+// The launch API copies the descriptor count declared by the kernel parameter.
+// A larger host array can also supply the original single-descriptor argument.
+template <typename Descriptor, uint32_t Count>
+struct TmaDescriptors {
+    Descriptor maps[Count];
+};
+
+static constexpr int kNumCandidateBlockMs = 8;
+static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 160, 192};
 static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
-static constexpr int kLCMCandidateBlockM = 384;
+// Preserve the workspace ABI independently of tile selection. The pool bound
+// covers per-expert padding up to192; the SF allocation is dominated by M8.
+static constexpr int kPoolTokenAlignment = 384;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -21,7 +30,7 @@ CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_t
     const auto num_max_experts_per_token = math::constexpr_min(num_topk, num_experts_per_rank);
     return math::constexpr_align(
         num_max_recv_tokens * num_max_experts_per_token + num_experts_per_rank * (static_cast<T>(kMaxCandidateBlockM) - 1),
-        static_cast<T>(kLCMCandidateBlockM));
+        static_cast<T>(kPoolTokenAlignment));
 }
 
 // SF pool capacity: all experts share a contiguous SF region, sized by pool blocks × SF_BLOCK_M
@@ -297,6 +306,15 @@ struct Workspace {
         return reinterpret_cast<uint32_t*>(base) +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
+    }
+
+    // All-push may reuse the otherwise unused 12B/row source-metadata allocation
+    // as a contiguous 8B/row address cache. Even a 4B alignment adjustment fits.
+    // SF-ready publishes it; local invocation ordering protects reuse.
+    CUTLASS_DEVICE
+    uint64_t* get_cached_destinations_ptr() const {
+        return reinterpret_cast<uint64_t*>(math::align<uint64_t>(
+            reinterpret_cast<uint64_t>(get_token_src_metadata_ptr()), 8));
     }
 
     // For combine usages

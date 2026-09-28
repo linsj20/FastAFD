@@ -9,20 +9,22 @@ import time
 from pathlib import Path
 
 
-REMOTE = '''import json,os,re,subprocess,sys
+REMOTE = '''import datetime,json,os,re,subprocess,sys
 from pathlib import Path
 records=json.load(sys.stdin)
 queue=subprocess.check_output(['squeue','-h','-u',os.environ['USER'],
  '-o','%i|%r'],text=True)
 queue_reasons=dict(line.split('|',1) for line in queue.splitlines() if '|' in line)
+state=subprocess.check_output(['sacct','-n','-X','-j',','.join(r['job'] for r in records),'-o',
+ 'JobIDRaw,State,ExitCode,Elapsed,NodeList,Reason','-P'],text=True)
+state_rows=[line.split('|') for line in state.splitlines()]
 for record in records:
  job=record['job']; root=Path(record.get('run_dir',record['output']))
- state=subprocess.check_output(['sacct','-n','-X','-j',job,'-o',
-  'JobIDRaw,State,ExitCode,Elapsed,NodeList,Reason','-P'],text=True)
- rows=[line.split('|') for line in state.splitlines() if line.startswith(job+'|')]
+ rows=[row for row in state_rows if row[0]==job]
  if len(rows)!=1: raise RuntimeError('Expected one scheduler record for '+job)
  row=rows[0]; logs={}
  paths=list(root.glob('*'+job+'*.out'))+list(root.glob('*'+job+'*.err'))
+ paths += [Path(path) for path in record.get('log_paths',[])]
  paths += [root/'experiment/afd.log',root/'experiment/driver.stderr']
  node_ips=set()
  for run in sorted(root.glob('*/results/*')):
@@ -40,8 +42,14 @@ for record in records:
    result=subprocess.run(command,text=True,capture_output=True)
    seeds.append({'cache_root':seed['cache_root'],'exit_code':result.returncode,
                  'stdout':result.stdout,'stderr':result.stderr})
- for path in paths:
+ log_bytes={}; log_counts={}
+ for path in dict.fromkeys(paths):
   if not path.is_file(): continue
+  log_bytes[str(path)]=path.stat().st_size
+  if record.get('log_count_pattern'):
+   pattern=re.compile(record['log_count_pattern'])
+   with path.open(errors='replace') as f:
+    log_counts[str(path)]=sum(bool(pattern.search(line.rstrip('\\n'))) for line in f)
   with path.open('rb') as f:
    f.seek(max(0,path.stat().st_size-8192)); tail=f.read().decode(errors='replace')
   logs[str(path)]=tail.splitlines()[-12:]
@@ -60,10 +68,17 @@ for record in records:
     if any((p.parent/'baseline.json').is_file() and (ordinary_only or ((p.parent/'profiled.json').is_file() and len(list((p.parent/'ranks/rank-0/iket').glob('*.trace.json'))) == 1)) for p in runs):
      done.append(case)
    progress.append(dict(model=group['model'],completed=len(done),expected=len(cases),last_started=started[-1:]))
+ graph_progress=[]
+ if row[1] == 'RUNNING':
+  for filename in record.get('graph_plans',[]):
+   plan=json.loads(Path(filename).read_text())
+   completed=sum((Path(run['path'])/'result.json').is_file() for run in plan['runs'])
+   graph_progress.append(dict(plan=filename,completed=completed,expected=len(plan['runs'])))
  print(json.dumps({'job':job,'state':row[1],'exit_code':row[2],
+  'observed_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
   'elapsed':row[3],'nodes':row[4],'reason':row[5],
-  'queue_reason':queue_reasons.get(job),'logs':logs,
-  'ray_node_ips':sorted(node_ips),'extension_seeds':seeds,'sweep_progress':progress,
+  'queue_reason':queue_reasons.get(job),'logs':logs,'log_bytes':log_bytes,'log_counts':log_counts,
+  'ray_node_ips':sorted(node_ips),'extension_seeds':seeds,'sweep_progress':progress,'graph_progress':graph_progress,
   'sample_bytes':sample.stat().st_size if sample.is_file() else 0}),flush=True)
 '''
 
@@ -72,7 +87,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("roots", nargs="+", type=Path)
     parser.add_argument("--host", default="oci-hsg")
-    parser.add_argument("--watch-seconds", type=int, default=180)
+    parser.add_argument("--watch-seconds", type=int, default=300)
+    parser.add_argument("--log-count-pattern", help="Count matching lines in each log without copying it")
     args = parser.parse_args()
     if args.watch_seconds < 0:
         raise ValueError("Watch interval cannot be negative")
@@ -81,6 +97,13 @@ def main():
     while active:
         records = [json.loads((root / "job.json").read_text())
                    for root in active.values()]
+        for record, root in zip(records, active.values()):
+            submission = root / "submit.json"
+            if submission.is_file():
+                command = json.loads(submission.read_text())
+                record['log_paths'] = [arg.split('=', 1)[1].replace('%j', record['job'])
+                                       for arg in command if arg.startswith(('--output=', '--error='))]
+            record['log_count_pattern'] = args.log_count_pattern
         output = subprocess.check_output(
             ["ssh", args.host, "python3 -c " + shlex.quote(REMOTE)],
             input=json.dumps(records), text=True)

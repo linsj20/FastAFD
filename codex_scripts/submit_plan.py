@@ -36,6 +36,8 @@ def main():
     if args.kind == 'sbatch':
         if command[:2] != ['sbatch', '--parsable']:
             raise ValueError('Expected an sbatch --parsable argument list')
+        (root / 'submit.sh').write_text('#!/bin/bash\nset -euo pipefail\n' +
+                                       shlex.join(command) + '\n')
         remote = env['OUTPUT_ROOT'].rstrip('/')
         directories = [remote]
     else:
@@ -76,6 +78,10 @@ def main():
     record['submitted_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     (root / 'job.json').write_text(json.dumps(record, indent=2) + '\n')
     print(json.dumps(record), flush=True)
+    # Analysis may resolve its input job from the remote plan directory.
+    # Persist locally first so a failed transfer cannot trigger resubmission.
+    subprocess.run(['rsync', '-a', str(root / 'job.json'),
+                    copy_host + ':' + remote + '/job.json'], check=True)
 
 
 if __name__ == '__main__':
